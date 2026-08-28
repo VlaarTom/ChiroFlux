@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Environments
+.venv/
+venv/
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Analysis output (default -plot-dir / -out-dir targets and generated data)
+*_plots/
+deeptda_model/
+*.npz
+path_weights.txt
