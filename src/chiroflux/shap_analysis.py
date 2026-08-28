@@ -649,6 +649,7 @@ def shap_ml(
     cv_array, cv_names = _apply_z_corrections(
         cv_array, cv_names,
         z_cols=z_cols_list,
+        exclude_list=exclude
         z_ref="z_Memb",
         drop_ref=drop_z_ref,
     )

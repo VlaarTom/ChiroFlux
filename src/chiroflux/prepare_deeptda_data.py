@@ -113,13 +113,13 @@ def _apply_flip(X, cv_names, flip_cols):
     return X
 
 
-def _apply_2d_transforms(X, cv_names, cos_cols, cos2_cols, z_cols):
+def _apply_2d_transforms(X, cv_names, cos_cols, cos2_cols, z_cols, exclude_list):
     """Apply the angle/z-coordinate transforms to a flat (N_frames, N_cvs)
     frame matrix, via a size-1 trailing axis (those helpers were written for
     the (N_paths, N_cvs, N_grid) crossing-array shape used elsewhere)."""
     X3 = X[:, :, np.newaxis]
     X3, cv_names = _apply_angle_transforms(X3, cv_names, cos_cols, cos2_cols)
-    X3, cv_names = _apply_z_corrections(X3, cv_names, z_cols)
+    X3, cv_names = _apply_z_corrections(X3, cv_names, z_cols, exclude_list)
     return X3[:, :, 0], cv_names
 
 
@@ -456,8 +456,8 @@ def prepare_deeptda_data_ld(
     X_d = _apply_flip(X_d, cv_names_d, flip_cols_d_list)
 
     # ── Angle transforms + z corrections (use original file column names) ──
-    X_l, cv_names_l = _apply_2d_transforms(X_l, cv_names_l, cos_cols_list, cos2_cols_list, _Z_COLS)
-    X_d, cv_names_d = _apply_2d_transforms(X_d, cv_names_d, cos_cols_list, cos2_cols_list, _Z_COLS)
+    X_l, cv_names_l = _apply_2d_transforms(X_l, cv_names_l, cos_cols_list, cos2_cols_list, _Z_COLS, exclude_list_l)
+    X_d, cv_names_d = _apply_2d_transforms(X_d, cv_names_d, cos_cols_list, cos2_cols_list, _Z_COLS, exclude_list_d)
 
     # ── CV name normalisation (e.g. _l_ → _u_) ─────────────────────────────
     if rename_pairs:

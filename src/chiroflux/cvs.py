@@ -76,7 +76,7 @@ def _apply_angle_transforms(cv_array, cv_names, cos_cols=None, cos2_cols=None):
 
     return cv_array, new_names
 
-def _apply_z_corrections(cv_array, cv_names, z_cols=None, z_ref="z_Memb", drop_ref=False):
+def _apply_z_corrections(cv_array, cv_names, z_cols=None, exclude_list=None, z_ref="z_Memb", drop_ref=False):
     """Shift z-coordinate CVs so that the membrane shift is accounted for and
     the value is relative to the membrane midplane (z=0).
 
@@ -88,6 +88,7 @@ def _apply_z_corrections(cv_array, cv_names, z_cols=None, z_ref="z_Memb", drop_r
                _extract_cv_crossings.
     cv_names : list of N_cvs column name strings.
     z_cols   : CV names to shift by the reference value.
+    exclude_list : List of all CV names to exclude.
     z_ref    : CV name to use as the reference midplane position.
     drop_ref : If True, remove the z_ref column from cv_array and cv_names
                after the corrections are applied.  Use this when z_ref (e.g.
@@ -111,6 +112,9 @@ def _apply_z_corrections(cv_array, cv_names, z_cols=None, z_ref="z_Memb", drop_r
 
     cv_array = cv_array.copy()
     for col in z_cols:
+        if col in exclude_list:
+            print(f"  Skipping '{col}' because it is in the exclude list.")
+            continue
         if col not in cv_names:
             warnings.warn(
                 f"-z-cols: '{col}' not found in CV names {cv_names}; skipping.",

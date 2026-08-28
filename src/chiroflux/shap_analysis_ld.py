@@ -261,14 +261,14 @@ def shap_enantiomer(
     angle_cols: Annotated[Optional[str], typer.Option("-angle-cols", help="CV columns in degrees → cos(θ)  [asymmetric molecule]")] = None,
     sym_angle_cols: Annotated[Optional[str], typer.Option("-sym-angle-cols", help="CV columns in degrees → cos²(θ)  [symmetric molecule]")] = None,
     paths: Annotated[str, typer.Option("-paths", help="Which paths to include: 'all', 'reactive', 'nonreactive'")] = "all",
-    nskip: Annotated[int, typer.Option("-nskip", help="Skip first nskip rows of each infretis_data.txt (equilibration)")] = 1000,
+    nskip: Annotated[int, typer.Option("-nskip", help="Skip first nskip rows of each infretis_data.txt")] = 1000,
     models: Annotated[str, typer.Option("-models", help=f"Comma-separated models to run; choices: {', '.join(MODEL_CHOICES)}")] = "rf,gbm,lgbm,logreg,svm",
     n_splits: Annotated[int, typer.Option("-n-splits", help="Number of stratified group CV folds")] = 5,
     n_estimators: Annotated[int, typer.Option("-n-estimators", help="Trees per RandomForest / GradientBoosting")] = 300,
-    n_jobs: Annotated[int, typer.Option("-n-jobs", help="CPU cores; -1 = all")] = 12,
+    n_jobs: Annotated[int, typer.Option("-n-jobs", help="CPU cores; -1 = all")] = -1,
     seed: Annotated[int, typer.Option("-seed", help="Random seed for fold splits and models")] = 42,
     plot_dir: Annotated[str, typer.Option("-plot-dir", help="Base name for root directory for plots; each model gets a subdirectory")] = "ld_plots",
-    top_n: Annotated[int, typer.Option("-top-n", help="Top N CVs for SHAP dependence plots")] = 3,
+    top_n: Annotated[int, typer.Option("-top-n", help="Top N CVs for SHAP dependence plots")] = 5,
     out: Annotated[str, typer.Option("-out", help="Base name for ranking files; '_<model>.txt' is appended")] = "shap_ld_ranking.txt",
     force_interfaces: Annotated[bool, typer.Option("-force-interfaces", help="Allow different interface counts between L and D; both grids are resampled to the shorter length via linear interpolation before averaging into a common grid")] = False,
     drop_z_ref: Annotated[bool, typer.Option("-drop-z-ref", help="Remove the z-reference column (z_Memb) from the feature set after z-corrections are applied; the column is still used as the reference during correction")] = False,
@@ -405,8 +405,8 @@ def shap_enantiomer(
     cv_arr_d, cv_names_d = _apply_angle_transforms(
         cv_arr_d, cv_names_d, cos_cols_list, cos2_cols_list
     )
-    cv_arr_l, cv_names_l = _apply_z_corrections(cv_arr_l, cv_names_l, z_cols_list, drop_ref=drop_z_ref)
-    cv_arr_d, cv_names_d = _apply_z_corrections(cv_arr_d, cv_names_d, z_cols_list, drop_ref=drop_z_ref)
+    cv_arr_l, cv_names_l = _apply_z_corrections(cv_arr_l, cv_names_l, z_cols_list, _excl_l_only, drop_ref=drop_z_ref)
+    cv_arr_d, cv_names_d = _apply_z_corrections(cv_arr_d, cv_names_d, z_cols_list, _excl_d_only, drop_ref=drop_z_ref)
 
     # ── Enantiomer mirror: θ → −θ ──────────────────────────────────────────
     # For signed chirality-odd CVs (dihedrals in [-180,180]), where L has φ
