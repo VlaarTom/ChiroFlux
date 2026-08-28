@@ -9,8 +9,7 @@ variables actually decide the outcome*: which CVs separate reactive from
 non-reactive paths, or one simulation from another (e.g. two enantiomers).
 
 Every analysis is WHAM-weighted, so paths sampled in different TIS ensembles are
-combined without bias, and everything is resolved **per interface** — a CV that
-matters at λ₀ is often not the one that matters near λ_max.
+combined without bias, and everything is resolved **per interface**
 
 ## Install
 
@@ -25,6 +24,7 @@ which are kept out of the base install because they are large:
 pip install -e '.[deeptda]'      # add the DeepTDA stack
 pip install -e '.[dev]'          # pytest + ruff
 ```
+[mlcolvar](https://mlcolvar.readthedocs.io/en/stable/installation.html)
 
 ## Input layout
 
@@ -62,7 +62,6 @@ chiroflux COMMAND --help
 A typical single-simulation run:
 
 ```bash
-chiroflux statistics -toml infretis.toml -data infretis_data.txt -cv-dir ML
 chiroflux shap-ml    -toml infretis.toml -data infretis_data.txt -cv-dir ML
 ```
 
@@ -71,8 +70,8 @@ Comparing two simulations (e.g. L and D enantiomers). These commands take a
 CV folder inside it:
 
 ```bash
-chiroflux shap-enantiomer          -dir-l L -dir-d D
-chiroflux prepare-deeptda-data-ld  -dir-l L -dir-d D
+chiroflux shap-enantiomer          -dir-l /path/to/L/folder/ -dir-d /path/to/D/folder/
+chiroflux prepare-deeptda-data-ld  -dir-l /path/to/L/folder/ -dir-d /path/to/D/folder/
 chiroflux train-deeptda -npz deeptda_ld_dataset.npz -class-names L,D
 ```
 
@@ -113,11 +112,6 @@ Columns already folded to `cos(...)`/`cos2(...)` by `-angle-cols` are skipped
 by `-flip-*` with a warning, since they hold values in [−1, 1] rather
 than degrees. (Negating them is the equivalent operation there, because
 −cos θ = cos(180 − θ).)
-
-> **Renamed before v0.1.0.** `-flip-*` was `-shift-*` and then briefly
-> `-mirror-*`; `-mirror-*` was `-negate-*`. "Shift" wrongly implied a +90°
-> translation, and "mirror" belongs on the chirality operation, not on the
-> leaflet one.
 
 ## Library use
 
