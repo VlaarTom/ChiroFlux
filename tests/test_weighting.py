@@ -4,11 +4,14 @@ These are the pure-numeric pieces the analyses lean on, so they can be
 checked without any simulation input.
 """
 
+import warnings
+
 import numpy as np
 import pytest
 
 from chiroflux.cvs import (
-    _apply_cv_entry_flip,
+    _apply_cv_flip,
+    _apply_z_corrections,
     _frame_count_after_subsample,
     _subsample_frames,
 )
@@ -180,47 +183,47 @@ class TestEntryFlip:
         return np.array(values, dtype=float).reshape(-1, 1, 1)
 
     def test_maps_theta_to_180_minus_theta(self):
-        out, _ = _apply_cv_entry_flip(self._arr([0, 30, 90, 150, 180]), ["tilt"], ["tilt"])
+        out, _ = _apply_cv_flip(self._arr([0, 30, 90, 150, 180]), ["tilt"], ["tilt"])
         assert out.ravel() == pytest.approx([180, 150, 90, 30, 0])
 
     def test_is_not_a_plus_90_shift(self):
         """The name and the old help text said +90; that would give 120, not 60."""
-        out, _ = _apply_cv_entry_flip(self._arr([120.0]), ["tilt"], ["tilt"])
+        out, _ = _apply_cv_flip(self._arr([120.0]), ["tilt"], ["tilt"])
         assert out.ravel()[0] == pytest.approx(60.0)
 
     def test_ninety_degrees_is_the_fixed_point(self):
-        out, _ = _apply_cv_entry_flip(self._arr([90.0]), ["tilt"], ["tilt"])
+        out, _ = _apply_cv_flip(self._arr([90.0]), ["tilt"], ["tilt"])
         assert out.ravel()[0] == pytest.approx(90.0)
 
     def test_is_its_own_inverse(self):
         original = self._arr([0, 17, 90, 133, 180])
-        once, names = _apply_cv_entry_flip(original, ["tilt"], ["tilt"])
-        twice, _ = _apply_cv_entry_flip(once, names, ["tilt"])
+        once, names = _apply_cv_flip(original, ["tilt"], ["tilt"])
+        twice, _ = _apply_cv_flip(once, names, ["tilt"])
         assert twice == pytest.approx(original)
 
     def test_preserves_the_zero_to_180_domain(self):
-        out, _ = _apply_cv_entry_flip(self._arr(np.linspace(0, 180, 50)), ["tilt"], ["tilt"])
+        out, _ = _apply_cv_flip(self._arr(np.linspace(0, 180, 50)), ["tilt"], ["tilt"])
         assert out.min() >= 0.0 and out.max() <= 180.0
 
     def test_flips_the_sign_of_the_cosine(self):
         angles = np.linspace(0, 180, 25)
-        out, _ = _apply_cv_entry_flip(self._arr(angles), ["tilt"], ["tilt"])
+        out, _ = _apply_cv_flip(self._arr(angles), ["tilt"], ["tilt"])
         assert np.cos(np.deg2rad(out.ravel())) == pytest.approx(-np.cos(np.deg2rad(angles)))
 
     def test_leaves_unmatched_columns_alone(self):
         arr = np.array([[[10.0], [20.0]]])  # 1 path, 2 CVs, 1 interface
-        out, _ = _apply_cv_entry_flip(arr, ["tilt", "other"], ["tilt"])
+        out, _ = _apply_cv_flip(arr, ["tilt", "other"], ["tilt"])
         assert out[0, 0, 0] == pytest.approx(170.0)
         assert out[0, 1, 0] == pytest.approx(20.0)
 
     def test_does_not_mutate_the_input(self):
         arr = self._arr([30.0])
-        _apply_cv_entry_flip(arr, ["tilt"], ["tilt"])
+        _apply_cv_flip(arr, ["tilt"], ["tilt"])
         assert arr.ravel()[0] == pytest.approx(30.0)
 
     def test_empty_substring_list_is_a_no_op(self):
         arr = self._arr([30.0])
-        out, names = _apply_cv_entry_flip(arr, ["tilt"], [])
+        out, names = _apply_cv_flip(arr, ["tilt"], [])
         assert out is arr and names == ["tilt"]
 
     def test_skips_already_cosine_folded_columns(self):
@@ -228,5 +231,48 @@ class TestEntryFlip:
         substring match can otherwise hit a value in [-1,1] and return ~179."""
         arr = self._arr([0.5])
         with pytest.warns(UserWarning, match="already in cosine form"):
-            out, _ = _apply_cv_entry_flip(arr, ["cos(tilt)"], ["tilt"])
+            out, _ = _apply_cv_flip(arr, ["cos(tilt)"], ["tilt"])
         assert out.ravel()[0] == pytest.approx(0.5)
+
+
+class TestZCorrectionExcludeGuard:
+    """A z-column missing because -exclude dropped it is expected, not an error.
+
+    -exclude matches by SUBSTRING, so the guard has to use the same predicate
+    the column discovery used; exact list membership silently misses.
+    """
+
+    NAMES = ["z_Memb", "z_O3_B"]          # z_O2_T already dropped by -exclude
+    Z_COLS = ["z_O2_T", "z_O3_B"]
+
+    def _run(self, exclude_list, capsys=None):
+        arr = np.zeros((2, len(self.NAMES), 1))
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            _apply_z_corrections(arr, list(self.NAMES), self.Z_COLS, exclude_list)
+        return [str(w.message) for w in caught]
+
+    def test_substring_exclude_does_not_warn(self):
+        """The reported bug: '-exclude O2' must silence z_O2_T."""
+        assert self._run(["O2"]) == []
+
+    def test_exact_name_exclude_does_not_warn(self):
+        assert self._run(["z_O2_T"]) == []
+
+    def test_prints_a_single_note_instead(self, capsys):
+        self._run(["O2"])
+        out = capsys.readouterr().out
+        assert out.count("\n") == 1
+        assert "z_O2_T" in out and "-exclude" in out
+
+    def test_a_genuine_typo_still_warns(self):
+        """Only excluded columns get a pass; a typo must stay loud."""
+        messages = self._run(["something_else"])
+        assert len(messages) == 1
+        assert "z_O2_T" in messages[0]
+
+    def test_none_exclude_list_does_not_crash(self):
+        """`col in None` used to raise TypeError for every caller that
+        omitted -exclude, which is most of them."""
+        messages = self._run(None)
+        assert len(messages) == 1  # warns, but does not raise

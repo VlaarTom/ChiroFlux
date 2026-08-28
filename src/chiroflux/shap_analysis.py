@@ -633,13 +633,16 @@ def shap_ml(
     pnr, maxop, path_f, path_w = _load_path_table(data, nskip, M)
     path_weights = _compute_path_weights(maxop, path_f, path_w, interfaces)
 
+    # Split once: both the column discovery and the z-correction need the
+    # substrings as a list, not as the raw comma-separated string.
+    exclude_list = exclude.split(",") if exclude else None
     cv_array, cv_names, _ = _extract_cv_crossings(
         cv_dir=cv_dir,
         pnr_expected=pnr,
         subgrid=interfaces,
         op_col=op_col,
         cv_cols=cv_cols.split(",") if cv_cols else None,
-        exclude=exclude.split(",") if exclude else None,
+        exclude=exclude_list,
     )
     cv_array, cv_names = _apply_angle_transforms(
         cv_array, cv_names,
@@ -649,7 +652,7 @@ def shap_ml(
     cv_array, cv_names = _apply_z_corrections(
         cv_array, cv_names,
         z_cols=z_cols_list,
-        exclude_list=exclude,
+        exclude_list=exclude_list,
         z_ref="z_Memb",
         drop_ref=drop_z_ref,
     )

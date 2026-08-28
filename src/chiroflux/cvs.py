@@ -13,12 +13,15 @@ adjustments needed before CVs from different sources are comparable:
 * frame subsampling, with a matching count-only version used to size output
   arrays before the data is read.
 
-Depends only on numpy.
+Depends only on numpy, plus ``pathdata`` for the shared name predicate that
+decides whether a missing column was deliberately excluded.
 """
 
 import warnings
 
 import numpy as np
+
+from .pathdata import _matches_exclude
 
 
 def _apply_angle_transforms(cv_array, cv_names, cos_cols=None, cos2_cols=None):
@@ -112,14 +115,17 @@ def _apply_z_corrections(cv_array, cv_names, z_cols=None, exclude_list=None, z_r
 
     cv_array = cv_array.copy()
     for col in z_cols:
-        if col in exclude_list:
-            print(f"  Skipping '{col}' because it is in the exclude list.")
-            continue
         if col not in cv_names:
-            warnings.warn(
-                f"-z-cols: '{col}' not found in CV names {cv_names}; skipping.",
-                stacklevel=2,
-            )
+            # Absent for two very different reasons. If -exclude dropped it,
+            # that was deliberate and only worth a note; anything else is
+            # probably a typo in -z-cols and deserves a warning.
+            if _matches_exclude(col, exclude_list):
+                print(f"  Skipping z-correction for '{col}': dropped by -exclude.")
+            else:
+                warnings.warn(
+                    f"-z-cols: '{col}' not found in CV names {cv_names}; skipping.",
+                    stacklevel=2,
+                )
             continue
         idx = cv_names.index(col)
         cv_array[:, idx, :] -= cv_array[:, ref_idx, :]
@@ -144,7 +150,7 @@ def _apply_cv_mirror(cv_array, cv_names, mirror_substrings):
     Only meaningful for CVs on a signed, zero-centred domain such as
     [-180, 180]. An unsigned angle from ``arccos`` lives on [0, 180], and
     negating it would move it to [-180, 0], off its own domain - use
-    ``_apply_cv_entry_flip`` for those instead.
+    ``_apply_cv_flip`` for those instead.
 
     Operates on a copy of cv_array so the original is not mutated.
 

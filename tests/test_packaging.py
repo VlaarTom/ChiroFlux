@@ -153,18 +153,26 @@ def test_module_does_not_import_the_ml_stack(module):
     assert out.stdout.strip() == "", f"{module} pulled in: {out.stdout.strip()}"
 
 
-def test_support_modules_have_no_internal_dependencies():
-    """pathdata and cvs are the bottom of the stack; if they grow an import of
-    an analysis module, the layering (and the guarantee above) is gone."""
+def test_support_module_layering_holds():
+    """pathdata is the bottom of the stack and must import nothing internal;
+    cvs and plotting sit directly on it and may import only pathdata.
+
+    If a support module grows an import of an analysis module, the layering -
+    and the ML-free guarantee above - is gone.
+    """
     import ast
     from pathlib import Path
 
+    allowed = {"pathdata": set(), "cvs": {"pathdata"}, "plotting": {"pathdata"}}
     src_dir = Path(__file__).resolve().parents[1] / "src" / "chiroflux"
-    for name in ("pathdata", "cvs"):
+    for name, permitted in allowed.items():
         tree = ast.parse((src_dir / f"{name}.py").read_text())
-        relative = [
+        relative = {
             n.module
             for n in ast.walk(tree)
             if isinstance(n, ast.ImportFrom) and n.level > 0
-        ]
-        assert relative == [], f"{name}.py should import nothing from the package"
+        }
+        assert relative <= permitted, (
+            f"{name}.py imports {sorted(relative - permitted)}; "
+            f"only {sorted(permitted) or 'nothing'} is allowed"
+        )

@@ -405,8 +405,10 @@ def shap_enantiomer(
     cv_arr_d, cv_names_d = _apply_angle_transforms(
         cv_arr_d, cv_names_d, cos_cols_list, cos2_cols_list
     )
-    cv_arr_l, cv_names_l = _apply_z_corrections(cv_arr_l, cv_names_l, z_cols_list, _excl_l_only, drop_ref=drop_z_ref)
-    cv_arr_d, cv_names_d = _apply_z_corrections(cv_arr_d, cv_names_d, z_cols_list, _excl_d_only, drop_ref=drop_z_ref)
+    # Full per-simulation exclude list (shared -exclude plus the -exclude-l/-d
+    # extras), matching what actually dropped the columns during discovery.
+    cv_arr_l, cv_names_l = _apply_z_corrections(cv_arr_l, cv_names_l, z_cols_list, exclude_list_l, drop_ref=drop_z_ref)
+    cv_arr_d, cv_names_d = _apply_z_corrections(cv_arr_d, cv_names_d, z_cols_list, exclude_list_d, drop_ref=drop_z_ref)
 
     # ── Enantiomer mirror: θ → −θ ──────────────────────────────────────────
     # For signed chirality-odd CVs (dihedrals in [-180,180]), where L has φ
