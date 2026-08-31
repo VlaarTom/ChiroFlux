@@ -23,6 +23,9 @@ import datetime
 import warnings
 from pathlib import Path
 from typing import Annotated, Optional
+import os
+os.environ["OMP_NUM_THREADS"] = "1"
+
 
 import joblib
 import matplotlib

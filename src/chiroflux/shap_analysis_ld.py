@@ -29,6 +29,7 @@ CLI command: ``inft shap-enantiomer``
 
 import datetime
 import os
+os.environ["OMP_NUM_THREADS"] = "1"
 import warnings
 from pathlib import Path
 from typing import Annotated, Optional
