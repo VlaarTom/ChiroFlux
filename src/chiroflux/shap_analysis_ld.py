@@ -37,10 +37,12 @@ import numpy as np
 import tomli
 import typer
 
+from . import panels
 from .cvs import (
     _apply_angle_transforms,
     _apply_cv_flip,
     _apply_cv_mirror,
+    _apply_cv_phase_shift,
     _apply_cv_rename,
     _apply_z_corrections,
 )
@@ -242,39 +244,54 @@ def _compute_common_grid(interfaces_l, interfaces_d):
 
 
 def shap_enantiomer(
-    dir_l: Annotated[str, typer.Option("-dir-l", help="Root directory of the L simulation")] = "L",
-    dir_d: Annotated[str, typer.Option("-dir-d", help="Root directory of the D simulation")] = "D",
-    toml_l: Annotated[str, typer.Option("-toml-l", help="Toml filename inside -dir-l")] = "infretis.toml",
-    data_l: Annotated[str, typer.Option("-data-l", help="Data filename inside -dir-l")] = "infretis_data.txt",
-    toml_d: Annotated[str, typer.Option("-toml-d", help="Toml filename inside -dir-d")] = "infretis.toml",
-    data_d: Annotated[str, typer.Option("-data-d", help="Data filename inside -dir-d")] = "infretis_data.txt",
-    op_col: Annotated[str, typer.Option("-op-col", help="Order-parameter column name")] = "OP_Lamb",
-    name_cv_cols: Annotated[Optional[str], typer.Option("-name-cv-cols", help="Comma-separated 'old:new' pairs to normalise CV names, e.g. '_l_:_u_' or '_l_:_u_,foo:bar'. Applied to both simulations after angle transforms, before the compatibility check.")] = None,
-    cv_cols: Annotated[Optional[str], typer.Option("-cv-cols", help="Comma-separated CV columns to use; default = all except -op-col")] = None,
-    exclude: Annotated[Optional[str], typer.Option("-exclude", help="Comma-separated substrings; CVs whose name matches are dropped from both simulations")] = None,
-    exclude_l: Annotated[Optional[str], typer.Option("-exclude-l", help="Comma-separated substrings; CVs whose name matches are dropped from the L simulation only")] = None,
-    exclude_d: Annotated[Optional[str], typer.Option("-exclude-d", help="Comma-separated substrings; CVs whose name matches are dropped from the D simulation only")] = None,
-    mirror_l: Annotated[Optional[str], typer.Option("-mirror-l", help="Enantiomer mirror (theta -> -theta) for the L simulation: comma-separated substrings; matching CVs are multiplied by -1. For SIGNED chirality-odd CVs such as dihedrals in [-180,180], where L has phi and D has -phi. Not for arccos angles in [0,180] - use -entry-flip-l (applied after z-corrections, before renaming)")] = None,
-    mirror_d: Annotated[Optional[str], typer.Option("-mirror-d", help="Enantiomer mirror (theta -> -theta) for the D simulation: comma-separated substrings; matching CVs are multiplied by -1. For SIGNED chirality-odd CVs such as dihedrals in [-180,180], where L has phi and D has -phi. Not for arccos angles in [0,180] - use -entry-flip-d (applied after z-corrections, before renaming)")] = None,
-    flip_l: Annotated[Optional[str], typer.Option("-flip-l", help="Opposite-leaflet entry correction (theta -> 180 - theta) for the L simulation: comma-separated substrings. For UNSIGNED angles measured against the membrane normal in [0,180]; swaps the +z (extracellular) and -z (intracellular) face. Not a chirality operation (applied after z-corrections, before renaming)")] = None,
-    flip_d: Annotated[Optional[str], typer.Option("-flip-d", help="Opposite-leaflet entry correction (theta -> 180 - theta) for the D simulation: comma-separated substrings. For UNSIGNED angles measured against the membrane normal in [0,180]; swaps the +z (extracellular) and -z (intracellular) face. Not a chirality operation (applied after z-corrections, before renaming)")] = None,
-    angle_cols: Annotated[Optional[str], typer.Option("-angle-cols", help="CV columns in degrees → cos(θ)  [asymmetric molecule]")] = None,
-    sym_angle_cols: Annotated[Optional[str], typer.Option("-sym-angle-cols", help="CV columns in degrees → cos²(θ)  [symmetric molecule]")] = None,
-    paths: Annotated[str, typer.Option("-paths", help="Which paths to include: 'all', 'reactive', 'nonreactive'")] = "all",
-    nskip: Annotated[int, typer.Option("-nskip", help="Skip first nskip rows of each infretis_data.txt")] = 1000,
-    models: Annotated[str, typer.Option("-models", help=f"Comma-separated models to run; choices: {', '.join(MODEL_CHOICES)}")] = "rf,gbm,lgbm,logreg,svm",
-    n_splits: Annotated[int, typer.Option("-n-splits", help="Number of stratified group CV folds")] = 5,
-    n_estimators: Annotated[int, typer.Option("-n-estimators", help="Trees per RandomForest / GradientBoosting")] = 300,
-    n_jobs: Annotated[int, typer.Option("-n-jobs", help="CPU cores; -1 = all")] = -1,
-    seed: Annotated[int, typer.Option("-seed", help="Random seed for fold splits and models")] = 42,
-    plot_dir: Annotated[str, typer.Option("-plot-dir", help="Base name for root directory for plots; each model gets a subdirectory")] = "ld_plots",
-    top_n: Annotated[int, typer.Option("-top-n", help="Top N CVs for SHAP dependence plots")] = 5,
-    out: Annotated[str, typer.Option("-out", help="Base name for ranking files; '_<model>.txt' is appended")] = "shap_ld_ranking.txt",
-    force_interfaces: Annotated[bool, typer.Option("-force-interfaces", help="Allow different interface counts between L and D; both grids are resampled to the shorter length via linear interpolation before averaging into a common grid")] = False,
-    drop_z_ref: Annotated[bool, typer.Option("-drop-z-ref", help="Remove the z-reference column (z_Memb) from the feature set after z-corrections are applied; the column is still used as the reference during correction")] = False,
-    optimize: Annotated[bool, typer.Option("-optimize", help="Run random hyperparameter search before the main k-fold loop; best params override -n-estimators and model defaults")] = False,
-    n_search_iter: Annotated[int, typer.Option("-n-search-iter", help="Number of random hyperparameter configurations to evaluate when -optimize is set")] = 20,
-    overw: Annotated[bool, typer.Option("-O", help="Overwrite existing files")] = False,
+    # ── Input data ────────────────────────────────────────────────────────
+    dir_l: Annotated[str, typer.Option("-dir-l", help="Root directory of the L simulation", rich_help_panel=panels.INPUT)] = "L",
+    dir_d: Annotated[str, typer.Option("-dir-d", help="Root directory of the D simulation", rich_help_panel=panels.INPUT)] = "D",
+    toml_l: Annotated[str, typer.Option("-toml-l", help="Toml filename inside -dir-l", rich_help_panel=panels.INPUT)] = "infretis.toml",
+    data_l: Annotated[str, typer.Option("-data-l", help="Data filename inside -dir-l", rich_help_panel=panels.INPUT)] = "infretis_data.txt",
+    toml_d: Annotated[str, typer.Option("-toml-d", help="Toml filename inside -dir-d", rich_help_panel=panels.INPUT)] = "infretis.toml",
+    data_d: Annotated[str, typer.Option("-data-d", help="Data filename inside -dir-d", rich_help_panel=panels.INPUT)] = "infretis_data.txt",
+    op_col: Annotated[str, typer.Option("-op-col", help="Order-parameter column name", rich_help_panel=panels.INPUT)] = "OP_Lamb",
+
+    # ── Dataset construction ──────────────────────────────────────────────
+    paths: Annotated[str, typer.Option("-paths", help="Which paths to include: 'all', 'reactive', 'nonreactive'", rich_help_panel=panels.DATASET)] = "all",
+    nskip: Annotated[int, typer.Option("-nskip", help="Skip first nskip rows of each infretis_data.txt", rich_help_panel=panels.DATASET)] = 1000,
+    force_interfaces: Annotated[bool, typer.Option("-force-interfaces", help="Allow different interface counts between L and D; both grids are resampled to the shorter length via linear interpolation before averaging into a common grid", rich_help_panel=panels.DATASET)] = False,
+
+    # ── CV selection ──────────────────────────────────────────────────────
+    cv_cols: Annotated[Optional[str], typer.Option("-cv-cols", help="Comma-separated CV columns to use; default = all except -op-col", rich_help_panel=panels.SELECT)] = None,
+    exclude: Annotated[Optional[str], typer.Option("-exclude", help="Comma-separated substrings; CVs whose name matches are dropped from both simulations", rich_help_panel=panels.SELECT)] = None,
+    exclude_l: Annotated[Optional[str], typer.Option("-exclude-l", help="Comma-separated substrings; CVs whose name matches are dropped from the L simulation only", rich_help_panel=panels.SELECT)] = None,
+    exclude_d: Annotated[Optional[str], typer.Option("-exclude-d", help="Comma-separated substrings; CVs whose name matches are dropped from the D simulation only", rich_help_panel=panels.SELECT)] = None,
+    name_cv_cols: Annotated[Optional[str], typer.Option("-name-cv-cols", help="Comma-separated 'old:new' pairs to normalise CV names, e.g. '_l_:_u_' or '_l_:_u_,foo:bar'. Applied to both simulations after angle transforms, before the compatibility check. NOTE: substitutions run in order, so a two-way swap ('_u_:_l_,_l_:_u_') collapses both onto one name.", rich_help_panel=panels.SELECT)] = None,
+
+    # ── CV corrections (representation) ───────────────────────────────────
+    angle_cols: Annotated[Optional[str], typer.Option("-angle-cols", help="CV columns in degrees → cos(θ)  [asymmetric molecule]", rich_help_panel=panels.REPR)] = None,
+    sym_angle_cols: Annotated[Optional[str], typer.Option("-sym-angle-cols", help="CV columns in degrees → cos²(θ)  [symmetric molecule, or any angle whose reference vector has an arbitrary sign]", rich_help_panel=panels.REPR)] = None,
+    drop_z_ref: Annotated[bool, typer.Option("-drop-z-ref", help="Remove the z-reference column (z_Memb) from the feature set after z-corrections are applied; the column is still used as the reference during correction", rich_help_panel=panels.REPR)] = False,
+
+    # ── CV corrections (symmetry, per simulation) ─────────────────────────
+    mirror_l: Annotated[Optional[str], typer.Option("-mirror-l", help="Enantiomer mirror (θ → −θ) for the L simulation: comma-separated substrings; matching CVs are multiplied by -1. For SIGNED chirality-odd CVs such as dihedrals in [-180,180], where L has φ and D has −φ. Not for arccos angles in [0,180] - use -flip-l (applied after z-corrections, before renaming)", rich_help_panel=panels.SYMMETRY)] = None,
+    mirror_d: Annotated[Optional[str], typer.Option("-mirror-d", help="Enantiomer mirror (θ → −θ) for the D simulation: comma-separated substrings; matching CVs are multiplied by -1. For SIGNED chirality-odd CVs such as dihedrals in [-180,180], where L has φ and D has −φ. Not for arccos angles in [0,180] - use -flip-d (applied after z-corrections, before renaming)", rich_help_panel=panels.SYMMETRY)] = None,
+    flip_l: Annotated[Optional[str], typer.Option("-flip-l", help="Opposite-leaflet entry correction (θ → 180 − θ) for the L simulation: comma-separated substrings. For UNSIGNED angles measured against the membrane normal in [0,180]; swaps the +z (extracellular) and −z (intracellular) face. Not a chirality operation (applied after z-corrections, before renaming)", rich_help_panel=panels.SYMMETRY)] = None,
+    flip_d: Annotated[Optional[str], typer.Option("-flip-d", help="Opposite-leaflet entry correction (θ → 180 − θ) for the D simulation: comma-separated substrings. For UNSIGNED angles measured against the membrane normal in [0,180]; swaps the +z (extracellular) and −z (intracellular) face. Not a chirality operation (applied after z-corrections, before renaming)", rich_help_panel=panels.SYMMETRY)] = None,
+    phase_shift_l: Annotated[Optional[str], typer.Option("-phase-shift-l", help="Half-turn phase advance (φ → φ + 180, wrapped to (-180,180]) for the L simulation: comma-separated substrings. For PERIODIC PHASES whose mirror image is half a cycle away rather than negated - e.g. the Cremer-Pople puckering phase PRO_CP_phi2, whose mirror is φ+180, not −φ (applied after z-corrections, before renaming)", rich_help_panel=panels.SYMMETRY)] = None,
+    phase_shift_d: Annotated[Optional[str], typer.Option("-phase-shift-d", help="Half-turn phase advance (φ → φ + 180, wrapped to (-180,180]) for the D simulation: comma-separated substrings. For PERIODIC PHASES whose mirror image is half a cycle away rather than negated - e.g. the Cremer-Pople puckering phase PRO_CP_phi2, whose mirror is φ+180, not −φ (applied after z-corrections, before renaming)", rich_help_panel=panels.SYMMETRY)] = None,
+
+    # ── Model and training ────────────────────────────────────────────────
+    models: Annotated[str, typer.Option("-models", help=f"Comma-separated models to run; choices: {', '.join(MODEL_CHOICES)}", rich_help_panel=panels.MODEL)] = "rf,gbm,lgbm,logreg,svm",
+    n_splits: Annotated[int, typer.Option("-n-splits", help="Number of stratified group CV folds", rich_help_panel=panels.MODEL)] = 5,
+    n_estimators: Annotated[int, typer.Option("-n-estimators", help="Trees per RandomForest / GradientBoosting", rich_help_panel=panels.MODEL)] = 300,
+    optimize: Annotated[bool, typer.Option("-optimize", help="Run random hyperparameter search before the main k-fold loop; best params override -n-estimators and model defaults", rich_help_panel=panels.MODEL)] = False,
+    n_search_iter: Annotated[int, typer.Option("-n-search-iter", help="Number of random hyperparameter configurations to evaluate when -optimize is set", rich_help_panel=panels.MODEL)] = 20,
+    seed: Annotated[int, typer.Option("-seed", help="Random seed for fold splits and models", rich_help_panel=panels.MODEL)] = 42,
+    n_jobs: Annotated[int, typer.Option("-n-jobs", help="CPU cores; -1 = all", rich_help_panel=panels.MODEL)] = -1,
+
+    # ── Output ────────────────────────────────────────────────────────────
+    out: Annotated[str, typer.Option("-out", help="Base name for ranking files; '_<model>.txt' is appended", rich_help_panel=panels.OUTPUT)] = "shap_ld_ranking.txt",
+    plot_dir: Annotated[str, typer.Option("-plot-dir", help="Base name for root directory for plots; each model gets a subdirectory", rich_help_panel=panels.OUTPUT)] = "ld_plots",
+    top_n: Annotated[int, typer.Option("-top-n", help="Top N CVs for SHAP dependence plots", rich_help_panel=panels.OUTPUT)] = 5,
+    overw: Annotated[bool, typer.Option("-O", help="Overwrite existing files", rich_help_panel=panels.OUTPUT)] = False,
 ):
     """L vs D enantiomer SHAP analysis: which CVs distinguish the two simulations?
 
@@ -426,6 +443,15 @@ def shap_enantiomer(
     flip_d_list = flip_d.split(",") if flip_d else []
     cv_arr_l, cv_names_l = _apply_cv_flip(cv_arr_l, cv_names_l, flip_l_list)
     cv_arr_d, cv_names_d = _apply_cv_flip(cv_arr_d, cv_names_d, flip_d_list)
+
+    # ── Half-turn phase advance: φ → φ + 180 ───────────────────────────────
+    # For periodic phases whose mirror image is half a cycle away rather than
+    # negated - the Cremer-Pople puckering phase is the case in point, since
+    # its ring normal is a pseudovector (mirror of C3-endo is C3-exo).
+    phase_shift_l_list = phase_shift_l.split(",") if phase_shift_l else []
+    phase_shift_d_list = phase_shift_d.split(",") if phase_shift_d else []
+    cv_arr_l, cv_names_l = _apply_cv_phase_shift(cv_arr_l, cv_names_l, phase_shift_l_list)
+    cv_arr_d, cv_names_d = _apply_cv_phase_shift(cv_arr_d, cv_names_d, phase_shift_d_list)
 
     # ── CV name normalisation (e.g. _l_ → _u_) ────────────────────────────
     # This solves name mismatch between L and D if the direction of the simulation was different

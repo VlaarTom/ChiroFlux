@@ -46,6 +46,7 @@ from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold, Strat
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 
+from . import panels
 from .cvs import _apply_angle_transforms, _apply_z_corrections
 from .pathdata import (
     _check_overwrite,
@@ -594,27 +595,38 @@ def _plot_calibration(oof_true, oof_proba, out_path, n_bins=10, overw=False):
 
 
 def shap_ml(
-    toml: Annotated[str, typer.Option("-toml", help="The .toml file")] = "infretis.toml",
-    data: Annotated[str, typer.Option("-data", help="The infretis_data.txt file")] = "infretis_data.txt",
-    cv_dir: Annotated[str, typer.Option("-cv-dir", help="Path data folder with CV values in .txt files")] = "ML",
-    op_col: Annotated[str, typer.Option("-op-col", help="Order-parameter column name")] = "OP_Lamb",
-    cv_cols: Annotated[Optional[str], typer.Option("-cv-cols", help="Comma-separated CV columns to use; default = all except -op-col")] = None,
-    exclude: Annotated[Optional[str], typer.Option("-exclude", help="Comma-separated substrings; CVs whose name matches one are dropped (only applied when -cv-cols is unset)")] = None,
-    angle_cols: Annotated[Optional[str], typer.Option("-angle-cols", help="Comma-separated CV columns in degrees to convert to cos(θ); use for asymmetric molecules where 0° and 180° are distinct orientations")] = None,
-    sym_angle_cols: Annotated[Optional[str], typer.Option("-sym-angle-cols", help="Comma-separated CV columns in degrees to convert to cos²(θ); use for head-tail symmetric molecules where θ and 180°−θ are equivalent")] = None,
-    nskip: Annotated[int, typer.Option("-nskip", help="Skip the first nskip rows of infretis_data.txt")] = 1000,
-    models: Annotated[str, typer.Option("-models", help=f"Comma-separated models to run; choices: {', '.join(MODEL_CHOICES)}")] = "rf,gbm,lgbm,logreg,svm",
-    n_splits: Annotated[int, typer.Option("-n-splits", help="Number of stratified CV folds")] = 5,
-    n_estimators: Annotated[int, typer.Option("-n-estimators", help="Trees per RandomForest / GradientBoosting / LightGBM")] = 300,
-    n_jobs: Annotated[int, typer.Option("-n-jobs", help="CPU cores for RF, LGBM, and LogReg; -1 = all (sklearn GBM is always single-threaded)")] = -1,
-    seed: Annotated[int, typer.Option("-seed", help="Random seed for fold splits and models")] = 42,
-    plot_dir: Annotated[str, typer.Option("-plot-dir", help="Root directory for plots; each model gets a subdirectory")] = "shap_ml_plots",
-    top_n: Annotated[int, typer.Option("-top-n", help="Number of top CVs for SHAP dependence plots per interface")] = 3,
-    out: Annotated[str, typer.Option("-out", help="Base name for ranking files; '_<model>.txt' is appended")] = "shap_ranking.txt",
-    drop_z_ref: Annotated[bool, typer.Option("-drop-z-ref", help="Remove the z-reference column (z_Memb) from the feature set after z-corrections are applied; the column is still used as the reference during correction")] = False,
-    optimize: Annotated[bool, typer.Option("-optimize", help="Run random hyperparameter search before the main k-fold loop; best params override -n-estimators and model defaults")] = False,
-    n_search_iter: Annotated[int, typer.Option("-n-search-iter", help="Number of random hyperparameter configurations to evaluate when -optimize is set")] = 20,
-    overw: Annotated[bool, typer.Option("-O", help="Force overwriting of existing files")] = False,
+    # ── Input data ────────────────────────────────────────────────────────
+    toml: Annotated[str, typer.Option("-toml", help="The .toml file", rich_help_panel=panels.INPUT)] = "infretis.toml",
+    data: Annotated[str, typer.Option("-data", help="The infretis_data.txt file", rich_help_panel=panels.INPUT)] = "infretis_data.txt",
+    cv_dir: Annotated[str, typer.Option("-cv-dir", help="Path data folder with CV values in .txt files", rich_help_panel=panels.INPUT)] = "ML",
+    op_col: Annotated[str, typer.Option("-op-col", help="Order-parameter column name", rich_help_panel=panels.INPUT)] = "OP_Lamb",
+
+    # ── Dataset construction ──────────────────────────────────────────────
+    nskip: Annotated[int, typer.Option("-nskip", help="Skip the first nskip rows of infretis_data.txt", rich_help_panel=panels.DATASET)] = 1000,
+
+    # ── CV selection ──────────────────────────────────────────────────────
+    cv_cols: Annotated[Optional[str], typer.Option("-cv-cols", help="Comma-separated CV columns to use; default = all except -op-col", rich_help_panel=panels.SELECT)] = None,
+    exclude: Annotated[Optional[str], typer.Option("-exclude", help="Comma-separated substrings; CVs whose name matches one are dropped (only applied when -cv-cols is unset)", rich_help_panel=panels.SELECT)] = None,
+
+    # ── CV corrections (representation) ───────────────────────────────────
+    angle_cols: Annotated[Optional[str], typer.Option("-angle-cols", help="Comma-separated CV columns in degrees to convert to cos(θ); use for asymmetric molecules where 0° and 180° are distinct orientations", rich_help_panel=panels.REPR)] = None,
+    sym_angle_cols: Annotated[Optional[str], typer.Option("-sym-angle-cols", help="Comma-separated CV columns in degrees to convert to cos²(θ); use for head-tail symmetric molecules where θ and 180°−θ are equivalent, or any angle whose reference vector has an arbitrary sign", rich_help_panel=panels.REPR)] = None,
+    drop_z_ref: Annotated[bool, typer.Option("-drop-z-ref", help="Remove the z-reference column (z_Memb) from the feature set after z-corrections are applied; the column is still used as the reference during correction", rich_help_panel=panels.REPR)] = False,
+
+    # ── Model and training ────────────────────────────────────────────────
+    models: Annotated[str, typer.Option("-models", help=f"Comma-separated models to run; choices: {', '.join(MODEL_CHOICES)}", rich_help_panel=panels.MODEL)] = "rf,gbm,lgbm,logreg,svm",
+    n_splits: Annotated[int, typer.Option("-n-splits", help="Number of stratified CV folds", rich_help_panel=panels.MODEL)] = 5,
+    n_estimators: Annotated[int, typer.Option("-n-estimators", help="Trees per RandomForest / GradientBoosting / LightGBM", rich_help_panel=panels.MODEL)] = 300,
+    optimize: Annotated[bool, typer.Option("-optimize", help="Run random hyperparameter search before the main k-fold loop; best params override -n-estimators and model defaults", rich_help_panel=panels.MODEL)] = False,
+    n_search_iter: Annotated[int, typer.Option("-n-search-iter", help="Number of random hyperparameter configurations to evaluate when -optimize is set", rich_help_panel=panels.MODEL)] = 20,
+    seed: Annotated[int, typer.Option("-seed", help="Random seed for fold splits and models", rich_help_panel=panels.MODEL)] = 42,
+    n_jobs: Annotated[int, typer.Option("-n-jobs", help="CPU cores for RF, LGBM, and LogReg; -1 = all (sklearn GBM is always single-threaded)", rich_help_panel=panels.MODEL)] = -1,
+
+    # ── Output ────────────────────────────────────────────────────────────
+    out: Annotated[str, typer.Option("-out", help="Base name for ranking files; '_<model>.txt' is appended", rich_help_panel=panels.OUTPUT)] = "shap_ranking.txt",
+    plot_dir: Annotated[str, typer.Option("-plot-dir", help="Root directory for plots; each model gets a subdirectory", rich_help_panel=panels.OUTPUT)] = "shap_ml_plots",
+    top_n: Annotated[int, typer.Option("-top-n", help="Number of top CVs for SHAP dependence plots per interface", rich_help_panel=panels.OUTPUT)] = 3,
+    overw: Annotated[bool, typer.Option("-O", help="Force overwriting of existing files", rich_help_panel=panels.OUTPUT)] = False,
 ):
     """Per-interface SHAP feature-importance analysis across one or more classifiers.
 

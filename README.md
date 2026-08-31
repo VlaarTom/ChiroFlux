@@ -83,6 +83,72 @@ chiroflux pca -toml L/infretis.toml -cv-dir L/ML \
               -toml2 D/infretis.toml -cv-dir2 D/ML -label1 L -label2 D
 ```
 
+### Worked example: two simulations entered from opposite leaflets
+
+L and D were run with the permeant entering from opposite sides of the
+membrane, so this run has to undo *both* a chirality convention and a
+direction-of-entry convention before the classifier sees the data:
+
+```bash
+chiroflux shap-enantiomer \
+  `# ── which simulations ──────────────────────────────────────────────` \
+  -dir-l data/L/ -dir-d data/D/ \
+  -data-l infretis_data_19.txt -data-d infretis_data_17.txt \
+  \
+  `# ── drop CVs that cannot inform an L/D comparison ──────────────────` \
+  `# z_O2/z_O3/z_C2/z_C3/z_N/z_P: lipid-atom families kept as controls in CV data ` \
+  `# intentially kept manually instead of one flag to exclude those               ` \
+  `# ACSF, z_PRO, cen_vec: not discriminating here                                ` \
+  -exclude z_O,z_C,z_N,z_P,cen_vec,ACSF,lambda \
+  \
+  `# ── collapse the leaflet pairs onto one naming scheme ──────────────` \
+  `# Keep only the LOWER-leaflet columns of L and the UPPER-leaflet    ` \
+  `# columns of D, then rename what survives to a single convention.   ` \
+  `# Dropping one side of each pair first is what makes the rename     ` \
+  `# safe: -name-cv-cols applies substitutions in order, so it cannot  ` \
+  `# express a genuine two-way swap.                                   ` \
+  -exclude-l _u_,2u,N_Pu \
+  -exclude-d _l_,2l,N_Pl \
+  -name-cv-cols _l_:_u_,2l:2u,N_Pl:N_Pu \
+  \
+  `# ── symmetry corrections, each applied to ONE simulation ───────────` \
+  `# theta -> 180 - theta: unsigned angles vs the membrane normal,     ` \
+  `# whose +z/-z face is swapped by the opposite entry direction.      ` \
+  -flip-d PRO_ang_C_CG,PRO_r_plane_chiral \
+  `# theta -> -theta: chirality-odd pseudoscalars, negated between     ` \
+  `# enantiomers by definition (dihedrals, signed volume, handed CNs). ` \
+  -mirror-d PRO_dih_,PRO_sign_vol,PRO_hCN_,PRO_nCos_,PRO_azim_ \
+  `# phi -> phi + 180: the Cremer-Pople phase, whose mirror is half a  ` \
+  `# pseudorotation cycle away rather than negated.                    ` \
+  -phase-shift-l PRO_CP_phi2 \
+  \
+  `# ── representation ─────────────────────────────────────────────────` \
+  `# z_Memb is the reference for the z-corrections; it carries no      ` \
+  `# independent signal, so drop it from the feature set afterwards.   ` \
+  -drop-z-ref \
+  \
+  `# ── model, parallelism, output ─────────────────────────────────────` \
+  -optimize -n-jobs 28 -O
+```
+
+Three things in this example are worth copying deliberately:
+
+- **Corrections are per simulation.** Each one is applied to L *or* D, never
+  both — applying the same correction to both cancels it. Which side you
+  correct is free (here `-phase-shift-l` brings L into D's frame while the
+  other two bring D into L's), as long as each CV is corrected exactly once.
+- **Substrings, not names.** `-exclude`, `-mirror-*`, `-flip-*` and
+  `-phase-shift-*` match by substring, so `PRO_dih_` catches both
+  `PRO_dih_chiral` and `PRO_dih_OH`. Keep them specific: a bare `PRO` would
+  match essentially every CV in this feature set. (`-angle-cols`,
+  `-sym-angle-cols` and `-z-cols` match **exact** names instead.)
+- **`-exclude` runs before the corrections.** A CV dropped there is not
+  available to be corrected. Note that `-exclude C2,C3,O2,O3` above also
+  removes the C2/O22-based handed coordination numbers, leaving
+  `PRO_hCN_Pu`/`PRO_hCN_Pl` as the only members of that family — worth
+  checking against your intent, since those pseudoscalars are the CVs most
+  able to resolve L from D.
+
 Note that options use a single dash (`-toml`, `-cv-dir`), matching the infretis
 tooling convention rather than the GNU `--long-option` style.
 
@@ -90,28 +156,42 @@ tooling convention rather than the GNU `--long-option` style.
 
 A CV that differs between L and D purely by convention will "perfectly"
 separate them while carrying no physical information, and will dominate any
-importance ranking. `shap-enantiomer` has two corrections for this. They fix
-*different* things, and which you need depends on how the angle is defined:
+importance ranking. `shap-enantiomer` has three corrections for this, grouped
+in `--help` under *CV corrections: symmetry*. They fix *different* things, and
+which you need depends on how the CV is defined:
 
 | flag | operation | corrects for | applies to |
 | --- | --- | --- | --- |
-| `-mirror-l` / `-mirror-d` | θ → −θ | **chirality**: a chirality-odd CV is negated between mirror-image enantiomers by definition, so L has φ where D has −φ | **signed** CVs on a zero-centred domain, e.g. a dihedral from `arctan2` in [−180, 180] |
+| `-mirror-l` / `-mirror-d` | θ → −θ | **chirality**: a chirality-odd CV is negated between mirror-image enantiomers by definition, so L has φ where D has −φ | **signed** CVs on a zero-centred domain — an `arctan2` dihedral in [−180, 180], a signed volume, a handed coordination number |
 | `-flip-l` / `-flip-d` | θ → 180 − θ | **direction of entry/internal/escape**: a permeant entering from the other leaflet sees the membrane normal reversed, swapping the +z (extracellular) and −z (intracellular) face | **unsigned** angles against the membrane normal, e.g. anything from `arccos` in [0, 180] |
+| `-phase-shift-l` / `-phase-shift-d` | φ → φ + 180 | **chirality of a periodic phase** whose reference vector is a pseudovector, so the mirror image lies half a cycle away rather than negated | **periodic phases** in (−180, 180] — e.g. a Cremer–Pople puckering phase, whose C3-endo mirrors to C3-exo |
+
+All three are their own inverse, and each should be applied to **one simulation
+only**, so its values become comparable to the other's.
 
 `-flip-*` is not a chirality operation — it will not turn L into D. 90°
 is its pivot because that is the flat-vs-vertical boundary: below 90° the
 reference face points toward +z, above it toward −z.
 
+`-phase-shift-*` exists because neither of the others is right for a puckering
+phase: the mirror is φ+180, not −φ and not 180−φ. It wraps back into
+(−180, 180] so the shifted simulation stays on the same domain as the
+unshifted one, and warns rather than silently re-basing a [0, 360) column.
+
 Match the flag to the domain. Negating an `arccos` angle sends [0, 180] to
-[−180, 0], off its own domain; entry-flipping a signed dihedral gives
-180 − (−170) = 350, likewise off-domain. Both operations are their own
-inverse, both flip the sign of the cosine, and both should be applied to one
-simulation only, so its values become comparable to the other's.
+[−180, 0], off its own domain; flipping a signed dihedral gives
+180 − (−170) = 350, likewise off-domain.
 
 Columns already folded to `cos(...)`/`cos2(...)` by `-angle-cols` are skipped
 by `-flip-*` with a warning, since they hold values in [−1, 1] rather
 than degrees. (Negating them is the equivalent operation there, because
 −cos θ = cos(180 − θ).)
+
+> **Known limitation.** `-name-cv-cols` applies its substitutions in order, so
+> it cannot express a two-way swap: `'_u_:_l_,_l_:_u_'` collapses both onto
+> `_u_` and silently produces duplicate column names. Leaflet-paired columns
+> (`*_u`/`*_l`, `z_*Top`/`z_*Bot`) therefore cannot currently be exchanged when
+> the two simulations were entered from opposite sides.
 
 ## Library use
 

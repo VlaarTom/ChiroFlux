@@ -11,6 +11,7 @@ import pytest
 
 from chiroflux.cvs import (
     _apply_cv_flip,
+    _apply_cv_phase_shift,
     _apply_z_corrections,
     _frame_count_after_subsample,
     _subsample_frames,
@@ -276,3 +277,63 @@ class TestZCorrectionExcludeGuard:
         omitted -exclude, which is most of them."""
         messages = self._run(None)
         assert len(messages) == 1  # warns, but does not raise
+
+
+class TestPhaseShift:
+    """phi -> phi + 180 (mod 360): the mirror of a periodic phase whose
+    reference vector is a pseudovector (e.g. Cremer-Pople phi2)."""
+
+    @staticmethod
+    def _arr(values):
+        return np.array(values, dtype=float).reshape(-1, 1, 1)
+
+    def _shift(self, values, names=("phi2",), subs=("phi2",)):
+        out, _ = _apply_cv_phase_shift(self._arr(values), list(names), list(subs))
+        return out.ravel()
+
+    def test_advances_by_half_a_turn(self):
+        assert self._shift([0.0, 45.0, -90.0]) == pytest.approx([180.0, -135.0, 90.0])
+
+    def test_result_stays_in_the_arctan2_interval(self):
+        out = self._shift(np.linspace(-179.9, 180.0, 200))
+        assert out.min() > -180.0 and out.max() <= 180.0
+
+    def test_is_its_own_inverse(self):
+        original = [-179.0, -90.0, 0.0, 45.0, 179.0, 180.0]
+        assert self._shift(self._shift(original)) == pytest.approx(original)
+
+    def test_really_is_a_180_degree_rotation(self):
+        """Both sine and cosine must negate - a half turn, not a reflection."""
+        xs = np.array([-170.0, -33.0, 0.0, 12.0, 175.0])
+        out = self._shift(xs)
+        assert np.cos(np.radians(out)) == pytest.approx(-np.cos(np.radians(xs)))
+        assert np.sin(np.radians(out)) == pytest.approx(-np.sin(np.radians(xs)))
+
+    def test_is_not_negation_and_not_the_180_minus_theta_flip(self):
+        """The whole reason this exists: neither of the other two is correct."""
+        x = 45.0
+        assert self._shift([x])[0] == pytest.approx(-135.0)
+        assert self._shift([x])[0] != pytest.approx(-x)        # not the mirror
+        assert self._shift([x])[0] != pytest.approx(180.0 - x)  # not the entry flip
+
+    def test_leaves_unmatched_columns_alone(self):
+        arr = np.array([[[10.0], [20.0]]])
+        out, _ = _apply_cv_phase_shift(arr, ["phi2", "other"], ["phi2"])
+        assert out[0, 0, 0] == pytest.approx(-170.0)
+        assert out[0, 1, 0] == pytest.approx(20.0)
+
+    def test_does_not_mutate_the_input(self):
+        arr = self._arr([45.0])
+        _apply_cv_phase_shift(arr, ["phi2"], ["phi2"])
+        assert arr.ravel()[0] == pytest.approx(45.0)
+
+    def test_empty_substring_list_is_a_no_op(self):
+        arr = self._arr([45.0])
+        out, names = _apply_cv_phase_shift(arr, ["phi2"], [])
+        assert out is arr and names == ["phi2"]
+
+    def test_warns_when_the_column_is_not_on_minus180_to_180(self):
+        """A [0,360) column would be silently re-based onto a different
+        convention from the simulation it is being compared against."""
+        with pytest.warns(UserWarning, match=r"outside \(-180, 180\]"):
+            _apply_cv_phase_shift(self._arr([0.0, 90.0, 270.0]), ["phi2"], ["phi2"])

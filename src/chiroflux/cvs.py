@@ -229,6 +229,63 @@ def _apply_cv_flip(cv_array, cv_names, entry_flip_substrings):
         cv_array[:, i, :] = 180.0 - cv_array[:, i, :]
     return cv_array, cv_names
 
+def _apply_cv_phase_shift(cv_array, cv_names, phase_shift_substrings):
+    """Advance a periodic phase by half a turn: phi -> phi + 180 (mod 360).
+
+    A third, distinct symmetry correction. Some chirality-sensitive CVs are
+    *phases* whose mirror image is half a cycle away rather than negated, so
+    neither ``_apply_cv_mirror`` (phi -> -phi) nor ``_apply_cv_flip``
+    (phi -> 180 - phi) is the right operation.
+
+    The Cremer-Pople puckering phase phi2 is the case this exists for. Its
+    ring normal is built intrinsically from R1 x R2, so it is a pseudovector:
+    under reflection every z_j changes sign and the phase maps to phi2 + 180,
+    not to -phi2 - the mirror image of a C3-endo pucker is C3-exo, half a
+    pseudorotation cycle away. The correct null comparison is therefore
+    P_L(phi2) against P_D(phi2 + 180).
+
+    The result is wrapped back into (-180, 180], the interval ``arctan2``
+    produces, so the shifted simulation stays on the same domain as the
+    unshifted one. A column on [0, 360) would need a different wrap; this
+    warns rather than silently re-basing it.
+
+    Applying it twice returns the original, like the other two corrections.
+
+    Parameters
+    ----------
+    cv_array                : (N_paths, N_cvs, N_interfaces) float, degrees.
+    cv_names                : list of CV column name strings.
+    phase_shift_substrings  : list of substrings; any CV whose name contains
+                              one is advanced by 180 degrees.
+
+    Returns
+    -------
+    cv_array : copy with the selected columns shifted by half a turn.
+    cv_names : unchanged.
+    """
+    if not phase_shift_substrings:
+        return cv_array, cv_names
+    cv_array = cv_array.copy()
+    for i, name in enumerate(cv_names):
+        if not any(sub in name for sub in phase_shift_substrings):
+            continue
+        col = cv_array[:, i, :]
+        finite = col[np.isfinite(col)]
+        if finite.size and (finite.max() > 180.0 or finite.min() <= -180.0):
+            warnings.warn(
+                f"'{name}' has values outside (-180, 180] "
+                f"(min {finite.min():.1f}, max {finite.max():.1f}); the phase "
+                "shift wraps to that interval and would change this column's "
+                "convention. Check that it really is an arctan2-style phase.",
+                stacklevel=2,
+            )
+        shifted = (col + 180.0) % 360.0            # -> [0, 360)
+        cv_array[:, i, :] = np.where(              # -> (-180, 180]
+            shifted > 180.0, shifted - 360.0, shifted
+        )
+    return cv_array, cv_names
+
+
 def _apply_cv_rename(cv_names, rename_pairs):
     """Apply substring substitutions to a list of CV names.
 

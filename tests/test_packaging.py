@@ -4,13 +4,14 @@ These do not touch simulation data - they cover the packaging itself: the
 public API, the CLI's lazy command loading, and the optional DeepTDA extra.
 """
 
+import inspect
 import subprocess
 import sys
 
 import pytest
 from typer.testing import CliRunner
 
-from chiroflux import cli
+from chiroflux import cli, panels
 
 runner = CliRunner()
 
@@ -125,6 +126,7 @@ ML_STACK = ("shap", "sklearn", "lightgbm", "pandas", "torch")
 # Modules that must stay clear of the machine-learning stack. shap_analysis and
 # shap_analysis_ld are deliberately absent: SHAP is what they are for.
 ML_FREE_MODULES = [
+    "chiroflux.panels",
     "chiroflux.pathdata",
     "chiroflux.cvs",
     "chiroflux.plotting",
@@ -163,7 +165,12 @@ def test_support_module_layering_holds():
     import ast
     from pathlib import Path
 
-    allowed = {"pathdata": set(), "cvs": {"pathdata"}, "plotting": {"pathdata"}}
+    allowed = {
+        "panels": set(),
+        "pathdata": set(),
+        "cvs": {"pathdata"},
+        "plotting": {"pathdata"},
+    }
     src_dir = Path(__file__).resolve().parents[1] / "src" / "chiroflux"
     for name, permitted in allowed.items():
         tree = ast.parse((src_dir / f"{name}.py").read_text())
@@ -176,3 +183,62 @@ def test_support_module_layering_holds():
             f"{name}.py imports {sorted(relative - permitted)}; "
             f"only {sorted(permitted) or 'nothing'} is allowed"
         )
+
+
+CANONICAL_PANEL_ORDER = [
+    panels.INPUT, panels.DATASET, panels.SELECT,
+    panels.REPR, panels.SYMMETRY, panels.MODEL, panels.OUTPUT,
+]
+
+
+def _option_panels(function):
+    """[(param name, panel title)] in declaration order, for typer Options."""
+    out = []
+    for name, param in inspect.signature(function).parameters.items():
+        for meta in getattr(param.annotation, "__metadata__", ()):
+            panel = getattr(meta, "rich_help_panel", None)
+            out.append((name, panel))
+    return out
+
+
+@pytest.mark.parametrize(
+    "module_name, function_name",
+    [("shap_analysis", "shap_ml"), ("shap_analysis_ld", "shap_enantiomer")],
+)
+def test_every_option_is_assigned_to_a_panel(module_name, function_name):
+    """An unpanelled option falls into the generic 'Options' box, away from
+    the group it belongs to - easy to miss when adding a flag."""
+    from importlib import import_module
+
+    fn = getattr(import_module(f"chiroflux.{module_name}"), function_name)
+    orphans = [name for name, panel in _option_panels(fn) if not panel]
+    assert orphans == [], f"{function_name}: no --help panel for {orphans}"
+
+
+@pytest.mark.parametrize(
+    "module_name, function_name",
+    [("shap_analysis", "shap_ml"), ("shap_analysis_ld", "shap_enantiomer")],
+)
+def test_panels_are_declared_in_the_canonical_order(module_name, function_name):
+    """Panels render in first-appearance order, so the signature order is what
+    the user sees. Commands must not disagree about it."""
+    from importlib import import_module
+
+    fn = getattr(import_module(f"chiroflux.{module_name}"), function_name)
+    seen = []
+    for _, panel in _option_panels(fn):
+        if panel and (not seen or seen[-1] != panel):
+            assert panel not in seen, f"{function_name}: panel {panel!r} is split"
+            seen.append(panel)
+    assert seen == [p for p in CANONICAL_PANEL_ORDER if p in seen], (
+        f"{function_name}: panels out of order\n  got      {seen}\n"
+        f"  expected {[p for p in CANONICAL_PANEL_ORDER if p in seen]}"
+    )
+
+
+def test_single_simulation_command_has_no_symmetry_panel():
+    """Symmetry corrections reconcile TWO simulations; offering them on the
+    single-simulation command would be meaningless."""
+    from chiroflux.shap_analysis import shap_ml
+
+    assert panels.SYMMETRY not in {p for _, p in _option_panels(shap_ml)}
