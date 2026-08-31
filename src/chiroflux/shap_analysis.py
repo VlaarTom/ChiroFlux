@@ -23,9 +23,6 @@ import datetime
 import warnings
 from pathlib import Path
 from typing import Annotated, Optional
-import os
-os.environ["OMP_NUM_THREADS"] = "1"
-
 
 import joblib
 import matplotlib
@@ -104,6 +101,27 @@ _PARAM_GRIDS = {
 _MAX_SVM_TRAIN = 5000
 
 
+def _single_threaded_workers():
+    """Context manager: joblib workers get one native thread each.
+
+    Guards against the second layer of over-subscription. Even with every
+    estimator's own ``n_jobs`` pinned to 1, each loky worker would otherwise
+    start a full-width OpenBLAS/MKL/OpenMP pool of its own, so N workers on an
+    N-core machine ask for N x N threads.
+
+    Setting ``OMP_NUM_THREADS`` in the parent does not cover this: it reaches
+    only OpenMP, while scikit-learn's own parallelism is joblib, and
+    LightGBM's ``num_threads`` overrides the variable anyway.
+
+    The backend has to be named explicitly - joblib rejects
+    ``inner_max_num_threads`` otherwise - so "loky" is stated, which is the
+    default these call sites would pick regardless. Only wrap process-based
+    call sites in this: forcing loky would turn a nested thread-preferring
+    ``Parallel`` (as in RandomForest's own fit) into process fan-out.
+    """
+    return joblib.parallel_config(backend="loky", inner_max_num_threads=1)
+
+
 def _chunk_shap_values(model, X_chunk):
     """SHAP values for one chunk of rows, normalised to the positive class.
 
@@ -142,9 +160,10 @@ def _parallel_shap_values(model, X_test, n_jobs):
         return _chunk_shap_values(model, X_test)
 
     chunks = [c for c in np.array_split(X_test, n_jobs_eff) if len(c)]
-    results = Parallel(n_jobs=n_jobs_eff)(
-        delayed(_chunk_shap_values)(model, c) for c in chunks
-    )
+    with _single_threaded_workers():
+        results = Parallel(n_jobs=n_jobs_eff)(
+            delayed(_chunk_shap_values)(model, c) for c in chunks
+        )
     return np.concatenate(results, axis=0)
 
 
@@ -197,14 +216,21 @@ def _optimize_hyperparams(
     else:
         X_search = X_f
 
+    # The search below already runs n_jobs candidate fits in parallel, so the
+    # estimator inside each one must stay single-threaded. Passing n_jobs to
+    # both multiplies them: RandomizedSearchCV(n_jobs=28) x RF(n_jobs=28) is
+    # 784 workers on a 28-core box, which thrashes rather than scales.
+    # OMP_NUM_THREADS does not bound this - scikit-learn's n_jobs is joblib
+    # (loky processes / threads), not OpenMP, and LightGBM's n_jobs maps to
+    # num_threads, which overrides OMP_NUM_THREADS outright.
     if model_type == "rf":
-        base = RandomForestClassifier(random_state=random_state, n_jobs=n_jobs)
+        base = RandomForestClassifier(random_state=random_state, n_jobs=1)
     elif model_type == "gbm":
         base = GradientBoostingClassifier(random_state=random_state)
     elif model_type == "lgbm":
-        base = lgb.LGBMClassifier(random_state=random_state, n_jobs=n_jobs, verbose=-1)
+        base = lgb.LGBMClassifier(random_state=random_state, n_jobs=1, verbose=-1)
     elif model_type == "logreg":
-        base = LogisticRegression(max_iter=1000, random_state=random_state, n_jobs=n_jobs)
+        base = LogisticRegression(max_iter=1000, random_state=random_state, n_jobs=1)
     else:  # svm
         base = SVC(kernel="rbf", probability=True, random_state=random_state, max_iter=100000)
 
@@ -227,7 +253,11 @@ def _optimize_hyperparams(
     fit_kwargs = {"sample_weight": sw}
     if groups_f is not None:
         fit_kwargs["groups"] = groups_f
-    search.fit(X_search, y_f, **fit_kwargs)
+    # Second half of the same guard: pin the native thread pools (OpenBLAS,
+    # MKL, OpenMP) inside each worker to one thread, so a candidate fit cannot
+    # open its own pool on top of the n_jobs workers already running.
+    with _single_threaded_workers():
+        search.fit(X_search, y_f, **fit_kwargs)
     print(
         f"  HPO ({n_iter} iterations): best CV AUC = {search.best_score_:.4f}"
         f"  params = {search.best_params_}"
@@ -390,14 +420,15 @@ def _model_shap_kfold(
 
         if model_type == "svm":
             try:
-                pi = permutation_importance(
-                    model, X_test, y_f[test_idx],
-                    scoring="roc_auc",
-                    n_repeats=10,
-                    random_state=random_state,
-                    sample_weight=sw[test_idx],
-                    n_jobs=n_jobs,
-                )
+                with _single_threaded_workers():
+                    pi = permutation_importance(
+                        model, X_test, y_f[test_idx],
+                        scoring="roc_auc",
+                        n_repeats=10,
+                        random_state=random_state,
+                        sample_weight=sw[test_idx],
+                        n_jobs=n_jobs,
+                    )
                 perm_importances.append(pi.importances_mean)
             except Exception as exc:
                 warnings.warn(
