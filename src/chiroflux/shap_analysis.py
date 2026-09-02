@@ -99,7 +99,8 @@ _PARAM_GRIDS = {
 # Maximum training samples for SVM per fold.  SVM scales O(n²)–O(n³), so
 # large datasets prevent convergence and make permutation importance useless.
 # Stratified subsampling keeps class ratios intact while capping the cost.
-_MAX_SVM_TRAIN = 5000
+_MAX_SVM_TRAIN = 50000
+_MAX_SVM_ITER = 1000000
 
 
 def _single_threaded_workers():
@@ -233,7 +234,7 @@ def _optimize_hyperparams(
     elif model_type == "logreg":
         base = LogisticRegression(max_iter=1000, random_state=random_state, n_jobs=1)
     else:  # svm
-        base = SVC(kernel="rbf", probability=True, random_state=random_state, max_iter=100000)
+        base = SVC(kernel="rbf", probability=True, random_state=random_state, max_iter=_MAX_SVM_ITER)
 
     cv = (
         StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
@@ -391,7 +392,7 @@ def _model_shap_kfold(
             kw.update(best_params)
             model = lgb.LGBMClassifier(**kw)
         elif model_type == "svm":
-            kw = dict(kernel="rbf", max_iter=1000000, random_state=random_state,
+            kw = dict(kernel="rbf", max_iter=_MAX_SVM_ITER, random_state=random_state,
                       C=0.5, gamma=0.5, probability=True, class_weight="balanced")
             kw.update(best_params)
             model = SVC(**kw)
