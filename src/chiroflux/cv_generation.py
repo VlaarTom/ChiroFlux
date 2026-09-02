@@ -1618,7 +1618,7 @@ def generate_cvs(
     end: Annotated[Optional[int], typer.Option("-end", help="Last path number to process; default = to the end.", rich_help_panel=panels.DATASET)] = None,
 
     # ── Model and training (parallelism) ──────────────────────────────────
-    workers: Annotated[int, typer.Option("-workers", help="Worker processes; each handles one path at a time.", rich_help_panel=panels.MODEL)] = 8,
+    workers: Annotated[int, typer.Option("-workers", help="Worker processes; each handles one path at a time.", rich_help_panel=panels.MODEL)] = 32,
 
     # ── Output ────────────────────────────────────────────────────────────
     out_dir: Annotated[str, typer.Option("-out-dir", help="Directory for the per-path <path_nr>.txt CV files.", rich_help_panel=panels.OUTPUT)] = ML,
@@ -1628,9 +1628,8 @@ def generate_cvs(
 
     Reads each path's .xtc segments once with MDAnalysis and writes the
     per-frame CV table that every other chiroflux command consumes. Needs the
-    optional `generate` extra (MDAnalysis) plus the trajectories, topology and
-    .ndx files - it is the only command that touches simulation data rather
-    than the .txt files produced from it.
+    .xtc, .gro and ndx files. Is the only command that works with simulation
+    data rather than the .txt files produced from it.
     """
     global N_WORKERS, infretis_data_file, ML
 

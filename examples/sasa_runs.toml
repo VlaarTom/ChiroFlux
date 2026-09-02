@@ -1,0 +1,43 @@
+# Runs to include in `chiroflux sasa`.
+#
+# One [[run]] table per simulation. Several runs are combined into one profile,
+# each scaled by its own `scale` factor, so this file is where an escape run and
+# an entry run get put on a common footing.
+#
+#   name     : label used in output filenames and plot legends.
+#   load_dir : infretis `load/` directory holding the per-path trajectories.
+#   weights  : WHAM path-weights file for this run.
+#   ml_dir   : the run's CV .txt folder, used to classify paths
+#              reactive/non-reactive and plus/minus.
+#   tpr      : topology for this run.
+#   scale    : multiplies this run's weighted histogram before runs are summed.
+#              Use 1.0 for the reference run. For a second run referenced to its
+#              own state A, this is the ratio of total crossing probabilities,
+#              i.e. the last row of each run's wham/Pcross.txt, column 2:
+#                  scale = P_wham(this run) / P_wham(reference run)
+#              Getting this wrong silently rescales one run relative to the
+#              other, so record where the numbers came from.
+#   mirror_z : reflect z about the membrane centre before binning. Set this for
+#              a run whose permeant entered from the opposite leaflet, so both
+#              runs share one z convention.
+
+[[run]]
+name     = "entry"
+load_dir = "L_PRO_neutral/infinit_entry/load"
+weights  = "L_PRO_neutral/infinit_entry/wham/path_weights.txt"
+ml_dir   = "L_PRO_neutral/infinit_entry/post/ML"
+tpr      = "L_PRO_neutral/infinit_entry/topol.tpr"
+scale    = 1.0
+mirror_z = false
+
+# A second run, folded onto the same z axis and rescaled to the first.
+# scale = 2.868490156674135e-04 / 2.624258248023158e-03  (escape / entry P_wham)
+#
+# [[run]]
+# name     = "escape"
+# load_dir = "L_PRO_neutral/infinit_escape/load"
+# weights  = "L_PRO_neutral/infinit_escape/wham/path_weights.txt"
+# ml_dir   = "L_PRO_neutral/infinit_escape/post/ML"
+# tpr      = "L_PRO_neutral/infinit_escape/topol.tpr"
+# scale    = 0.10930670252575012
+# mirror_z = true

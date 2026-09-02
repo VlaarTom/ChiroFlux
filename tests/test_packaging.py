@@ -30,6 +30,9 @@ def test_documented_entry_points_are_importable():
     for module_name, function_name in [
         ("cv_generation", "generate_cvs"),
         ("cv_histograms", "histograms"),
+        ("membrane_spatial", "membrane_spatial"),
+        ("neighbours", "neighbours"),
+        ("sasa", "sasa"),
         ("shap_analysis", "shap_ml"),
         ("shap_analysis_ld", "shap_enantiomer"),
         ("statistical_analysis", "statistics"),
@@ -48,6 +51,9 @@ def test_cli_registry_covers_every_entry_point():
     assert registered == {
         ("cv_generation", "generate_cvs"),
         ("cv_histograms", "histograms"),
+        ("membrane_spatial", "membrane_spatial"),
+        ("neighbours", "neighbours"),
+        ("sasa", "sasa"),
         ("shap_analysis", "shap_ml"),
         ("shap_analysis_ld", "shap_enantiomer"),
         ("statistical_analysis", "statistics"),
@@ -210,7 +216,9 @@ def _option_panels(function):
 @pytest.mark.parametrize(
     "module_name, function_name",
     [("shap_analysis", "shap_ml"), ("shap_analysis_ld", "shap_enantiomer"),
-     ("cv_generation", "generate_cvs"), ("cv_histograms", "histograms")],
+     ("cv_generation", "generate_cvs"), ("cv_histograms", "histograms"),
+     ("sasa", "sasa"), ("membrane_spatial", "membrane_spatial"),
+     ("neighbours", "neighbours")],
 )
 def test_every_option_is_assigned_to_a_panel(module_name, function_name):
     """An unpanelled option falls into the generic 'Options' box, away from
@@ -225,7 +233,9 @@ def test_every_option_is_assigned_to_a_panel(module_name, function_name):
 @pytest.mark.parametrize(
     "module_name, function_name",
     [("shap_analysis", "shap_ml"), ("shap_analysis_ld", "shap_enantiomer"),
-     ("cv_generation", "generate_cvs"), ("cv_histograms", "histograms")],
+     ("cv_generation", "generate_cvs"), ("cv_histograms", "histograms"),
+     ("sasa", "sasa"), ("membrane_spatial", "membrane_spatial"),
+     ("neighbours", "neighbours")],
 )
 def test_panels_are_declared_in_the_canonical_order(module_name, function_name):
     """Panels render in first-appearance order, so the signature order is what
@@ -300,3 +310,35 @@ def test_histograms_exposes_the_settings_that_differed_between_copies():
     for setting in ("out_dir", "ranges", "other_cv_dir",
                     "other_weights", "correction_apply_to"):
         assert setting in names, f"{setting} is not settable from the CLI"
+
+
+@pytest.mark.parametrize(
+    "module_name, command_globals",
+    [
+        ("neighbours", ["slab_range"]),
+        ("membrane_spatial",
+         ["N_WORKERS", "leaflets", "near_n", "slab_range", "water_z_range"]),
+    ],
+)
+def test_converted_scripts_still_publish_their_module_globals(
+    module_name, command_globals
+):
+    """These commands came from `if __name__ == "__main__"` blocks whose
+    assignments were module-level, and helper functions read them as globals.
+    Moving the block into a function turns those into locals - a NameError at
+    runtime, only on the code paths that use them. The command must declare
+    them global."""
+    import ast
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parents[1] / "src" / "chiroflux" / f"{module_name}.py"
+    tree = ast.parse(src.read_text())
+    cmd = next(
+        n for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == module_name
+    )
+    declared = {
+        name for s in ast.walk(cmd) if isinstance(s, ast.Global) for name in s.names
+    }
+    missing = sorted(set(command_globals) - declared)
+    assert not missing, f"{module_name}: not declared global -> {missing}"

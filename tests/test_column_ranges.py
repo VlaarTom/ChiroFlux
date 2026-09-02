@@ -63,3 +63,51 @@ def re_escape(s):
     import re
 
     return re.escape(s)
+
+
+# ── chiroflux sasa: the run table is an input file too ───────────────────────
+
+SASA_EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "sasa_runs.toml"
+
+
+def test_the_sasa_runs_example_ships():
+    from chiroflux.sasa import sasa
+
+    assert SASA_EXAMPLE.is_file(), "examples/sasa_runs.toml is missing"
+    assert inspect.signature(sasa).parameters["runs"].default is ..., (
+        "-runs must be required: which simulations are combined, and with what "
+        "relative scaling, defines the whole result"
+    )
+
+
+def test_sasa_run_entries_are_validated(tmp_path):
+    """A run table that names a path which does not exist, or scales a
+    histogram by a non-positive number, must fail before any trajectory is
+    read rather than producing a quietly wrong profile."""
+    from chiroflux.sasa import _load_runs
+
+    (tmp_path / "load").mkdir()
+    (tmp_path / "ml").mkdir()
+    (tmp_path / "topol.tpr").write_text("x")
+    (tmp_path / "w.txt").write_text("x")
+    base = (
+        '[[run]]\nname="entry"\n'
+        f'load_dir="{tmp_path}/load"\nweights="{tmp_path}/w.txt"\n'
+        f'ml_dir="{tmp_path}/ml"\ntpr="{tmp_path}/topol.tpr"\n'
+    )
+    cfg = tmp_path / "runs.toml"
+
+    cfg.write_text(base)
+    run = _load_runs(cfg)[0]
+    assert run["scale"] == 1.0 and run["mirror_z"] is False, "defaults applied"
+
+    for body, expected in [
+        (base + "scale=-1\n", "must be positive"),
+        (base + base, "duplicate run name"),
+        ('[[run]]\nname="x"\n', "is missing"),
+        (base.replace(str(tmp_path) + "/load", "/nope"), "does not exist"),
+        ("[other]\nx=1\n", "no [[run]] tables"),
+    ]:
+        cfg.write_text(body)
+        with pytest.raises(typer.BadParameter, match=re_escape(expected)):
+            _load_runs(cfg)

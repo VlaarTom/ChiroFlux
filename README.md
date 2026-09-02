@@ -57,6 +57,9 @@ chiroflux COMMAND --help
 | --- | --- |
 | `generate-cvs` | Computes the per-frame CVs from the MD trajectories and writes the per-path `.txt` files every other command reads. |
 | `histograms` | Weighted CV histograms, statistics and 2D maps over a path ensemble, optionally merging a second simulation onto a common OP axis. Requires a `-ranges` file (see below). |
+| `sasa` | Weighted solvent-accessible surface area profile across the membrane, from a Shrake–Rupley construction on the trajectories. Requires a `-runs` file (see below). |
+| `membrane-spatial` | Spatial membrane structure around the permeant: radial/z maps, curvature, local thickness and bonded metrics. |
+| `neighbours` | Lipid neighbour composition around the permeant per membrane slab, with bootstrap enrichment statistics against bulk composition. |
 | `shap-ml` | Fits WHAM-weighted classifiers (random forest, logistic regression, gradient boosting, LightGBM, SVM) per interface and explains them with SHAP. |
 | `shap-enantiomer` | Same, but the label is *which of two simulations* a path came from. |
 | `statistics` | Model-free weighted effect sizes (Cohen's d, Spearman ρ, KS distance) per interface — a cheap sanity check on the SHAP rankings. |
@@ -118,6 +121,33 @@ script, differing only in configuration. There is deliberately **no default**:
 the binning determines every histogram in the output, so a plausible-but-wrong
 fallback would be worse than refusing to run. Malformed entries (wrong length,
 `max <= min`, zero bins) are rejected with the offending column named.
+
+### Which simulations to combine: the `-runs` file
+
+`chiroflux sasa` requires `-runs`, a TOML file with one `[[run]]` table per
+simulation. Start from [`examples/sasa_runs.toml`](examples/sasa_runs.toml):
+
+```toml
+[[run]]
+name     = "entry"
+load_dir = "L_PRO_neutral/infinit_entry/load"
+weights  = "L_PRO_neutral/infinit_entry/wham/path_weights.txt"
+ml_dir   = "L_PRO_neutral/infinit_entry/post/ML"
+tpr      = "L_PRO_neutral/infinit_entry/topol.tpr"
+scale    = 1.0        # multiplies this run's weighted histogram
+mirror_z = false      # reflect z, for a run entered from the other leaflet
+```
+
+Runs are summed onto one z axis, so `scale` puts them on a common footing: use
+`1.0` for the reference run, and for a second run referenced to its own state A
+use the ratio of total crossing probabilities (the last row of each run's
+`wham/Pcross.txt`, column 2). The ratio of crossing probabilities is sufficient 
+since the paths are weighted in the analysis. `mirror_z` is the SASA-profile 
+counterpart of `-flip-*` — set it for a run whose permeant entered from the 
+opposite leaflet.
+
+Every path in the file is checked for existence before a single trajectory is
+read, and a non-positive `scale` or a duplicate run name is rejected outright.
 
 ### Worked example: two simulations entered from opposite leaflets
 
@@ -197,6 +227,17 @@ escaped space, which arrives as a lone argument and fails with
 
 Note that options use a single dash (`-toml`, `-cv-dir`), matching the infretis
 tooling convention rather than the GNU `--long-option` style.
+
+`membrane-spatial` and `neighbours` came from scripts that already used
+double-dash options, so they accept **both** spellings — `-start` and `--start`
+are the same flag — and existing command lines keep working. Their few
+multi-value options changed from space- to comma-separated, since that has no
+single-dash equivalent:
+
+```bash
+chiroflux neighbours -start 1 -slab-range -40,40        # was: --slab-range -40 40
+chiroflux membrane-spatial -start 1 -near-n 5,10        # was: --near-n 5 10
+```
 
 ### Aligning angle conventions between two simulations
 

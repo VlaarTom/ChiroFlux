@@ -38,6 +38,21 @@ _COMMANDS = {
         "histograms",
         "Weighted CV histograms, statistics and 2D maps over a path ensemble.",
     ),
+    "membrane-spatial": _Command(
+        "membrane_spatial",
+        "membrane_spatial",
+        "Spatial membrane maps: radial/z structure and curvature around the permeant.",
+    ),
+    "neighbours": _Command(
+        "neighbours",
+        "neighbours",
+        "Lipid neighbour composition and enrichment around the permeant, per slab.",
+    ),
+    "sasa": _Command(
+        "sasa",
+        "sasa",
+        "Weighted solvent-accessible surface area profile across the membrane.",
+    ),
     "shap-ml": _Command(
         "shap_analysis",
         "shap_ml",
