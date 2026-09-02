@@ -5,6 +5,7 @@ public API, the CLI's lazy command loading, and the optional DeepTDA extra.
 """
 
 import inspect
+import re
 import subprocess
 import sys
 
@@ -27,6 +28,8 @@ def test_documented_entry_points_are_importable():
     from importlib import import_module
 
     for module_name, function_name in [
+        ("cv_generation", "generate_cvs"),
+        ("cv_histograms", "histograms"),
         ("shap_analysis", "shap_ml"),
         ("shap_analysis_ld", "shap_enantiomer"),
         ("statistical_analysis", "statistics"),
@@ -43,6 +46,8 @@ def test_cli_registry_covers_every_entry_point():
     """Every analysis function must be reachable as a CLI subcommand."""
     registered = {(spec.module, spec.function) for spec in cli._COMMANDS.values()}
     assert registered == {
+        ("cv_generation", "generate_cvs"),
+        ("cv_histograms", "histograms"),
         ("shap_analysis", "shap_ml"),
         ("shap_analysis_ld", "shap_enantiomer"),
         ("statistical_analysis", "statistics"),
@@ -100,7 +105,8 @@ def test_subcommand_help_runs(name):
     """Dispatch must swap the stub for the real command, options and all."""
     result = runner.invoke(cli.app, [name, "--help"], env={"COLUMNS": "200"})
     assert result.exit_code == 0, result.output
-    assert "-toml" in result.output or "-npz" in result.output
+    # every command takes at least one real option, whatever it is called
+    assert re.search(r"\s-[a-z][a-z-]*\s", result.output), result.output
 
 
 def test_missing_deeptda_extra_gives_an_actionable_error(monkeypatch):
@@ -203,7 +209,8 @@ def _option_panels(function):
 
 @pytest.mark.parametrize(
     "module_name, function_name",
-    [("shap_analysis", "shap_ml"), ("shap_analysis_ld", "shap_enantiomer")],
+    [("shap_analysis", "shap_ml"), ("shap_analysis_ld", "shap_enantiomer"),
+     ("cv_generation", "generate_cvs"), ("cv_histograms", "histograms")],
 )
 def test_every_option_is_assigned_to_a_panel(module_name, function_name):
     """An unpanelled option falls into the generic 'Options' box, away from
@@ -217,7 +224,8 @@ def test_every_option_is_assigned_to_a_panel(module_name, function_name):
 
 @pytest.mark.parametrize(
     "module_name, function_name",
-    [("shap_analysis", "shap_ml"), ("shap_analysis_ld", "shap_enantiomer")],
+    [("shap_analysis", "shap_ml"), ("shap_analysis_ld", "shap_enantiomer"),
+     ("cv_generation", "generate_cvs"), ("cv_histograms", "histograms")],
 )
 def test_panels_are_declared_in_the_canonical_order(module_name, function_name):
     """Panels render in first-appearance order, so the signature order is what
@@ -242,3 +250,53 @@ def test_single_simulation_command_has_no_symmetry_panel():
     from chiroflux.shap_analysis import shap_ml
 
     assert panels.SYMMETRY not in {p for _, p in _option_panels(shap_ml)}
+
+
+def test_cv_generation_imports_without_mdanalysis_or_simulation_files():
+    """The generator originally resolved its .ndx/.tpr atom groups at IMPORT
+    time, so it could only be imported from inside a simulation directory, and
+    it imported MDAnalysis unconditionally. Both are deferred now - otherwise
+    `chiroflux generate-cvs --help` would need a topology file to run."""
+    code = (
+        "import sys, os, tempfile; os.chdir(tempfile.mkdtemp()); "
+        "import chiroflux.cv_generation; "
+        "print('MDAnalysis' in sys.modules)"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True
+    )
+    assert out.returncode == 0, f"import failed outside a sim directory:\n{out.stderr}"
+    assert out.stdout.strip() == "False", "MDAnalysis was imported eagerly"
+
+
+def test_missing_generate_extra_gives_an_actionable_error(monkeypatch):
+    """Without MDAnalysis the error must name the extra to install."""
+    import builtins
+
+    import chiroflux.cv_generation as gen
+
+    monkeypatch.setattr(gen, "mda", None)
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name.split(".")[0] == "MDAnalysis":
+            raise ImportError(f"No module named {name!r}")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    with pytest.raises(ImportError, match=r"pip install -e"):
+        gen._require_mdanalysis()
+
+
+def test_histograms_exposes_the_settings_that_differed_between_copies():
+    """This script was configured by editing module constants, which is why
+    four divergent copies existed in the tree. The settings that actually
+    differed between them must be reachable as options."""
+    from chiroflux.cv_histograms import histograms
+
+    names = set(inspect.signature(histograms).parameters)
+    # "ranges" covers what -op-range used to patch: the whole binning table is
+    # now an input file, so no histogram range needs a code edit.
+    for setting in ("out_dir", "ranges", "other_cv_dir",
+                    "other_weights", "correction_apply_to"):
+        assert setting in names, f"{setting} is not settable from the CLI"

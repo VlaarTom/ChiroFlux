@@ -24,6 +24,10 @@ which are kept out of the base install because they are large:
 pip install -e '.[deeptda]'      # add the DeepTDA stack
 pip install -e '.[dev]'          # pytest + ruff
 ```
+
+`generate-cvs` is the only command that reads MD trajectories; everything else
+works from the `.txt` files it produces. It needs the trajectories, the
+topology and the `.ndx` index files alongside them.
 [mlcolvar](https://mlcolvar.readthedocs.io/en/stable/installation.html)
 
 ## Input layout
@@ -51,6 +55,8 @@ chiroflux COMMAND --help
 
 | Command | What it does |
 | --- | --- |
+| `generate-cvs` | Computes the per-frame CVs from the MD trajectories and writes the per-path `.txt` files every other command reads. |
+| `histograms` | Weighted CV histograms, statistics and 2D maps over a path ensemble, optionally merging a second simulation onto a common OP axis. Requires a `-ranges` file (see below). |
 | `shap-ml` | Fits WHAM-weighted classifiers (random forest, logistic regression, gradient boosting, LightGBM, SVM) per interface and explains them with SHAP. |
 | `shap-enantiomer` | Same, but the label is *which of two simulations* a path came from. |
 | `statistics` | Model-free weighted effect sizes (Cohen's d, Spearman ρ, KS distance) per interface — a cheap sanity check on the SHAP rankings. |
@@ -82,6 +88,36 @@ chiroflux train-deeptda -npz deeptda_ld_dataset.npz -class-names L,D
 chiroflux pca -toml L/infretis.toml -cv-dir L/ML \
               -toml2 D/infretis.toml -cv-dir2 D/ML -label1 L -label2 D
 ```
+
+### Histogram binning: the `-ranges` file
+
+`chiroflux histograms` requires `-ranges`, a TOML file giving the binning for
+every CV:
+
+```toml
+[ranges]
+"OP_Lamb" = [-25, -13.5, 125]     # min, max, n_bins
+"Mem_APL" = [0.6, 0.9, 60]
+
+[ranges_nr_minus]                 # overrides for ("non-reactive", "minus")
+"OP_Lamb" = [-36, -24, 120]
+```
+
+Start from [`examples/column_ranges.toml`](examples/column_ranges.toml) (120
+columns, the values the original script carried) and copy it per simulation:
+
+```bash
+cp examples/column_ranges.toml L/ranges.toml    # then edit the OP window
+chiroflux histograms -cv-dir L/ML -weights L/path_weights.txt -ranges L/ranges.toml
+```
+
+These ranges are genuinely per-simulation — each run covers a different OP
+window — which is why they are an input rather than a constant in the code.
+Keeping them inline is what produced four divergent copies of the original
+script, differing only in configuration. There is deliberately **no default**:
+the binning determines every histogram in the output, so a plausible-but-wrong
+fallback would be worse than refusing to run. Malformed entries (wrong length,
+`max <= min`, zero bins) are rejected with the offending column named.
 
 ### Worked example: two simulations entered from opposite leaflets
 
@@ -143,11 +179,21 @@ Three things in this example are worth copying deliberately:
   match essentially every CV in this feature set. (`-angle-cols`,
   `-sym-angle-cols` and `-z-cols` match **exact** names instead.)
 - **`-exclude` runs before the corrections.** A CV dropped there is not
-  available to be corrected. Note that `-exclude C2,C3,O2,O3` above also
-  removes the C2/O22-based handed coordination numbers, leaving
-  `PRO_hCN_Pu`/`PRO_hCN_Pl` as the only members of that family — worth
-  checking against your intent, since those pseudoscalars are the CVs most
+  available to be corrected, so keep the patterns narrow enough not to catch
+  something you meant to correct. The `z_`-prefixed patterns above are chosen
+  for exactly that reason: they drop the per-atom z columns without touching
+  the `PRO_hCN_C2*`/`PRO_nCos_C2*` handed coordination numbers, which a bare
+  `C2,O2` would also have removed — and those pseudoscalars are the CVs most
   able to resolve L from D.
+
+  Excluding the z columns also means every entry in the built-in z-correction
+  list is now absent, which is reported as one `Skipping z-correction for
+  'z_...': dropped by -exclude` line each rather than as a warning.
+
+When copying the block, keep the line continuations clean: a `\` continues a
+line only when it is the **last** character. A trailing space turns it into an
+escaped space, which arrives as a lone argument and fails with
+`Got unexpected extra argument ( )`.
 
 Note that options use a single dash (`-toml`, `-cv-dir`), matching the infretis
 tooling convention rather than the GNU `--long-option` style.

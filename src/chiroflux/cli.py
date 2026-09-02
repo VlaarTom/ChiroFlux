@@ -28,6 +28,16 @@ class _Command:
 
 
 _COMMANDS = {
+    "generate-cvs": _Command(
+        "cv_generation",
+        "generate_cvs",
+        "Compute per-frame CVs from MD trajectories into per-path .txt files.",
+    ),
+    "histograms": _Command(
+        "cv_histograms",
+        "histograms",
+        "Weighted CV histograms, statistics and 2D maps over a path ensemble.",
+    ),
     "shap-ml": _Command(
         "shap_analysis",
         "shap_ml",
