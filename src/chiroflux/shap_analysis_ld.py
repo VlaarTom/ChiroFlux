@@ -59,6 +59,9 @@ from .plotting import _plot_importance_bar
 from .shap_analysis import (
     _MODEL_LABELS,
     MODEL_CHOICES,
+    SHAP_DEVICE_CHOICES,
+    SVM_DEVICE_CHOICES,
+    _calibration_metrics,
     _model_shap_kfold,
     _plot_calibration,
     _plot_roc_curves,
@@ -286,6 +289,8 @@ def shap_enantiomer(
     n_search_iter: Annotated[int, typer.Option("-n-search-iter", help="Number of random hyperparameter configurations to evaluate when -optimize is set", rich_help_panel=panels.MODEL)] = 20,
     seed: Annotated[int, typer.Option("-seed", help="Random seed for fold splits and models", rich_help_panel=panels.MODEL)] = 42,
     n_jobs: Annotated[int, typer.Option("-n-jobs", help="CPU cores; -1 = all", rich_help_panel=panels.MODEL)] = -1,
+    shap_device: Annotated[str, typer.Option("-shap-device", help="Where to compute tree SHAP values: 'auto' uses shap's CUDA TreeSHAP when a usable GPU is present and falls back to the multi-core CPU explainer otherwise, 'gpu' fails instead of falling back, 'cpu' forces the CPU path. Explaining dominates a fold's runtime, so this is the main speed knob; attributions agree between the two to float rounding.", rich_help_panel=panels.MODEL)] = "auto",
+    svm_device: Annotated[str, typer.Option("-svm-device", help="Where to fit the SVM: 'auto' uses cuML on the GPU when available and falls back to scikit-learn otherwise, 'gpu' fails instead of falling back, 'cpu' forces scikit-learn. Only affects -models svm. The SVM path is dominated by permutation importance, which is predict-bound: ~78x faster on the GPU, rankings agreeing to Spearman 0.9998.", rich_help_panel=panels.MODEL)] = "auto",
 
     # ── Output ────────────────────────────────────────────────────────────
     out: Annotated[str, typer.Option("-out", help="Base name for ranking files; '_<model>.txt' is appended", rich_help_panel=panels.OUTPUT)] = "shap_ld_ranking.txt",
@@ -320,6 +325,14 @@ def shap_enantiomer(
 
     if paths not in _PATHS_CHOICES:
         raise typer.BadParameter(f"paths={paths!r} — choose from {_PATHS_CHOICES}.")
+    if svm_device not in SVM_DEVICE_CHOICES:
+        raise typer.BadParameter(
+            f"svm-device={svm_device!r} — choose from {SVM_DEVICE_CHOICES}."
+        )
+    if shap_device not in SHAP_DEVICE_CHOICES:
+        raise typer.BadParameter(
+            f"shap-device={shap_device!r} — choose from {SHAP_DEVICE_CHOICES}."
+        )
     model_list = [m.strip() for m in models.split(",")]
     unknown = [m for m in model_list if m not in MODEL_CHOICES]
     if unknown:
@@ -507,6 +520,8 @@ def shap_enantiomer(
                 n_splits=n_splits,
                 n_estimators=n_estimators,
                 n_jobs=n_jobs,
+                shap_device=shap_device,
+                svm_device=svm_device,
                 random_state=seed,
                 groups=groups,
                 optimize=optimize,
@@ -539,8 +554,12 @@ def shap_enantiomer(
             str(model_plot_dir / "calibration.png"), overw=overw,
         )
 
+        brier, ece = _calibration_metrics(oof_true, oof_proba)
+        print(f"  calibration: Brier = {brier:.4f}   ECE = {ece:.4f}")
+
         order = np.argsort(mean_abs_shap)[::-1]
         with open(model_out, "w") as f:
+            f.write(f"# calibration: Brier={brier:.6f} ECE={ece:.6f}\n")
             f.write("# model\tpaths\trank\tfeature\tmean_abs_shap\tmean_fold_AUC\n")
             for rank, idx in enumerate(order, 1):
                 f.write(

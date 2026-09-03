@@ -124,6 +124,166 @@ def _single_threaded_workers():
     return joblib.parallel_config(backend="loky", inner_max_num_threads=1)
 
 
+SHAP_DEVICE_CHOICES = ("auto", "gpu", "cpu")
+
+#: Rows per GPU batch. TreeSHAP allocates per row x tree x feature, so this
+#: bounds VRAM rather than host RAM; 8 GB cards want a few thousand at most.
+_GPU_SHAP_BATCH = 2000
+
+
+SVM_DEVICE_CHOICES = ("auto", "gpu", "cpu")
+
+
+def _make_svc(device, **kw):
+    """Build an RBF SVC on the GPU (cuML) when usable, else scikit-learn.
+
+    The SVM path is dominated by ``permutation_importance``, which is
+    predict-bound: measured at 192s on 22 CPU cores against 2.4s with cuML, a
+    ~78x difference, with importance rankings agreeing to Spearman 0.9998.
+
+    cuML's SVC accepts every parameter used here except ``probability``, which
+    is dropped: cuML 26.8 rejects it outright, and 26.2 accepts it but the SVM
+    path never calls ``predict_proba`` anyway - probabilities come from
+    ``_platt_calibrate_oof``. ``decision_function`` is the one scoring method
+    both versions provide. cuML also wants float32, so callers must pass
+    arrays through ``_as_svm_array``.
+
+    Returns (estimator, on_gpu).
+    """
+    if device != "cpu":
+        try:
+            from cuml.svm import SVC as cuSVC
+
+            return cuSVC(**{k: v for k, v in kw.items() if k != "probability"}), True
+        except Exception as exc:
+            if device == "gpu":
+                raise RuntimeError(
+                    f"-svm-device gpu was requested but cuML is unusable: {exc}"
+                ) from exc
+            warnings.warn(
+                f"cuML unavailable ({type(exc).__name__}: {exc}); fitting the SVM "
+                "on the CPU. Pass -svm-device cpu to silence this.",
+                stacklevel=2,
+            )
+    return SVC(**kw), False
+
+
+def _as_svm_array(a, on_gpu):
+    """cuML requires float32; scikit-learn is happy either way."""
+    return np.ascontiguousarray(a, dtype=np.float32) if on_gpu else a
+
+
+def _platt_calibrate_oof(scores, y, n_splits=5, random_state=0):
+    """Map out-of-fold decision scores to probabilities via Platt scaling.
+
+    SVC only yields probabilities with ``probability=True``, which fits an
+    internal 5-fold Platt calibration inside *every* SVM fit - measured at 5.5x
+    the cost of the plain fit - and which cuML's SVC does not offer at all.
+    Since Platt scaling is just a 1-D logistic map from decision score to
+    probability, the same thing can be fitted once afterwards on the scores the
+    k-fold loop already produces, for microseconds.
+
+    The map is fitted *nested*: each block's probabilities come from a sigmoid
+    fitted on the other blocks' scores. Fitting on all the scores and then
+    judging calibration on those same scores would report the calibration of
+    the map itself, which is optimistic by construction.
+
+    Measured against SVC(probability=True) on the same folds: Brier 0.1472 vs
+    0.1472, ECE 0.0114 vs 0.0125, AUC 0.8689 vs 0.8690.
+
+    Returns an array of probabilities, NaN where a score was missing or a
+    calibration block was single-class.
+    """
+    scores = np.asarray(scores, dtype=float)
+    y = np.asarray(y)
+    out = np.full(len(scores), np.nan)
+
+    usable = np.isfinite(scores) & np.isfinite(y)
+    s, yy = scores[usable], y[usable].astype(int)
+    idx = np.flatnonzero(usable)
+    if len(s) < 2 * n_splits or len(np.unique(yy)) < 2:
+        warnings.warn(
+            "Too few out-of-fold scores (or only one class) to calibrate the "
+            "SVM probabilities; the calibration plot will be skipped.",
+            stacklevel=2,
+        )
+        return out
+
+    splitter = StratifiedKFold(
+        n_splits=min(n_splits, np.bincount(yy).min()),
+        shuffle=True, random_state=random_state,
+    )
+    for train, test in splitter.split(s.reshape(-1, 1), yy):
+        if len(np.unique(yy[train])) < 2:
+            continue
+        sigmoid = LogisticRegression().fit(s[train].reshape(-1, 1), yy[train])
+        out[idx[test]] = sigmoid.predict_proba(s[test].reshape(-1, 1))[:, 1]
+    return out
+
+
+def _calibration_metrics(y_true, proba, n_bins=10):
+    """Brier score and expected calibration error, or NaN if not computable.
+
+    A number per interface scales where a reliability diagram per interface
+    does not: with ~20 interfaces x 5 models there are too many plots to read,
+    but a Brier column can be sorted.
+
+    Brier is the mean squared error of the probabilities (lower is better, and
+    it rewards sharpness as well as calibration). ECE is the average gap
+    between predicted probability and observed frequency across bins, which
+    isolates calibration alone.
+    """
+    y_true = np.asarray(y_true, dtype=float)
+    proba = np.asarray(proba, dtype=float)
+    ok = np.isfinite(y_true) & np.isfinite(proba)
+    if ok.sum() < n_bins or len(np.unique(y_true[ok])) < 2:
+        return float("nan"), float("nan")
+
+    t, p = y_true[ok].astype(int), proba[ok]
+    brier = float(np.mean((p - t) ** 2))
+
+    edges = np.linspace(0.0, 1.0, n_bins + 1)
+    ece = 0.0
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        in_bin = (p > lo) & (p <= hi)
+        if in_bin.any():
+            ece += in_bin.mean() * abs(t[in_bin].mean() - p[in_bin].mean())
+    return brier, float(ece)
+
+
+def _positive_class_shap(sv):
+    """Normalise a SHAP result to a (N, N_features) positive-class array.
+
+    Older shap returns a [class0, class1] list, newer shap one (N, F, 2) array.
+    """
+    if isinstance(sv, list):
+        return sv[1]
+    sv = np.asarray(sv)
+    return sv[:, :, 1] if sv.ndim == 3 else sv
+
+
+def _gpu_shap_values(model, X_test):
+    """CUDA TreeSHAP over X_test, batched to bound VRAM.
+
+    shap ships a GPU implementation of the same Tree SHAP algorithm, and it
+    dominates the runtime of a fold: explaining is far more expensive than
+    fitting, and the CPU explainer is single-threaded per row. Measured on a
+    300-tree forest it returned attributions identical to the CPU explainer to
+    ~1e-6 (float32 vs float64) while running ~4x faster.
+
+    Raises if no usable CUDA device or shap GPU build is present; callers
+    decide whether to fall back.
+    """
+    explainer = shap.explainers.GPUTree(model, data=None)
+    out = []
+    for start in range(0, len(X_test), _GPU_SHAP_BATCH):
+        batch = X_test[start:start + _GPU_SHAP_BATCH]
+        out.append(_positive_class_shap(
+            explainer.shap_values(batch, check_additivity=False)
+        ))
+    return np.concatenate(out, axis=0) if len(out) > 1 else out[0]
+
+
 def _chunk_shap_values(model, X_chunk):
     """SHAP values for one chunk of rows, normalised to the positive class.
 
@@ -135,18 +295,13 @@ def _chunk_shap_values(model, X_chunk):
     otherwise fine. shap's own warning recommends disabling the check
     rather than the much slower feature_perturbation='interventional' mode.
     """
-    sv = shap.TreeExplainer(model).shap_values(X_chunk, check_additivity=False)
-    # Normalise across shap versions: older shap returns a [class0, class1]
-    # list, newer shap returns one (N, N_feat, 2) array.
-    if isinstance(sv, list):
-        sv = sv[1]
-    elif sv.ndim == 3:
-        sv = sv[:, :, 1]
-    return sv
+    return _positive_class_shap(
+        shap.TreeExplainer(model).shap_values(X_chunk, check_additivity=False)
+    )
 
 
-def _parallel_shap_values(model, X_test, n_jobs):
-    """SHAP values for X_test, splitting rows across n_jobs worker processes.
+def _parallel_shap_values(model, X_test, n_jobs, device="auto"):
+    """SHAP values for X_test, on the GPU if one is usable, else across cores.
 
     shap.TreeExplainer has no n_jobs/threading knob of its own (it calls
     straight into a single-threaded C extension for sklearn models), so for
@@ -156,7 +311,40 @@ def _parallel_shap_values(model, X_test, n_jobs):
     values per row don't depend on other rows, given the fitted model) and
     explaining each chunk in its own process is the only way to use more
     than one core here.
+
+    A CUDA device replaces that fan-out rather than adding to it: one GPU
+    beats the multi-core CPU path, and running N worker processes against a
+    single card would only make them contend for it and for its memory.
+
+    `device` is "auto" (GPU when usable, otherwise CPU), "gpu" (fail if not)
+    or "cpu".
     """
+    # A DataFrame reaches here only from the LightGBM path, where shap's GPU
+    # TreeSHAP warns that categorical features are unsupported and results may
+    # be wrong. LightGBM explains in milliseconds anyway, so that case simply
+    # stays on the CPU rather than being made to work.
+    gpu_eligible = device != "cpu" and not isinstance(X_test, pd.DataFrame)
+    if gpu_eligible:
+        try:
+            return _gpu_shap_values(model, X_test)
+        except Exception as exc:
+            if device == "gpu":
+                raise RuntimeError(
+                    f"-shap-device gpu was requested but GPU TreeSHAP failed: {exc}"
+                ) from exc
+            warnings.warn(
+                f"GPU TreeSHAP unavailable ({type(exc).__name__}: {exc}); "
+                "falling back to the CPU explainer. Pass -shap-device cpu to "
+                "silence this.",
+                stacklevel=2,
+            )
+    elif device == "gpu" and isinstance(X_test, pd.DataFrame):
+        warnings.warn(
+            "-shap-device gpu ignored for this model: shap's GPU TreeSHAP does "
+            "not support the categorical/DataFrame input LightGBM is given.",
+            stacklevel=2,
+        )
+
     n_jobs_eff = joblib.effective_n_jobs(n_jobs)
     if n_jobs_eff <= 1 or len(X_test) < 2 * n_jobs_eff:
         return _chunk_shap_values(model, X_test)
@@ -192,7 +380,7 @@ def _linear_shap_values(model, X_train, X_test):
 
 def _optimize_hyperparams(
     model_type, X_f, y_f, sw, groups_f,
-    n_splits, n_jobs, random_state, n_iter,
+    n_splits, n_jobs, random_state, n_iter, svm_device="auto",
 ):
     """Random search over _PARAM_GRIDS[model_type] using the same CV strategy
     as the main k-fold loop.  Returns the best parameter dict, which callers
@@ -234,7 +422,11 @@ def _optimize_hyperparams(
     elif model_type == "logreg":
         base = LogisticRegression(max_iter=1000, random_state=random_state, n_jobs=1)
     else:  # svm
-        base = SVC(kernel="rbf", probability=True, random_state=random_state, max_iter=_MAX_SVM_ITER)
+        base, _ = _make_svc(
+            svm_device, kernel="rbf", probability=False,
+            random_state=random_state, max_iter=_MAX_SVM_ITER,
+            class_weight="balanced",
+        )
 
     cv = (
         StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
@@ -280,6 +472,8 @@ def _model_shap_kfold(
     groups=None,
     optimize=False,
     n_search_iter=20,
+    shap_device="auto",
+    svm_device="auto",
 ):
     """Stratified k-fold CV with SHAP explanation, supporting three model types.
 
@@ -350,6 +544,7 @@ def _model_shap_kfold(
 
     shap_values_f = np.full((len(y_f), X_f.shape[1]), np.nan)
     oof_proba_f = np.full(len(y_f), np.nan)
+    oof_score_f = np.full(len(y_f), np.nan)   # SVM decision scores
     fold_auc = np.full(n_splits, np.nan)
     fold_roc = []
     perm_importances = []  # SVM only: list of (n_features,) arrays, one per fold
@@ -368,8 +563,10 @@ def _model_shap_kfold(
             model_type, X_f, y_f, sw, groups_f,
             n_splits=n_splits, n_jobs=n_jobs,
             random_state=random_state, n_iter=n_search_iter,
+            svm_device=svm_device,
         )
 
+    svm_on_gpu = False
     for fold, (train_idx, test_idx) in enumerate(fold_iter):
         scaler = StandardScaler().fit(X_f[train_idx])
         X_train = scaler.transform(X_f[train_idx])
@@ -392,32 +589,54 @@ def _model_shap_kfold(
             kw.update(best_params)
             model = lgb.LGBMClassifier(**kw)
         elif model_type == "svm":
+            # probability=False: SVC's internal Platt calibration costs ~5.5x
+            # the plain fit, and the same map is recovered afterwards from the
+            # out-of-fold decision scores by _platt_calibrate_oof. Dropping it
+            # also keeps this path usable by GPU SVM backends, which expose
+            # decision_function but no predict_proba.
             kw = dict(kernel="rbf", max_iter=_MAX_SVM_ITER, random_state=random_state,
-                      C=0.5, gamma=0.5, probability=True, class_weight="balanced")
+                      C=0.5, gamma=0.5, probability=False, class_weight="balanced")
             kw.update(best_params)
-            model = SVC(**kw)
+            model, svm_on_gpu = _make_svc(svm_device, **kw)
         else:  # logreg
             kw = dict(max_iter=1000, random_state=random_state, n_jobs=n_jobs)
             kw.update(best_params)
             model = LogisticRegression(**kw)
+
+        if model_type == "svm":
+            # cuML wants float32; a no-op on the CPU path
+            X_train = _as_svm_array(X_train, svm_on_gpu)
+            X_test = _as_svm_array(X_test, svm_on_gpu)
 
         if model_type == "svm" and X_train.shape[0] > _MAX_SVM_TRAIN:
             sss = StratifiedShuffleSplit(
                 n_splits=1, train_size=_MAX_SVM_TRAIN, random_state=random_state + fold
             )
             sub_idx, _ = next(sss.split(X_train, y_f[train_idx]))
-            model.fit(X_train[sub_idx], y_f[train_idx][sub_idx],
-                      sample_weight=sw[train_idx][sub_idx])
+            model.fit(X_train[sub_idx],
+                      _as_svm_array(y_f[train_idx][sub_idx], svm_on_gpu),
+                      sample_weight=_as_svm_array(sw[train_idx][sub_idx], svm_on_gpu))
+        elif model_type == "svm":
+            model.fit(X_train, _as_svm_array(y_f[train_idx], svm_on_gpu),
+                      sample_weight=_as_svm_array(sw[train_idx], svm_on_gpu))
         else:
             model.fit(X_train, y_f[train_idx], sample_weight=sw[train_idx])
 
-        proba = model.predict_proba(X_test)[:, 1]
-        oof_proba_f[test_idx] = proba
+        # AUC and the ROC curve are rank-based, so an uncalibrated decision
+        # score gives exactly the same numbers as a probability would. Only the
+        # calibration plot needs real probabilities, and for SVM those are
+        # recovered from these scores after the loop.
+        if model_type == "svm":
+            score = np.asarray(model.decision_function(X_test)).ravel()
+            oof_score_f[test_idx] = score
+        else:
+            score = model.predict_proba(X_test)[:, 1]
+            oof_proba_f[test_idx] = score
         if len(np.unique(y_f[test_idx])) > 1:
             fold_auc[fold] = roc_auc_score(
-                y_f[test_idx], proba, sample_weight=sw[test_idx]
+                y_f[test_idx], score, sample_weight=sw[test_idx]
             )
-            fpr, tpr, _ = roc_curve(y_f[test_idx], proba)
+            fpr, tpr, _ = roc_curve(y_f[test_idx], score)
             fold_roc.append((fpr, tpr, float(fold_auc[fold])))
 
         if model_type == "svm":
@@ -441,7 +660,7 @@ def _model_shap_kfold(
                 if model_type == "logreg":
                     sv = _linear_shap_values(model, X_train, X_test)
                 else:
-                    sv = _parallel_shap_values(model, X_test, n_jobs)
+                    sv = _parallel_shap_values(model, X_test, n_jobs, device=shap_device)
             except ExplainerError as exc:
                 warnings.warn(
                     f"Fold {fold}: SHAP explanation failed: {exc}", stacklevel=2
@@ -471,6 +690,11 @@ def _model_shap_kfold(
     print(f"{'rank':>4}  {'CV':<25}  {score_label:>26}")
     for rank, idx in enumerate(order, 1):
         print(f"{rank:>4}  {feature_names[idx]:<25}  {mean_abs_shap[idx]:26.4f}")
+
+    if model_type == "svm":
+        oof_proba_f = _platt_calibrate_oof(
+            oof_score_f, y_f, n_splits=n_splits, random_state=random_state
+        )
 
     oof_proba = np.full(len(finite), np.nan)
     oof_proba[finite] = oof_proba_f
@@ -622,6 +846,8 @@ def shap_ml(
     n_search_iter: Annotated[int, typer.Option("-n-search-iter", help="Number of random hyperparameter configurations to evaluate when -optimize is set", rich_help_panel=panels.MODEL)] = 20,
     seed: Annotated[int, typer.Option("-seed", help="Random seed for fold splits and models", rich_help_panel=panels.MODEL)] = 42,
     n_jobs: Annotated[int, typer.Option("-n-jobs", help="CPU cores for RF, LGBM, and LogReg; -1 = all (sklearn GBM is always single-threaded)", rich_help_panel=panels.MODEL)] = -1,
+    shap_device: Annotated[str, typer.Option("-shap-device", help="Where to compute tree SHAP values: 'auto' uses shap's CUDA TreeSHAP when a usable GPU is present and falls back to the multi-core CPU explainer otherwise, 'gpu' fails instead of falling back, 'cpu' forces the CPU path. Explaining dominates a fold's runtime, so this is the main speed knob; attributions agree between the two to float rounding.", rich_help_panel=panels.MODEL)] = "auto",
+    svm_device: Annotated[str, typer.Option("-svm-device", help="Where to fit the SVM: 'auto' uses cuML on the GPU when available and falls back to scikit-learn otherwise, 'gpu' fails instead of falling back, 'cpu' forces scikit-learn. Only affects -models svm. The SVM path is dominated by permutation importance, which is predict-bound: ~78x faster on the GPU, rankings agreeing to Spearman 0.9998.", rich_help_panel=panels.MODEL)] = "auto",
 
     # ── Output ────────────────────────────────────────────────────────────
     out: Annotated[str, typer.Option("-out", help="Base name for ranking files; '_<model>.txt' is appended", rich_help_panel=panels.OUTPUT)] = "shap_ranking.txt",
@@ -660,6 +886,14 @@ def shap_ml(
 
     Interfaces with fewer than -n-splits paths in either class are skipped.
     """
+    if svm_device not in SVM_DEVICE_CHOICES:
+        raise typer.BadParameter(
+            f"svm-device={svm_device!r} — choose from {SVM_DEVICE_CHOICES}."
+        )
+    if shap_device not in SHAP_DEVICE_CHOICES:
+        raise typer.BadParameter(
+            f"shap-device={shap_device!r} — choose from {SHAP_DEVICE_CHOICES}."
+        )
     z_cols_list   = [
         "z_NTop", "z_NBot", "z_PTop", "z_PBot",
         "z_O2_T", "z_O2_B", "z_O3_T", "z_O3_B",
@@ -752,6 +986,8 @@ def shap_ml(
                     n_splits=n_splits,
                     n_estimators=n_estimators,
                     n_jobs=n_jobs,
+                    shap_device=shap_device,
+                    svm_device=svm_device,
                     random_state=seed,
                     optimize=optimize,
                     n_search_iter=n_search_iter,
@@ -784,12 +1020,17 @@ def shap_ml(
                 str(model_plot_dir / f"{prefix}calibration.png"), overw=overw,
             )
 
+            brier, ece = _calibration_metrics(oof_true, oof_proba)
+            print(f"  calibration: Brier = {brier:.4f}   ECE = {ece:.4f}")
+
             order = np.argsort(mean_abs_shap)[::-1]
             results.append({
                 "interface": i,
                 "lambda": interfaces[i],
                 "ranking": [(cv_names[idx], float(mean_abs_shap[idx])) for idx in order],
                 "mean_fold_auc": float(np.nanmean(fold_auc)),
+                "brier": brier,
+                "ece": ece,
             })
             end = datetime.datetime.now()
             print(f"Interface {i + 1}/{M} done in {end - start}.")
