@@ -136,10 +136,6 @@ import tomli
 import typer
 
 from . import panels
-
-# (the original inserted this file's directory on sys.path so it could import
-#  analysis_parallel from the same folder; as a package module it imports the
-#  same helpers from chiroflux.cv_histograms instead)
 from .cv_histograms import (
     HIST_COLOR,
     HIST_DPI,
@@ -190,15 +186,10 @@ def _parse_range(text, flag, n):
 
 
 # ── Runs, loaded from the -runs file ─────────────────────────────────────────
-# This was a literal list of dicts here, so comparing a different pair of
-# simulations meant editing the module. It is now read from a TOML file given
-# with -runs (see examples/sasa_runs.toml) and populated by _load_runs before
-# the analysis starts; everything below still reads RUNS as a global.
 RUNS = []
 
 _RUN_REQUIRED = ("name", "load_dir", "weights", "ml_dir", "tpr")
 _RUN_OPTIONAL = {"scale": 1.0, "mirror_z": False}
-
 
 def _load_runs(path):
     """Read the [[run]] tables from a TOML file into the RUNS format.
@@ -290,7 +281,7 @@ DEBUG_TRUNCATE   = True             # False: append across runs
 # it look frozen once the paths slow down, which is not a failure but reads like
 # one.  A dated line every PROGRESS_EVERY paths says the same thing and survives
 # being written to a file.
-PROGRESS_EVERY = 25
+PROGRESS_EVERY = 100
 
 # Seconds without a single completed path before the run is declared stalled.
 # multiprocessing.Pool does NOT notice a worker that dies abruptly -- the OOM
@@ -1914,6 +1905,21 @@ def sasa(
 
     setup_debug_log()
 
+    # Write a JSON file with the parameters used for this run, so the plots and CSVs can be interpreted later.
+    import json as _json
+    with open(os.path.join(OUTPUT_DIR, "sasa_meta.json"), "w") as _fh:
+        _json.dump({
+            "z_range": list(Z_RANGE),
+            "z_bin_width": Z_BIN_WIDTH,
+            "sasa_range": list(SASA_RANGE),
+            "fold_symmetric": bool(FOLD_SYMMETRIC),
+            "probe_radius": PROBE_RADIUS,
+            "n_sphere_points": N_SPHERE_POINTS,
+            "occlude_with_water": bool(OCCLUDE_WITH_WATER),
+            "runs": [r["name"] for r in RUNS],
+            "runs_mirror_z": [bool(r["mirror_z"]) for r in RUNS],
+        }, _fh, indent=1)
+
     bin_info = build_sasa_bin_info()
     z_centers, z_min, z_dz = bin_info["z"]
     s_centers, s_min, s_ds = bin_info["SASA"]
@@ -1925,9 +1931,9 @@ def sasa(
     if SKIP_PARSING:
         existing = glob.glob(os.path.join(INTERMEDIATE_DIR, "*.npz"))
         if not existing:
-            print("ERROR: SKIP_PARSING=True but no intermediates were found.")
+            print("ERROR: -skip-parsing was given but no intermediates were found.")
             raise SystemExit(1)
-        print(f"\nSKIP_PARSING=True - reusing {len(existing)} intermediate files.")
+        print(f"\n-skip-parsing - reusing {len(existing)} intermediate files.")
     else:
         for stale in glob.glob(os.path.join(INTERMEDIATE_DIR, "*__sasa.npz")):
             os.remove(stale)

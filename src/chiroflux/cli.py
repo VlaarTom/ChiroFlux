@@ -53,6 +53,11 @@ _COMMANDS = {
         "sasa",
         "Weighted solvent-accessible surface area profile across the membrane.",
     ),
+    "sasa-compare": _Command(
+        "sasa_compare",
+        "sasa_compare",
+        "Compare two SASA profiles (e.g. L vs D) with a bootstrapped difference.",
+    ),
     "shap-ml": _Command(
         "shap_analysis",
         "shap_ml",

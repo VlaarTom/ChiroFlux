@@ -33,6 +33,7 @@ def test_documented_entry_points_are_importable():
         ("membrane_spatial", "membrane_spatial"),
         ("neighbours", "neighbours"),
         ("sasa", "sasa"),
+        ("sasa_compare", "sasa_compare"),
         ("shap_analysis", "shap_ml"),
         ("shap_analysis_ld", "shap_enantiomer"),
         ("statistical_analysis", "statistics"),
@@ -54,6 +55,7 @@ def test_cli_registry_covers_every_entry_point():
         ("membrane_spatial", "membrane_spatial"),
         ("neighbours", "neighbours"),
         ("sasa", "sasa"),
+        ("sasa_compare", "sasa_compare"),
         ("shap_analysis", "shap_ml"),
         ("shap_analysis_ld", "shap_enantiomer"),
         ("statistical_analysis", "statistics"),
@@ -217,8 +219,8 @@ def _option_panels(function):
     "module_name, function_name",
     [("shap_analysis", "shap_ml"), ("shap_analysis_ld", "shap_enantiomer"),
      ("cv_generation", "generate_cvs"), ("cv_histograms", "histograms"),
-     ("sasa", "sasa"), ("membrane_spatial", "membrane_spatial"),
-     ("neighbours", "neighbours")],
+     ("sasa", "sasa"), ("sasa_compare", "sasa_compare"),
+     ("membrane_spatial", "membrane_spatial"), ("neighbours", "neighbours")],
 )
 def test_every_option_is_assigned_to_a_panel(module_name, function_name):
     """An unpanelled option falls into the generic 'Options' box, away from
@@ -234,8 +236,8 @@ def test_every_option_is_assigned_to_a_panel(module_name, function_name):
     "module_name, function_name",
     [("shap_analysis", "shap_ml"), ("shap_analysis_ld", "shap_enantiomer"),
      ("cv_generation", "generate_cvs"), ("cv_histograms", "histograms"),
-     ("sasa", "sasa"), ("membrane_spatial", "membrane_spatial"),
-     ("neighbours", "neighbours")],
+     ("sasa", "sasa"), ("sasa_compare", "sasa_compare"),
+     ("membrane_spatial", "membrane_spatial"), ("neighbours", "neighbours")],
 )
 def test_panels_are_declared_in_the_canonical_order(module_name, function_name):
     """Panels render in first-appearance order, so the signature order is what

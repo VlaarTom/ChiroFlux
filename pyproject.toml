@@ -49,6 +49,28 @@ deeptda = [
     "lightning>=2.0",
     "mlcolvar>=1.3",
 ]
+# GPU SVM for `-svm-device gpu` (chiroflux runs fine without it: -svm-device
+# auto falls back to scikit-learn).
+#
+# IMPORTANT: this extra is NOT sufficient on its own, and installing it into an
+# existing environment can break torch. cuML is built against CUDA 12.9, so the
+# whole environment's CUDA runtime has to agree with it:
+#
+#   * torch must be a cu129 build, which lives on PyTorch's own index rather
+#     than PyPI and therefore cannot be expressed here;
+#   * any orphaned CUDA 13 nvidia-* packages must be removed first, or cuML's
+#     kernels fail at runtime with CUDA_ERROR_INVALID_IMAGE;
+#   * those nvidia-* packages share one directory tree, so removing some
+#     deletes files the others own and torch has to be repaired afterwards.
+#
+# See "GPU SVM: the -svm-device flag" in the README for the full sequence.
+#
+# The other GPU path, `-shap-device gpu`, needs no extra at all - but it does
+# need a build of shap that ships the CUDA extension (_cext_gpu). The conda
+# package has it; the PyPI wheels do not. That is also not expressible here.
+gpu = [
+    "cuml-cu12>=25.8",
+]
 dev = [
     "pytest>=7.4",
     "ruff>=0.4",

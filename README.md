@@ -1,6 +1,6 @@
 # ChiroFlux
 
-Collective-variable analysis for TIS/RETIS path sampling with
+Collective-variable creation and analysis for TIS/RETIS path sampling with
 [infretis](https://github.com/infretis/infretis).
 
 Given a simulation — its `.toml` config, its `infretis_data.txt` path table and a
@@ -92,6 +92,113 @@ chiroflux pca -toml L/infretis.toml -cv-dir L/ML \
               -toml2 D/infretis.toml -cv-dir2 D/ML -label1 L -label2 D
 ```
 
+### GPU SHAP: the `-shap-device` flag
+
+Explaining, not fitting, dominates `shap-ml` and `shap-enantiomer`. On a
+300-tree forest, fitting took ~1 s while `TreeExplainer` took ~177 s for a
+test fold — **99.4% of the time**. shap ships a CUDA implementation of the same
+Tree SHAP algorithm, and `-shap-device` selects it:
+
+| value | behaviour |
+| --- | --- |
+| `auto` (default) | use the GPU when one is usable, fall back to the CPU explainer with a warning otherwise |
+| `gpu` | fail rather than fall back — use when you want to know the GPU is really being used |
+| `cpu` | force the multi-core CPU path |
+
+Measured on an RTX 2000 Ada, 300 trees, 600 test rows × 40 CVs:
+
+```
+device=cpu (all 22 cores) : 13.58 s
+device=gpu                :  3.56 s     x3.8
+attributions agree        : True, max|diff| 2.2e-06
+```
+
+The difference is float32 on the GPU against float64 on the CPU, so rankings
+are unaffected — there is a test asserting the two agree.
+
+The GPU *replaces* the process fan-out rather than adding to it: `-n-jobs`
+workers all competing for one card would only contend for it and its VRAM.
+Batches are capped at 2000 rows to bound VRAM rather than host RAM.
+
+This applies to `rf` and `gbm`. LightGBM is handed a `DataFrame`, and shap's
+GPU TreeSHAP warns that categorical features are unsupported there, so that
+model stays on the CPU — it explains in milliseconds either way. `logreg` uses
+`LinearExplainer` and `svm` uses permutation importance, so neither is affected.
+
+Note this accelerates *explaining*. Fitting is the other 0.6% — for the SVM,
+which is not a tree model and is dominated by permutation importance instead,
+see `-svm-device` below.
+
+### GPU SVM: the `-svm-device` flag
+
+`-models svm` spends ~75% of its time in `permutation_importance`, which is
+`predict`-bound rather than fit-bound. cuML's SVC accelerates exactly that:
+
+```
+                fit        permutation_importance      total
+sklearn CPU    1.59 s            192.15 s            193.74 s
+cuML GPU       2.73 s              2.44 s              5.17 s     x37.5 overall
+ranking agreement (Spearman): 0.9998, identical top-3 CVs
+```
+
+`-svm-device` takes `auto` (default), `gpu` or `cpu`, mirroring `-shap-device`.
+It needs cuML installed; without it, `auto` falls back to scikit-learn with a
+warning and the package behaves exactly as before.
+
+#### Installing the GPU paths
+
+**A new environment** needs no special sequence. `shap`'s GPU TreeSHAP lives in
+the CUDA build of the conda package (the PyPI wheels carry no CUDA extension),
+so take `shap` from conda-forge and everything else from pip:
+
+```bash
+conda create -n chiroflux_gpu -c conda-forge python=3.13 "shap=0.52.0=cuda129*"
+conda activate chiroflux_gpu
+pip install -e '.[gpu,deeptda]'
+```
+
+pip resolves cuML and torch together in one transaction and picks a mutually
+compatible CUDA runtime. Verify with:
+
+```bash
+python -c "import importlib.util as u; print(u.find_spec('shap._cext_gpu') is not None)"   # -shap-device gpu
+python -c "import cuml, torch; print(cuml.__version__, torch.cuda.is_available())"          # -svm-device gpu
+pytest
+```
+
+chiroflux never imports infretis - it only reads its output files - so this
+environment does not need infretis unless you also run simulations from it.
+
+**Migrating an existing environment** is harder, and only because pip will not
+renegotiate an already-installed torch. If yours is a cu128 build, pip keeps it
+and then takes the newest cuML, which wants CUDA 12.9 - a mismatch that shows
+up at runtime as `CUDA_ERROR_INVALID_IMAGE`. In that case:
+
+```bash
+conda create --name myenv_gpu --clone myenv          # keep a fallback
+
+pip install --upgrade "torch==2.13.0+cu129" torchvision \
+    --index-url https://download.pytorch.org/whl/cu129
+pip install -e '.[gpu]'
+
+# orphaned CUDA 13 packages, if any, also cause CUDA_ERROR_INVALID_IMAGE
+pip uninstall -y nvidia-cublas nvidia-cuda-cupti nvidia-cuda-nvrtc \
+    nvidia-cuda-runtime nvidia-cudnn-cu13 nvidia-cufft nvidia-cufile \
+    nvidia-curand nvidia-cusolver nvidia-cusparse nvidia-cusparselt-cu13 \
+    nvidia-nccl-cu13 nvidia-nvjitlink nvidia-nvshmem-cu13 nvidia-nvtx
+
+# those packages share one nvidia/ tree, so the uninstall above deletes files
+# torch owns (libcudnn.so.9 among them) - put them back
+pip install --force-reinstall --no-deps \
+    nvidia-cudnn-cu12==9.20.0.48 nvidia-cusparselt-cu12==0.8.1 \
+    nvidia-nccl-cu12==2.29.7 nvidia-nvshmem-cu12==3.4.5
+```
+
+Skipping the last step leaves torch broken, so `train-deeptda` stops working
+while cuML starts. Run `pytest` and a `torch.cuda.is_available()` check before
+trusting a migrated environment - and prefer the fresh environment above, which
+needs none of this.
+
 ### Histogram binning: the `-ranges` file
 
 `chiroflux histograms` requires `-ranges`, a TOML file giving the binning for
@@ -121,6 +228,53 @@ script, differing only in configuration. There is deliberately **no default**:
 the binning determines every histogram in the output, so a plausible-but-wrong
 fallback would be worse than refusing to run. Malformed entries (wrong length,
 `max <= min`, zero bins) are rejected with the offending column named.
+
+### Comparing two SASA profiles
+
+`sasa` combines the runs in its `-runs` file into one profile; `sasa-compare`
+takes two such profiles and reports where they differ:
+
+```bash
+chiroflux sasa -runs L_runs.toml -out-dir sasa_L
+chiroflux sasa -runs D_runs.toml -out-dir sasa_D
+chiroflux sasa-compare -a sasa_L -b sasa_D -label-a L -label-b D
+```
+
+It recomputes both profiles from the cached per-path arrays, so no trajectory
+is re-read and the comparison can be re-run freely while adjusting it.
+
+If the two permeants traverse the membrane in **opposite directions**, their
+depth axes run opposite ways and the profiles are not comparable bin for bin.
+`-mirror-b` reflects B through the membrane centre (z → −z) first:
+
+```bash
+chiroflux sasa-compare -a sasa_L -b sasa_D -label-a L -label-b D -mirror-b
+```
+
+On a test profile peaking at z = −20 against one peaking at z = +20, this took
+the bins flagged as different from 24/40 down to 3/40 — the rest were an
+artefact of the misaligned axis. The reflection also swaps the phosphate-plane
+landmarks, since the upper leaflet becomes the lower one.
+
+Two guards: it requires a z range symmetric about zero (reversing bins is only
+z → −z there), and it warns if B was already built with a run-level `mirror_z`,
+because mirroring twice returns the original.
+
+The difference Δ(z) = B − A is bootstrapped **jointly**: each replicate
+resamples paths within A and within B and differences the two resampled means.
+Drawing two separate confidence bands and checking whether they overlap is the
+intuitive alternative and it is wrong — non-overlapping intervals do imply a
+difference, but overlapping ones do not imply its absence, so that reading
+misses real effects. As with `sasa`, the resampling unit is the **path**, since
+frames within a path are consecutive points of one trajectory.
+
+Output is one plot per quantity (total / polar / apolar SASA and exposed
+fraction) showing both profiles above and Δ with its band below, plus
+`sasa_comparison.csv` giving per-bin Δ, interval and a significance flag.
+
+Both runs must share a z axis. `sasa` records its binning in `sasa_meta.json`
+and the comparison refuses mismatched `-z-range`, `-z-bin-width`,
+`-probe-radius`, `-fold-symmetric` or `-occlude-with-water`.
 
 ### Which simulations to combine: the `-runs` file
 

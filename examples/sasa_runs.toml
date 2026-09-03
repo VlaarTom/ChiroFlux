@@ -41,3 +41,15 @@ mirror_z = false
 # tpr      = "L_PRO_neutral/infinit_escape/topol.tpr"
 # scale    = 0.10930670252575012
 # mirror_z = true
+
+# NOTE: comparing two simulations is a separate command and needs no entry
+# here. This file describes how ONE profile is built; `chiroflux sasa-compare`
+# takes the two output directories that result:
+#
+#   chiroflux sasa -runs L_runs.toml -out-dir sasa_L
+#   chiroflux sasa -runs D_runs.toml -out-dir sasa_D
+#   chiroflux sasa-compare -a sasa_L -b sasa_D -label-a L -label-b D
+#
+# Keeping them apart means the expensive trajectory pass is not repeated every
+# time the comparison is re-plotted, and either profile can be compared against
+# any other without editing this file.
