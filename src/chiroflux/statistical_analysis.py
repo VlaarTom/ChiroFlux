@@ -30,6 +30,7 @@ from matplotlib.patches import Patch
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from . import panels
 from .cvs import _apply_angle_transforms
 from .pathdata import (
     _check_overwrite,
@@ -240,19 +241,28 @@ def _plot_cv_distributions(X, y, weights, feature_names, effect_sizes, out_dir, 
 # ---------------------------------------------------------------------------
 
 def statistics(
-    toml: Annotated[str, typer.Option("-toml", help="The .toml file")] = "infretis.toml",
-    data: Annotated[str, typer.Option("-data", help="The infretis_data.txt file")] = "infretis_data.txt",
-    cv_dir: Annotated[str, typer.Option("-cv-dir", help="Path data folder with CV values in .txt files")] = "ML",
-    op_col: Annotated[str, typer.Option("-op-col", help="Order-parameter column name")] = "OP_Lamb",
-    cv_cols: Annotated[Optional[str], typer.Option("-cv-cols", help="Comma-separated CV columns to use; default = all except -op-col")] = None,
-    exclude: Annotated[Optional[str], typer.Option("-exclude", help="Comma-separated substrings; CVs whose name matches one are dropped (only when -cv-cols is unset)")] = None,
-    angle_cols: Annotated[Optional[str], typer.Option("-angle-cols", help="Comma-separated CV columns in degrees to convert to cos(θ) (asymmetric molecules)")] = None,
-    sym_angle_cols: Annotated[Optional[str], typer.Option("-sym-angle-cols", help="Comma-separated CV columns in degrees to convert to cos²(θ) (symmetric molecules)")] = None,
-    nskip: Annotated[int, typer.Option("-nskip", help="Skip the first nskip rows of infretis_data.txt")] = 1000,
-    plot_dir: Annotated[str, typer.Option("-plot-dir", help="Root directory for output plots")] = "shap_plots",
-    top_n: Annotated[int, typer.Option("-top-n", help="Number of top CVs for distribution comparison plots")] = 3,
-    out: Annotated[str, typer.Option("-out", help="Output file for the CV rankings")] = "shap_wo_ml_ranking.txt",
-    overw: Annotated[bool, typer.Option("-O", help="Force overwriting of existing files")] = False,
+    # ── Input data ────────────────────────────────────────────────────────
+    toml: Annotated[str, typer.Option("-toml", help="The .toml file", rich_help_panel=panels.INPUT)] = "infretis.toml",
+    data: Annotated[str, typer.Option("-data", help="The infretis_data.txt file", rich_help_panel=panels.INPUT)] = "infretis_data.txt",
+    cv_dir: Annotated[str, typer.Option("-cv-dir", help="Path data folder with CV values in .txt files", rich_help_panel=panels.INPUT)] = "ML",
+    op_col: Annotated[str, typer.Option("-op-col", help="Order-parameter column name", rich_help_panel=panels.INPUT)] = "OP_Lamb",
+
+    # ── Dataset construction ──────────────────────────────────────────────
+    nskip: Annotated[int, typer.Option("-nskip", help="Skip the first nskip rows of infretis_data.txt", rich_help_panel=panels.DATASET)] = 1000,
+
+    # ── CV selection ──────────────────────────────────────────────────────
+    cv_cols: Annotated[Optional[str], typer.Option("-cv-cols", help="Comma-separated CV columns to use; default = all except -op-col", rich_help_panel=panels.SELECT)] = None,
+    exclude: Annotated[Optional[str], typer.Option("-exclude", help="Comma-separated substrings; CVs whose name matches one are dropped (only when -cv-cols is unset)", rich_help_panel=panels.SELECT)] = None,
+
+    # ── CV corrections: representation ────────────────────────────────────
+    angle_cols: Annotated[Optional[str], typer.Option("-angle-cols", help="Comma-separated CV columns in degrees to convert to cos(θ) (asymmetric molecules)", rich_help_panel=panels.REPR)] = None,
+    sym_angle_cols: Annotated[Optional[str], typer.Option("-sym-angle-cols", help="Comma-separated CV columns in degrees to convert to cos²(θ) (symmetric molecules)", rich_help_panel=panels.REPR)] = None,
+
+    # ── Output ────────────────────────────────────────────────────────────
+    plot_dir: Annotated[str, typer.Option("-plot-dir", help="Root directory for output plots", rich_help_panel=panels.OUTPUT)] = "shap_plots",
+    top_n: Annotated[int, typer.Option("-top-n", help="Number of top CVs for distribution comparison plots", rich_help_panel=panels.OUTPUT)] = 3,
+    out: Annotated[str, typer.Option("-out", help="Output file for the CV rankings", rich_help_panel=panels.OUTPUT)] = "shap_wo_ml_ranking.txt",
+    overw: Annotated[bool, typer.Option("-O", help="Force overwriting of existing files", rich_help_panel=panels.OUTPUT)] = False,
 ):
     """Per-interface CV importance from raw WHAM-weighted data (no ML model).
 

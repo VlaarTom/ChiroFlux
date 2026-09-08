@@ -24,6 +24,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import typer
 
+from . import panels
 from .pathdata import _check_overwrite
 
 _DEEPTDA_HINT = (
@@ -84,21 +85,28 @@ def _weighted_resample(X, y, w, n_per_class, rng):
 
 
 def train_deeptda(
-    npz: Annotated[str, typer.Option("-npz", help="Dataset .npz from prepare-deeptda-data.")] = "deeptda_ld_dataset.npz",
-    out_dir: Annotated[str, typer.Option("-out-dir", help="Output folder for the trained model and diagnostic plots.")] = "deeptda_model",
-    n_per_class: Annotated[int, typer.Option("-n-per-class", help="Importance-resampled frames per class.")] = 500000,
-    n_cvs: Annotated[int, typer.Option("-n-cvs", help="Number of CVs to learn.")] = 1,
-    hidden: Annotated[str, typer.Option("-hidden", help="Comma-separated hidden layer sizes.")] = "32,16",
-    target_centers: Annotated[str, typer.Option("-target-centers", help="Comma-separated Gaussian target centers, one per state.")] = "-.5,.5",
-    target_sigmas: Annotated[str, typer.Option("-target-sigmas", help="Comma-separated Gaussian target sigmas, one per state.")] = "0.2,0.2",
-    val_frac: Annotated[float, typer.Option("-val-frac", help="Fraction of the resampled set held out for validation.")] = 0.2,
-    batch_size: Annotated[int, typer.Option("-batch-size", help="Training batch size.")] = 4096,
-    max_epochs: Annotated[int, typer.Option("-max-epochs", help="Maximum number of training epochs.")] = 10000,
-    patience: Annotated[int, typer.Option("-patience", help="Stop after this many epochs with no validation-loss improvement; the best (not final) epoch's weights are saved.")] = 1000,
-    lr: Annotated[float, typer.Option("-lr", help="Adam learning rate.")] = 1e-3,
-    seed: Annotated[int, typer.Option("-seed", help="Random seed for resampling and training.")] = 42,
-    class_names: Annotated[str, typer.Option("-class-names", help="Comma-separated names for class 0,1 used in prints and plot legends, e.g. 'non-reactive,reactive' (prepare-deeptda-data) or 'L,D' (prepare-deeptda-data-ld).")] = "non-reactive,reactive",
-    overw: Annotated[bool, typer.Option("-O", help="Force overwriting of files.")] = False,
+    # ── Input data ────────────────────────────────────────────────────────
+    npz: Annotated[str, typer.Option("-npz", help="Dataset .npz from prepare-deeptda-data.", rich_help_panel=panels.INPUT)] = "deeptda_ld_dataset.npz",
+
+    # ── Dataset construction ──────────────────────────────────────────────
+    n_per_class: Annotated[int, typer.Option("-n-per-class", help="Importance-resampled frames per class.", rich_help_panel=panels.DATASET)] = 500000,
+    val_frac: Annotated[float, typer.Option("-val-frac", help="Fraction of the resampled set held out for validation.", rich_help_panel=panels.DATASET)] = 0.2,
+    class_names: Annotated[str, typer.Option("-class-names", help="Comma-separated names for class 0,1 used in prints and plot legends, e.g. 'non-reactive,reactive' (prepare-deeptda-data) or 'L,D' (prepare-deeptda-data-ld).", rich_help_panel=panels.DATASET)] = "non-reactive,reactive",
+
+    # ── Model and training ────────────────────────────────────────────────
+    n_cvs: Annotated[int, typer.Option("-n-cvs", help="Number of CVs to learn.", rich_help_panel=panels.MODEL)] = 1,
+    hidden: Annotated[str, typer.Option("-hidden", help="Comma-separated hidden layer sizes.", rich_help_panel=panels.MODEL)] = "32,16",
+    target_centers: Annotated[str, typer.Option("-target-centers", help="Comma-separated Gaussian target centers, one per state.", rich_help_panel=panels.MODEL)] = "-.5,.5",
+    target_sigmas: Annotated[str, typer.Option("-target-sigmas", help="Comma-separated Gaussian target sigmas, one per state.", rich_help_panel=panels.MODEL)] = "0.2,0.2",
+    batch_size: Annotated[int, typer.Option("-batch-size", help="Training batch size.", rich_help_panel=panels.MODEL)] = 4096,
+    max_epochs: Annotated[int, typer.Option("-max-epochs", help="Maximum number of training epochs.", rich_help_panel=panels.MODEL)] = 10000,
+    patience: Annotated[int, typer.Option("-patience", help="Stop after this many epochs with no validation-loss improvement; the best (not final) epoch's weights are saved.", rich_help_panel=panels.MODEL)] = 1000,
+    lr: Annotated[float, typer.Option("-lr", help="Adam learning rate.", rich_help_panel=panels.MODEL)] = 1e-3,
+    seed: Annotated[int, typer.Option("-seed", help="Random seed for resampling and training.", rich_help_panel=panels.MODEL)] = 42,
+
+    # ── Output ────────────────────────────────────────────────────────────
+    out_dir: Annotated[str, typer.Option("-out-dir", help="Output folder for the trained model and diagnostic plots.", rich_help_panel=panels.OUTPUT)] = "deeptda_model",
+    overw: Annotated[bool, typer.Option("-O", help="Force overwriting of files.", rich_help_panel=panels.OUTPUT)] = False,
 ):
     """Train a 2-state DeepTDA CV on a prepare-deeptda-data(-ld) dataset."""
     (

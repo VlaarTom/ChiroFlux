@@ -39,6 +39,7 @@ import numpy as np
 import tomli
 import typer
 
+from . import panels
 from .cvs import (
     _apply_angle_transforms,
     _apply_cv_rename,
@@ -274,18 +275,25 @@ def _load_sim_frames(
 
 
 def prepare_deeptda_data(
-    toml: Annotated[str, typer.Option("-toml", help="Path to the infretis .toml config (for the TIS interfaces).")] = "infretis.toml",
-    data: Annotated[str, typer.Option("-data", help="Path to the infretis_data.txt file.")] = "infretis_data.txt",
-    cv_dir: Annotated[str, typer.Option("-cv-dir", help="Folder with per-path CV trajectory .txt files.")] = "ML",
-    nskip: Annotated[int, typer.Option("-nskip", help="Skip the first nskip rows of the data file (burn-in).")] = 1000,
-    exclude: Annotated[str, typer.Option("-ex-cv", help="Comma-separated CV name(s) or substring(s) to exclude (e.g. a full column name or a shared prefix).")] = "",
-    out: Annotated[str, typer.Option("-out", help="Output .npz path for the prepared dataset.")] = "deeptda_dataset.npz",
-    op_col: Annotated[str, typer.Option("-op-col", help="Name of the order-parameter column in the CV files.")] = "OP_Lamb",
-    lambda_low: Annotated[Optional[float], typer.Option("-lambda-low", help="Op value at/below which proximity weight is 0 (default: interfaces[0]).")] = None,
-    lambda_high: Annotated[Optional[float], typer.Option("-lambda-high", help="Op value at/above which proximity weight is 1 (default: interfaces[1]).")] = None,
-    stride: Annotated[int, typer.Option("-stride", help="Keep every Nth frame of each path.")] = 1,
-    max_frames_per_path: Annotated[Optional[int], typer.Option("-max-frames-per-path", help="Cap frames kept per path (evenly subsampled); unset = no cap.")] = None,
-    overw: Annotated[bool, typer.Option("-O", help="Force overwriting of files.")] = False,
+    # ── Input data ────────────────────────────────────────────────────────
+    toml: Annotated[str, typer.Option("-toml", help="Path to the infretis .toml config (for the TIS interfaces).", rich_help_panel=panels.INPUT)] = "infretis.toml",
+    data: Annotated[str, typer.Option("-data", help="Path to the infretis_data.txt file.", rich_help_panel=panels.INPUT)] = "infretis_data.txt",
+    cv_dir: Annotated[str, typer.Option("-cv-dir", help="Folder with per-path CV trajectory .txt files.", rich_help_panel=panels.INPUT)] = "ML",
+    op_col: Annotated[str, typer.Option("-op-col", help="Name of the order-parameter column in the CV files.", rich_help_panel=panels.INPUT)] = "OP_Lamb",
+
+    # ── Dataset construction ──────────────────────────────────────────────
+    nskip: Annotated[int, typer.Option("-nskip", help="Skip the first nskip rows of the data file (burn-in).", rich_help_panel=panels.DATASET)] = 1000,
+    lambda_low: Annotated[Optional[float], typer.Option("-lambda-low", help="Op value at/below which proximity weight is 0 (default: interfaces[0]).", rich_help_panel=panels.DATASET)] = None,
+    lambda_high: Annotated[Optional[float], typer.Option("-lambda-high", help="Op value at/above which proximity weight is 1 (default: interfaces[1]).", rich_help_panel=panels.DATASET)] = None,
+    stride: Annotated[int, typer.Option("-stride", help="Keep every Nth frame of each path.", rich_help_panel=panels.DATASET)] = 1,
+    max_frames_per_path: Annotated[Optional[int], typer.Option("-max-frames-per-path", help="Cap frames kept per path (evenly subsampled); unset = no cap.", rich_help_panel=panels.DATASET)] = None,
+
+    # ── CV selection ──────────────────────────────────────────────────────
+    exclude: Annotated[str, typer.Option("-ex-cv", help="Comma-separated CV name(s) or substring(s) to exclude (e.g. a full column name or a shared prefix).", rich_help_panel=panels.SELECT)] = "",
+
+    # ── Output ────────────────────────────────────────────────────────────
+    out: Annotated[str, typer.Option("-out", help="Output .npz path for the prepared dataset.", rich_help_panel=panels.OUTPUT)] = "deeptda_dataset.npz",
+    overw: Annotated[bool, typer.Option("-O", help="Force overwriting of files.", rich_help_panel=panels.OUTPUT)] = False,
 ):
     """Build a frame-level, path-weight x proximity-weight DeepTDA training
     set from TIS/RETIS trajectories, and save it to a compressed .npz."""
@@ -330,31 +338,42 @@ def prepare_deeptda_data(
 
 
 def prepare_deeptda_data_ld(
-    dir_l: Annotated[str, typer.Option("-dir-l", help="Root directory of the L simulation")] = "L",
-    dir_d: Annotated[str, typer.Option("-dir-d", help="Root directory of the D simulation")] = "D",
-    toml_l: Annotated[str, typer.Option("-toml-l", help="Toml filename inside -dir-l")] = "infretis.toml",
-    data_l: Annotated[str, typer.Option("-data-l", help="Data filename inside -dir-l")] = "infretis_data.txt",
-    toml_d: Annotated[str, typer.Option("-toml-d", help="Toml filename inside -dir-d")] = "infretis.toml",
-    data_d: Annotated[str, typer.Option("-data-d", help="Data filename inside -dir-d")] = "infretis_data.txt",
-    op_col: Annotated[str, typer.Option("-op-col", help="Name of the order-parameter column in the CV files.")] = "OP_Lamb",
-    cv_cols: Annotated[Optional[str], typer.Option("-cv-cols", help="Comma-separated CV columns to use; default = all except -op-col")] = None,
-    exclude: Annotated[Optional[str], typer.Option("-exclude", help="Comma-separated substrings; CVs whose name matches are dropped from both simulations")] = None,
-    exclude_l: Annotated[Optional[str], typer.Option("-exclude-l", help="Comma-separated substrings; CVs whose name matches are dropped from the L simulation only")] = None,
-    exclude_d: Annotated[Optional[str], typer.Option("-exclude-d", help="Comma-separated substrings; CVs whose name matches are dropped from the D simulation only")] = None,
-    angle_cols: Annotated[Optional[str], typer.Option("-angle-cols", help="Comma-separated CV columns in degrees -> cos(theta)  [asymmetric molecule]")] = None,
-    sym_angle_cols: Annotated[Optional[str], typer.Option("-sym-angle-cols", help="Comma-separated CV columns in degrees -> cos^2(theta)  [symmetric molecule]")] = None,
-    flip_cols_l: Annotated[Optional[str], typer.Option("-flip-cols-l", help="Comma-separated CV columns to negate (x -> -x) in the L simulation only, before angle transforms. Use for chirality-odd CVs (e.g. dihedral angles) that are mathematically guaranteed to be sign-flipped between mirror-image enantiomers for purely definitional reasons; correcting one side makes the values directly comparable and stops the raw sign from trivially dominating the L/D discriminant.")] = None,
-    flip_cols_d: Annotated[Optional[str], typer.Option("-flip-cols-d", help="Comma-separated CV columns to negate (x -> -x) in the D simulation only, before angle transforms. See -flip-cols-l.")] = None,
-    name_cv_cols: Annotated[Optional[str], typer.Option("-name-cv-cols", help="Comma-separated 'old:new' pairs to normalise CV names, e.g. '_l_:_u_' or '_l_:_u_,foo:bar'. Applied to both simulations after angle transforms, before the compatibility check.")] = None,
-    paths: Annotated[str, typer.Option("-paths", help="Which paths to include: 'all', 'reactive', 'nonreactive'")] = "all",
-    nskip: Annotated[int, typer.Option("-nskip", help="Skip the first nskip rows of each infretis_data.txt (burn-in).")] = 1000,
-    lambda_low: Annotated[Optional[float], typer.Option("-lambda-low", help="Op value at/below which proximity weight is 0; unset (with -lambda-high also unset) = no proximity ramp, every frame keeps its full path weight.")] = None,
-    lambda_high: Annotated[Optional[float], typer.Option("-lambda-high", help="Op value at/above which proximity weight is 1; must be set together with -lambda-low.")] = None,
-    stride: Annotated[int, typer.Option("-stride", help="Keep every Nth frame of each path.")] = 1,
-    max_frames_per_path: Annotated[Optional[int], typer.Option("-max-frames-per-path", help="Cap frames kept per path (evenly subsampled); unset = no cap.")] = None,
-    out: Annotated[str, typer.Option("-out", help="Output .npz path for the prepared dataset.")] = "deeptda_ld_dataset.npz",
-    force_interfaces: Annotated[bool, typer.Option("-force-interfaces", help="Allow different interface counts between L and D. Unlike shap-enantiomer, no interpolation/common grid is needed here (frames are pooled raw, with no lambda feature) - this only relaxes the compatibility check; each simulation's own interfaces are still used independently for its own WHAM weights and proximity ramp.")] = False,
-    overw: Annotated[bool, typer.Option("-O", help="Force overwriting of files.")] = False,
+    # ── Input data ────────────────────────────────────────────────────────
+    dir_l: Annotated[str, typer.Option("-dir-l", help="Root directory of the L simulation", rich_help_panel=panels.INPUT)] = "L",
+    dir_d: Annotated[str, typer.Option("-dir-d", help="Root directory of the D simulation", rich_help_panel=panels.INPUT)] = "D",
+    toml_l: Annotated[str, typer.Option("-toml-l", help="Toml filename inside -dir-l", rich_help_panel=panels.INPUT)] = "infretis.toml",
+    data_l: Annotated[str, typer.Option("-data-l", help="Data filename inside -dir-l", rich_help_panel=panels.INPUT)] = "infretis_data.txt",
+    toml_d: Annotated[str, typer.Option("-toml-d", help="Toml filename inside -dir-d", rich_help_panel=panels.INPUT)] = "infretis.toml",
+    data_d: Annotated[str, typer.Option("-data-d", help="Data filename inside -dir-d", rich_help_panel=panels.INPUT)] = "infretis_data.txt",
+    op_col: Annotated[str, typer.Option("-op-col", help="Name of the order-parameter column in the CV files.", rich_help_panel=panels.INPUT)] = "OP_Lamb",
+
+    # ── Dataset construction ──────────────────────────────────────────────
+    paths: Annotated[str, typer.Option("-paths", help="Which paths to include: 'all', 'reactive', 'nonreactive'", rich_help_panel=panels.DATASET)] = "all",
+    nskip: Annotated[int, typer.Option("-nskip", help="Skip the first nskip rows of each infretis_data.txt (burn-in).", rich_help_panel=panels.DATASET)] = 1000,
+    force_interfaces: Annotated[bool, typer.Option("-force-interfaces", help="Allow different interface counts between L and D. Unlike shap-enantiomer, no interpolation/common grid is needed here (frames are pooled raw, with no lambda feature) - this only relaxes the compatibility check; each simulation's own interfaces are still used independently for its own WHAM weights and proximity ramp.", rich_help_panel=panels.DATASET)] = False,
+    lambda_low: Annotated[Optional[float], typer.Option("-lambda-low", help="Op value at/below which proximity weight is 0; unset (with -lambda-high also unset) = no proximity ramp, every frame keeps its full path weight.", rich_help_panel=panels.DATASET)] = None,
+    lambda_high: Annotated[Optional[float], typer.Option("-lambda-high", help="Op value at/above which proximity weight is 1; must be set together with -lambda-low.", rich_help_panel=panels.DATASET)] = None,
+    stride: Annotated[int, typer.Option("-stride", help="Keep every Nth frame of each path.", rich_help_panel=panels.DATASET)] = 1,
+    max_frames_per_path: Annotated[Optional[int], typer.Option("-max-frames-per-path", help="Cap frames kept per path (evenly subsampled); unset = no cap.", rich_help_panel=panels.DATASET)] = None,
+
+    # ── CV selection ──────────────────────────────────────────────────────
+    cv_cols: Annotated[Optional[str], typer.Option("-cv-cols", help="Comma-separated CV columns to use; default = all except -op-col", rich_help_panel=panels.SELECT)] = None,
+    exclude: Annotated[Optional[str], typer.Option("-exclude", help="Comma-separated substrings; CVs whose name matches are dropped from both simulations", rich_help_panel=panels.SELECT)] = None,
+    exclude_l: Annotated[Optional[str], typer.Option("-exclude-l", help="Comma-separated substrings; CVs whose name matches are dropped from the L simulation only", rich_help_panel=panels.SELECT)] = None,
+    exclude_d: Annotated[Optional[str], typer.Option("-exclude-d", help="Comma-separated substrings; CVs whose name matches are dropped from the D simulation only", rich_help_panel=panels.SELECT)] = None,
+    name_cv_cols: Annotated[Optional[str], typer.Option("-name-cv-cols", help="Comma-separated 'old:new' pairs to normalise CV names, e.g. '_l_:_u_' or '_l_:_u_,foo:bar'. Applied to both simulations after angle transforms, before the compatibility check.", rich_help_panel=panels.SELECT)] = None,
+
+    # ── CV corrections: representation ────────────────────────────────────
+    angle_cols: Annotated[Optional[str], typer.Option("-angle-cols", help="Comma-separated CV columns in degrees -> cos(theta)  [asymmetric molecule]", rich_help_panel=panels.REPR)] = None,
+    sym_angle_cols: Annotated[Optional[str], typer.Option("-sym-angle-cols", help="Comma-separated CV columns in degrees -> cos^2(theta)  [symmetric molecule]", rich_help_panel=panels.REPR)] = None,
+
+    # ── CV corrections: symmetry (apply to ONE simulation only) ───────────
+    flip_cols_l: Annotated[Optional[str], typer.Option("-flip-cols-l", help="Comma-separated CV columns to negate (x -> -x) in the L simulation only, before angle transforms. Use for chirality-odd CVs (e.g. dihedral angles) that are mathematically guaranteed to be sign-flipped between mirror-image enantiomers for purely definitional reasons; correcting one side makes the values directly comparable and stops the raw sign from trivially dominating the L/D discriminant.", rich_help_panel=panels.SYMMETRY)] = None,
+    flip_cols_d: Annotated[Optional[str], typer.Option("-flip-cols-d", help="Comma-separated CV columns to negate (x -> -x) in the D simulation only, before angle transforms. See -flip-cols-l.", rich_help_panel=panels.SYMMETRY)] = None,
+
+    # ── Output ────────────────────────────────────────────────────────────
+    out: Annotated[str, typer.Option("-out", help="Output .npz path for the prepared dataset.", rich_help_panel=panels.OUTPUT)] = "deeptda_ld_dataset.npz",
+    overw: Annotated[bool, typer.Option("-O", help="Force overwriting of files.", rich_help_panel=panels.OUTPUT)] = False,
 ):
     """Build a frame-level DeepTDA training set that discriminates between two
     simulations (e.g. L vs D enantiomers of the same permeating molecule),

@@ -45,6 +45,7 @@ import typer
 matplotlib.use("Agg")  # non-interactive backend; safe for CLI use
 import matplotlib.pyplot as plt
 
+from . import panels
 from .cvs import _frame_count_after_subsample, _subsample_frames
 from .pathdata import (
     _check_overwrite,
@@ -377,27 +378,38 @@ def _run_pca(
 
 
 def PCA(
-    toml: Annotated[str, typer.Option("-toml", help="Path to the infretis .toml config (for the TIS interfaces).")] = "infretis.toml",
-    data: Annotated[str, typer.Option("-data", help="Path to the infretis_data.txt file.")] = "infretis_data.txt",
-    cv_dir: Annotated[str, typer.Option("-cv-dir", help="Folder with per-path CV trajectory .txt files.")] = "ML",
-    toml2: Annotated[Optional[str], typer.Option("-toml2", help="Optional second simulation's infretis .toml, to fit a joint PCA basis over both and compare them (must share the same CVs as the first).")] = None,
-    data2: Annotated[Optional[str], typer.Option("-data2", help="Second simulation's infretis_data.txt (required together with -toml2).")] = None,
-    cv_dir2: Annotated[Optional[str], typer.Option("-cv-dir2", help="Second simulation's CV trajectory folder. Required together with -toml2/-data2 - not defaulted to -cv-dir, since the two simulations commonly share the same relative folder name (e.g. both have an 'ML' subfolder) and silently reusing -cv-dir would read sim1's files for both.")] = None,
-    label1: Annotated[str, typer.Option("-label1", help="Legend label for the first simulation (only used when -toml2/-data2 are given).")] = "sim1",
-    label2: Annotated[str, typer.Option("-label2", help="Legend label for the second simulation.")] = "sim2",
-    nskip: Annotated[int, typer.Option("-nskip", help="Skip the first nskip rows of the data file(s) (burn-in).")] = 1000,
-    op_col: Annotated[str, typer.Option("-op-col", help="Name of the order-parameter column in the CV files (used for plot colouring).")] = "OP_Lamb",
-    exclude: Annotated[str, typer.Option("-ex-cv", help="Comma-separated CV name(s) or substring(s) to exclude.")] = "",
-    ensemble: Annotated[str, typer.Option("-ensemble", help="Which paths to include: 'all', 'plus' (cross the interfaces) or 'minus' (sample below lambda_0).")] = "plus",
-    n_components: Annotated[int, typer.Option("-n-components", help="Number of principal components to keep.")] = 5,
-    standardize: Annotated[bool, typer.Option("-standardize/-no-standardize", help="Standardise each CV (weighted zero mean/unit variance) before PCA; disable to run PCA on the raw CV scales.")] = True,
-    reweight: Annotated[bool, typer.Option("-reweight/-no-reweight", help="Weight frames by their path's WHAM weight, unbiasing across the TIS ensembles; disable to weight every frame equally.")] = True,
-    stride: Annotated[int, typer.Option("-stride", help="Keep every Nth frame of each path.")] = 1,
-    max_frames_per_path: Annotated[Optional[int], typer.Option("-max-frames-per-path", help="Cap frames kept per path (evenly subsampled); unset = no cap.")] = None,
-    out: Annotated[str, typer.Option("-out", help="Output .npz path for the PCA results (suffixed _all/_reactive/_non-reactive for the three runs).")] = "pca_results.npz",
-    plot: Annotated[str, typer.Option("-plot", help="Output .png path for the PC1-vs-PC2 scatter plot (suffixed _all/_reactive/_non-reactive for the three runs).")] = "pca_scatter.png",
-    encoding: Annotated[str, typer.Option("-encoding", help="Text encoding of the .txt trajectory files.")] = "utf-8",
-    overw: Annotated[bool, typer.Option("-O", help="Force overwriting of files.")] = False,
+    # ── Input data ────────────────────────────────────────────────────────
+    toml: Annotated[str, typer.Option("-toml", help="Path to the infretis .toml config (for the TIS interfaces).", rich_help_panel=panels.INPUT)] = "infretis.toml",
+    data: Annotated[str, typer.Option("-data", help="Path to the infretis_data.txt file.", rich_help_panel=panels.INPUT)] = "infretis_data.txt",
+    cv_dir: Annotated[str, typer.Option("-cv-dir", help="Folder with per-path CV trajectory .txt files.", rich_help_panel=panels.INPUT)] = "ML",
+    op_col: Annotated[str, typer.Option("-op-col", help="Name of the order-parameter column in the CV files (used for plot colouring).", rich_help_panel=panels.INPUT)] = "OP_Lamb",
+    encoding: Annotated[str, typer.Option("-encoding", help="Text encoding of the .txt trajectory files.", rich_help_panel=panels.INPUT)] = "utf-8",
+
+    # ── Dataset construction ──────────────────────────────────────────────
+    toml2: Annotated[Optional[str], typer.Option("-toml2", help="Optional second simulation's infretis .toml, to fit a joint PCA basis over both and compare them (must share the same CVs as the first).", rich_help_panel=panels.DATASET)] = None,
+    data2: Annotated[Optional[str], typer.Option("-data2", help="Second simulation's infretis_data.txt (required together with -toml2).", rich_help_panel=panels.DATASET)] = None,
+    cv_dir2: Annotated[Optional[str], typer.Option("-cv-dir2", help="Second simulation's CV trajectory folder. Required together with -toml2/-data2 - not defaulted to -cv-dir, since the two simulations commonly share the same relative folder name (e.g. both have an 'ML' subfolder) and silently reusing -cv-dir would read sim1's files for both.", rich_help_panel=panels.DATASET)] = None,
+    label1: Annotated[str, typer.Option("-label1", help="Legend label for the first simulation (only used when -toml2/-data2 are given).", rich_help_panel=panels.DATASET)] = "sim1",
+    label2: Annotated[str, typer.Option("-label2", help="Legend label for the second simulation.", rich_help_panel=panels.DATASET)] = "sim2",
+    nskip: Annotated[int, typer.Option("-nskip", help="Skip the first nskip rows of the data file(s) (burn-in).", rich_help_panel=panels.DATASET)] = 1000,
+    ensemble: Annotated[str, typer.Option("-ensemble", help="Which paths to include: 'all', 'plus' (cross the interfaces) or 'minus' (sample below lambda_0).", rich_help_panel=panels.DATASET)] = "plus",
+    reweight: Annotated[bool, typer.Option("-reweight/-no-reweight", help="Weight frames by their path's WHAM weight, unbiasing across the TIS ensembles; disable to weight every frame equally.", rich_help_panel=panels.DATASET)] = True,
+    stride: Annotated[int, typer.Option("-stride", help="Keep every Nth frame of each path.", rich_help_panel=panels.DATASET)] = 1,
+    max_frames_per_path: Annotated[Optional[int], typer.Option("-max-frames-per-path", help="Cap frames kept per path (evenly subsampled); unset = no cap.", rich_help_panel=panels.DATASET)] = None,
+
+    # ── CV selection ──────────────────────────────────────────────────────
+    exclude: Annotated[str, typer.Option("-ex-cv", help="Comma-separated CV name(s) or substring(s) to exclude.", rich_help_panel=panels.SELECT)] = "",
+
+    # ── CV corrections: representation ────────────────────────────────────
+    standardize: Annotated[bool, typer.Option("-standardize/-no-standardize", help="Standardise each CV (weighted zero mean/unit variance) before PCA; disable to run PCA on the raw CV scales.", rich_help_panel=panels.REPR)] = True,
+
+    # ── Model ─────────────────────────────────────────────────────────────
+    n_components: Annotated[int, typer.Option("-n-components", help="Number of principal components to keep.", rich_help_panel=panels.MODEL)] = 5,
+
+    # ── Output ────────────────────────────────────────────────────────────
+    out: Annotated[str, typer.Option("-out", help="Output .npz path for the PCA results (suffixed _all/_reactive/_non-reactive for the three runs).", rich_help_panel=panels.OUTPUT)] = "pca_results.npz",
+    plot: Annotated[str, typer.Option("-plot", help="Output .png path for the PC1-vs-PC2 scatter plot (suffixed _all/_reactive/_non-reactive for the three runs).", rich_help_panel=panels.OUTPUT)] = "pca_scatter.png",
+    overw: Annotated[bool, typer.Option("-O", help="Force overwriting of files.", rich_help_panel=panels.OUTPUT)] = False,
 ):
     """WHAM-weighted PCA over the per-frame CVs of TIS/RETIS path-sampling
     trajectories. Always runs three separate, independent calculations -
