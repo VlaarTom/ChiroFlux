@@ -29,6 +29,8 @@ def test_documented_entry_points_are_importable():
 
     for module_name, function_name in [
         ("cv_generation", "generate_cvs"),
+        ("leaflet_index", "leaflet_index"),
+        ("permeant_index", "permeant_index"),
         ("cv_histograms", "histograms"),
         ("membrane_spatial", "membrane_spatial"),
         ("neighbours", "neighbours"),
@@ -37,6 +39,7 @@ def test_documented_entry_points_are_importable():
         ("shap_analysis", "shap_ml"),
         ("shap_analysis_ld", "shap_enantiomer"),
         ("statistical_analysis", "statistics"),
+        ("dynamics", "dynamics"),
         ("principal_component_analysis", "PCA"),
         ("prepare_deeptda_data", "prepare_deeptda_data"),
         ("prepare_deeptda_data", "prepare_deeptda_data_ld"),
@@ -51,6 +54,8 @@ def test_cli_registry_covers_every_entry_point():
     registered = {(spec.module, spec.function) for spec in cli._COMMANDS.values()}
     assert registered == {
         ("cv_generation", "generate_cvs"),
+        ("leaflet_index", "leaflet_index"),
+        ("permeant_index", "permeant_index"),
         ("cv_histograms", "histograms"),
         ("membrane_spatial", "membrane_spatial"),
         ("neighbours", "neighbours"),
@@ -59,6 +64,7 @@ def test_cli_registry_covers_every_entry_point():
         ("shap_analysis", "shap_ml"),
         ("shap_analysis_ld", "shap_enantiomer"),
         ("statistical_analysis", "statistics"),
+        ("dynamics", "dynamics"),
         ("principal_component_analysis", "PCA"),
         ("prepare_deeptda_data", "prepare_deeptda_data"),
         ("prepare_deeptda_data", "prepare_deeptda_data_ld"),
@@ -145,6 +151,7 @@ ML_FREE_MODULES = [
     "chiroflux.cvs",
     "chiroflux.plotting",
     "chiroflux.statistical_analysis",
+    "chiroflux.dynamics",
     "chiroflux.principal_component_analysis",
     "chiroflux.prepare_deeptda_data",
     "chiroflux.train_deeptda",
@@ -215,13 +222,30 @@ def _option_panels(function):
     return out
 
 
-@pytest.mark.parametrize(
-    "module_name, function_name",
-    [("shap_analysis", "shap_ml"), ("shap_analysis_ld", "shap_enantiomer"),
-     ("cv_generation", "generate_cvs"), ("cv_histograms", "histograms"),
-     ("sasa", "sasa"), ("sasa_compare", "sasa_compare"),
-     ("membrane_spatial", "membrane_spatial"), ("neighbours", "neighbours")],
-)
+# Every command with typer options must group them into --help panels. A command
+# missing from this list is not exempt - it is untested, which is how four
+# commands drifted into having no panels at all.
+PANELLED_COMMANDS = [
+    ("cv_generation", "generate_cvs"),
+    ("leaflet_index", "leaflet_index"),
+    ("permeant_index", "permeant_index"),
+    ("cv_histograms", "histograms"),
+    ("membrane_spatial", "membrane_spatial"),
+    ("neighbours", "neighbours"),
+    ("sasa", "sasa"),
+    ("sasa_compare", "sasa_compare"),
+    ("shap_analysis", "shap_ml"),
+    ("shap_analysis_ld", "shap_enantiomer"),
+    ("statistical_analysis", "statistics"),
+    ("dynamics", "dynamics"),
+    ("principal_component_analysis", "PCA"),
+    ("prepare_deeptda_data", "prepare_deeptda_data"),
+    ("prepare_deeptda_data", "prepare_deeptda_data_ld"),
+    ("train_deeptda", "train_deeptda"),
+]
+
+
+@pytest.mark.parametrize("module_name, function_name", PANELLED_COMMANDS)
 def test_every_option_is_assigned_to_a_panel(module_name, function_name):
     """An unpanelled option falls into the generic 'Options' box, away from
     the group it belongs to - easy to miss when adding a flag."""
@@ -232,13 +256,7 @@ def test_every_option_is_assigned_to_a_panel(module_name, function_name):
     assert orphans == [], f"{function_name}: no --help panel for {orphans}"
 
 
-@pytest.mark.parametrize(
-    "module_name, function_name",
-    [("shap_analysis", "shap_ml"), ("shap_analysis_ld", "shap_enantiomer"),
-     ("cv_generation", "generate_cvs"), ("cv_histograms", "histograms"),
-     ("sasa", "sasa"), ("sasa_compare", "sasa_compare"),
-     ("membrane_spatial", "membrane_spatial"), ("neighbours", "neighbours")],
-)
+@pytest.mark.parametrize("module_name, function_name", PANELLED_COMMANDS)
 def test_panels_are_declared_in_the_canonical_order(module_name, function_name):
     """Panels render in first-appearance order, so the signature order is what
     the user sees. Commands must not disagree about it."""

@@ -33,6 +33,16 @@ _COMMANDS = {
         "generate_cvs",
         "Compute per-frame CVs from MD trajectories into per-path .txt files.",
     ),
+    "permeant-index": _Command(
+        "permeant_index",
+        "permeant_index",
+        "Write the permeant-side .ndx files, with their atom selections verified.",
+    ),
+    "leaflet-index": _Command(
+        "leaflet_index",
+        "leaflet_index",
+        "Write CN_*.ndx with leaflet groups split per lipid, not per atom height.",
+    ),
     "histograms": _Command(
         "cv_histograms",
         "histograms",
@@ -72,6 +82,11 @@ _COMMANDS = {
         "statistical_analysis",
         "statistics",
         "Model-free weighted effect sizes (Cohen's d, Spearman, KS) per interface.",
+    ),
+    "dynamics": _Command(
+        "dynamics",
+        "dynamics",
+        "Windowed CV dynamics per interface: fluctuation, timescale, event ordering.",
     ),
     "pca": _Command(
         "principal_component_analysis",

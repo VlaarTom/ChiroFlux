@@ -55,6 +55,8 @@ chiroflux COMMAND --help
 | Command | What it does |
 | --- | --- |
 | `generate-cvs` | Computes the per-frame CVs from the MD trajectories and writes the per-path `.txt` files every other command reads. |
+| `permeant-index` | Writes the permeant-side `.ndx` files, checking each group's atoms are bonded the way its CV assumes. |
+| `leaflet-index` | Writes the `CN_*.ndx` leaflet groups, assigning each lipid to a leaflet by its own headgroup rather than by each atom's height. |
 | `histograms` | Weighted CV histograms, statistics and 2D maps over a path ensemble, optionally merging a second simulation onto a common OP axis. Requires a `-ranges` file (see below). |
 | `sasa` | Weighted solvent-accessible surface area profile across the membrane, from a Shrake–Rupley construction on the trajectories. Requires a `-runs` file (see below). |
 | `membrane-spatial` | Spatial membrane structure around the permeant: radial/z maps, curvature, local thickness and bonded metrics. |
@@ -62,6 +64,7 @@ chiroflux COMMAND --help
 | `shap-ml` | Fits WHAM-weighted classifiers (random forest, logistic regression, gradient boosting, LightGBM, SVM) per interface and explains them with SHAP. |
 | `shap-enantiomer` | Same, but the label is *which of two simulations* a path came from. |
 | `statistics` | Model-free weighted effect sizes (Cohen's d, Spearman ρ, KS distance) per interface — a cheap sanity check on the SHAP rankings. |
+| `dynamics` | Time-resolved CV features in a window around each crossing: fluctuation amplitude, autocorrelation time, and lead/lag event ordering against the order parameter. Optional FFT features, with a built-in redundancy check against them. |
 | `pca` | Weighted PCA of the CV space, optionally on a joint basis fitted across two simulations so they can be compared in the same coordinates. |
 | `prepare-deeptda-data` | Builds a frame-level, weighted DeepTDA training set labelled reactive/non-reactive. |
 | `prepare-deeptda-data-ld` | Same, but labelled by which of two simulations each frame came from. |
@@ -326,14 +329,19 @@ chiroflux shap-enantiomer \
   `# Dropping one side of each pair first is what makes the rename     ` \
   `# safe: -name-cv-cols applies substitutions in order, so it cannot  ` \
   `# express a genuine two-way swap.                                   ` \
-  -exclude-l _u_,2u,N_Pu \
-  -exclude-d _l_,2l,N_Pl \
-  -name-cv-cols _l_:_u_,2l:2u,N_Pl:N_Pu \
+  `# Every leaflet-marked column spells the leaflet as a MEDIAL field, so   ` \
+  `# one pattern reaches all of them: CA_C2_u_DOPC, PRO_hCN_u_P,           ` \
+  `# PRO_hCN_u_C2_DOPC_s1, Mem_u_tilt, Mem_u_def. Do not shorten to a bare ` \
+  `# "_l": that also matches Mem_thick_loc, which is not leaflet-paired,   ` \
+  `# and would rename it to Mem_thick_uoc.                                  ` \
+  -exclude-l _u_ \
+  -exclude-d _l_ \
+  -name-cv-cols _l_:_u_ \
   \
   `# ── symmetry corrections, each applied to ONE simulation ───────────` \
   `# theta -> 180 - theta: unsigned angles vs the membrane normal,     ` \
   `# whose +z/-z face is swapped by the opposite entry direction.      ` \
-  -flip-d PRO_ang_C_CG,PRO_r_plane_chiral \
+  -flip-d PRO_ang_C_CG,PRO_r_plane_chiral,PRO_mode_,_tilt \
   `# theta -> -theta: chirality-odd pseudoscalars, negated between     ` \
   `# enantiomers by definition (dihedrals, signed volume, handed CNs). ` \
   -mirror-d PRO_dih_,PRO_sign_vol,PRO_hCN_,PRO_nCos_,PRO_azim_ \
@@ -427,11 +435,33 @@ by `-flip-*` with a warning, since they hold values in [−1, 1] rather
 than degrees. (Negating them is the equivalent operation there, because
 −cos θ = cos(180 − θ).)
 
+#### Which correction the geometry-resolved chirality CVs need
+
+`generate-cvs` emits three kinds of quantity around the permeant stereocentre,
+and they do **not** all take the same correction:
+
+| CVs | kind | correction |
+| --- | --- | --- |
+| `PRO_hCN_*`, `PRO_hCN_*_s1..s3`, `PRO_nCos_*`, `PRO_azim_*`, `PRO_sign_vol`, `PRO_dih_chiral` | signed **pseudoscalar**, zero-centred | `-mirror-l` / `-mirror-d` |
+| `Mem_u_tilt`, `Mem_l_tilt`, `PRO_mode_ring`, `PRO_mode_O`, `PRO_mode_N` | cosine of a **true vector** against +z | `-flip-l` / `-flip-d` (negation, on a cos-valued column) |
+| `PRO_rMin_*`, `Mem_u_tiltN`, `Mem_l_tiltN` | true scalar (a distance, a count) | **none** — these are reflection-invariant |
+
+Mirroring the handed columns is right and does not throw the chirality signal
+away. To leading order the lipid environment is achiral, so an L path's `hCN`
+distribution is the mirror of a D path's and the bulk of the L/D difference in
+these columns reflects that near-symmetry rather than any discrimination.
+`-mirror-*` removes exactly that leading antisymmetry; what survives is the
+diastereomeric residual, which is the quantity of interest.
+
+What must **not** be done to them is `-sym-angle-cols`. Folding to cos²θ
+discards the sign irreversibly, taking the residual with it — unlike negation,
+which is invertible. Reserve it for genuinely head–tail symmetric angles.
+
 > **Known limitation.** `-name-cv-cols` applies its substitutions in order, so
 > it cannot express a two-way swap: `'_u_:_l_,_l_:_u_'` collapses both onto
-> `_u_` and silently produces duplicate column names. Leaflet-paired columns
-> (`*_u`/`*_l`, `z_*Top`/`z_*Bot`) therefore cannot currently be exchanged when
-> the two simulations were entered from opposite sides.
+> `_u_` and silently produces duplicate column names. Therefore, the individual
+> simulations should already exclude the opposite leaflet with no interaction.
+> **Have to come up with a fix for the internal simulations.**
 
 ## Library use
 
@@ -489,7 +519,101 @@ pytest          # packaging/CLI wiring, shared helpers, weighting maths
 ruff check .
 ```
 
-## Known issue
+## Known issues
+
+### Leaflet labels are unreliable for the deep chain carbons
+
+The `CN_*.ndx` leaflet groups are cut by a static z threshold evaluated at
+frame 0. For the headgroup, glycerol and ester markers that is exact — C2, P,
+N, O22 and O32 all split 55/55 in DOPC and 11/11 in POPC. For the deep chain
+carbons it is not: DOPC C210 splits 54/56 and C310 51/59, and POPC C210 10/12.
+
+This is **not** lipid flip-flop. A translocated lipid would carry its whole
+headgroup across, and the P/N/C2 counts would be off by the same number; they
+are exact. What the cutoff catches is chain **interdigitation** — C10 sits deep
+in the hydrophobic core, and chain ends from opposing leaflets reach across the
+midplane. The species dependence confirms it: DOPC's sn-3 chain is oleoyl
+(18:1, long and kinked) and misassigns four carbons, while POPC's is palmitoyl
+(16:0) and misassigns none. A flip-flop rate would not care which carbon you
+looked at.
+
+Consequence: the 24 coordination numbers built on groups 11–14
+(`CA_CC2_*`, `CA_CC3_*`, `N_CC2_*`, `N_CC3_*`, `O_CC2_*`, `O_CC3_*`) count a
+few percent of the opposite leaflet's chain carbons — and, since the
+misassigned atoms are exactly those nearest the midplane, that contamination is
+concentrated where a permeant crossing the core actually is. `Mem_*_tilt`
+avoids the problem by reassigning chain atoms geometrically rather than by
+label (see `compute_local_chain_tilt`); the coordination numbers do not.
+
+The error is static and shared across paths *within* a simulation, so it should
+largely cancel in reactive-vs-non-reactive comparisons. **It does not
+automatically cancel between two simulations**: L and D are built by the same
+script, but from their own frame-0 structures, so the misassigned set differs
+between them and the affected CVs carry a small systematic L/D difference that
+has nothing to do with chirality.
+
+**The fix is `chiroflux leaflet-index`**, which assigns each lipid to a leaflet
+once from its own headgroup phosphorus and then writes every marker of that
+residue to the matching group. A chain carbon never votes on its own leaflet,
+so interdigitation stops mattering and the groups come out equal by
+construction:
+
+```bash
+chiroflux leaflet-index -topology gromacs_input/topol.tpr \
+                        -coords   gromacs_input/conf.g96 \
+                        -resname DOPC,POPC -out-dir gromacs_input
+```
+
+`-resname` takes several species at once (comma- or space-separated), writing
+`CN_<RESNAME>.ndx` per species; `-out` overrides those names, one path per
+species in the same order. Doing them together matters: the midplane is then
+computed once over every headgroup rather than per species, which on the
+reference system is 38.77 A pooled against 38.69 A from DOPC alone and 39.16 A
+from the 22 POPC alone — one bilayer should not be cut in two places.
+
+It prints a per-marker count table; every row should match the headgroup split.
+On the reference system it reproduces `gmx select` **exactly** for the fifteen
+groups that were already right, and changes only the four chain-carbon groups,
+by exactly the one and four atoms that were misassigned. Regenerate both
+simulations' files and re-run `generate-cvs`.
+
+The old shell recipe also hardcodes `ZMID=4.06` nm where the actual mean
+headgroup plane is 3.87 nm; `leaflet-index` computes the midplane from the
+structure, and takes `-midplane` if you need to pin it.
+
+### `PRO_ang_OH` measures the wrong angle
+
+The index files came from a hand-maintained `make_ndx.py` copied into each
+simulation directory, and the copies drifted. For `PRO_C_O_H.ndx` — the group
+behind `PRO_ang_OH` — the copies disagree:
+
+| copy | selection |
+| --- | --- |
+| `D_PRO_neutral/infinit_entry` | `C, O01, H02` |
+| `D_PRO_neutral/infinit_escape` | `C, O, H02` |
+| `L_PRO_neutral/infinit_entry` | `C, O, H02` |
+
+In the CHARMM topology (identical in both runs) `O` is the carbonyl oxygen,
+type OG2D1, bonded only to `C`; `O01` is the hydroxyl, type OG311, bonded to
+`C` and `H02`. The carboxylic C–O–H angle is therefore **C–O01–H02**. The
+`C, O, H02` spelling asks for the angle at the carbonyl oxygen subtended by a
+hydrogen it is not bonded to — a well-defined number, but not the one the CV
+name claims, and not an internal coordinate of the molecule.
+
+The shipped `D_PRO_neutral/infinit_escape/gromacs_input/PRO_C_O_H.ndx` holds
+indices `[2, 3, 16]` = C, **O**, H02, so the escape run's `PRO_ang_OH` is the
+carbonyl version. Check L's shipped file before comparing the two runs; if they
+disagree, `PRO_ang_OH` is a convention artefact and will act as a spurious L/D
+discriminator.
+
+`chiroflux permeant-index` writes `C, O01, H02` for both runs and verifies it
+against the topology's bond list, so **regenerating changes what `PRO_ang_OH`
+means**. That is the intended fix, not a regression. If you did want the
+carbonyl geometry, change the one entry in `PERMEANT_INDEX_SPEC` — but then
+rename the CV, because `dih_OH` next to it is already the proper carboxylic
+torsion `O-C-O01-H02`.
+
+### Tied ranks in the weighted Spearman
 
 `_weighted_spearman` in `statistical_analysis.py` does not average tied ranks:
 `np.argsort(np.argsort(x))` gives a constant column the distinct ranks
