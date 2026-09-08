@@ -742,11 +742,51 @@ def compute_body_frame(coords_tetra, box):
     return ca, normal, axis
 
 
-def compute_handed_cn(coords_tetra, coords_lipid, box, d0=0.5, n_exp=6, m_exp=12):
+#: Radial shell edges (nm) for the shell-resolved handed coordination number.
+#: Chosen to bracket the sign crossover described in `compute_handed_cn`:
+#: close contact, the intermediate range where the preference reverses, and the
+#: outer range where discrimination dies away (Nandi's dU vanishes past ~1 nm).
+HCN_SHELL_EDGES = (0.0, 0.5, 0.8, 1.2)
+
+#: Column-name suffixes for the shells above, in the same order.
+HCN_SHELL_NAMES = ('s1', 's2', 's3')
+
+
+def compute_handed_cn(coords_tetra, coords_lipid, box, d0=0.5, n_exp=6, m_exp=12,
+                      shell_edges=None):
     """
     Handed (pseudoscalar) coordination number.
 
         hCN = sum_j  w(r_j) * (n . d_j) / r_j
+
+    For the default n_exp=6, m_exp=12 the switching function collapses exactly
+    to w(r) = 1 / (1 + (r/d0)^6) - the special case below is that expression's
+    value at r = d0 - so hCN is dominated by the closest contacts: w is 0.50 at
+    r = d0, 0.081 at 1.5*d0 and 0.015 at 2*d0.
+
+    That weighting matters more than it looks. The chiral discrimination this
+    CV exists to detect *changes sign* with separation: homochiral preference
+    at close contact, heterochiral at intermediate separation (Nandi &
+    Vollhardt, Curr Opin Colloid Interface Sci 13 (2008) 40-46). An
+    r-integrated sum therefore averages across the crossover and partially
+    cancels itself - which is consistent with Nandi's own numbers for
+    carvone:DPPC, where the pointwise discrimination spans +15 to -10 kT over
+    separation and mutual azimuth but is only 0.1 kT at the potential minimum
+    (J Phys Chem A 107 (2003) 4588).
+
+    Passing `shell_edges` returns the same signed cosines resolved into radial
+    shells, which leaves the crossover visible instead of integrating over it.
+    The shell sums are deliberately *unweighted*: suppressing the intermediate
+    range is exactly what the switching function does wrong here.
+
+    Returns
+    -------
+    handed      : (n_frames,)  switching-weighted signed sum (unchanged)
+    nearest_cos : (n_frames,)  signed cosine of the closest neighbour
+    nearest_r   : (n_frames,)  distance to that closest neighbour, NaN if none
+    shells      : (n_frames, len(shell_edges) - 1) unweighted signed sums, or
+                  None when shell_edges is None. An empty shell gives 0.0,
+                  which reads correctly as "no handed bias from this range".
     """
     ca, normal, _ = compute_body_frame(coords_tetra, box)
 
@@ -754,6 +794,13 @@ def compute_handed_cn(coords_tetra, coords_lipid, box, d0=0.5, n_exp=6, m_exp=12
     n_frames = lip.shape[0]
     lip = lip.reshape(n_frames, -1, 3)
     box = _normalize_box(box, n_frames)
+
+    if lip.shape[1] == 0:
+        # An empty selection has no nearest neighbour to argmin over.
+        empty = np.full(n_frames, np.nan)
+        n_shells = 0 if shell_edges is None else len(shell_edges) - 1
+        return (np.zeros(n_frames), empty, empty,
+                None if shell_edges is None else np.zeros((n_frames, n_shells)))
 
     d = _min_image(lip - ca[:, None, :], box)
     r = np.linalg.norm(d, axis=-1)
@@ -771,10 +818,21 @@ def compute_handed_cn(coords_tetra, coords_lipid, box, d0=0.5, n_exp=6, m_exp=12
 
     handed = np.sum(w * cos_signed, axis=1)
 
+    has_any = np.any(safe, axis=1)
     nearest = np.argmin(np.where(safe, r, np.inf), axis=1)
-    nearest_cos = cos_signed[np.arange(n_frames), nearest]
+    rows = np.arange(n_frames)
+    nearest_cos = np.where(has_any, cos_signed[rows, nearest], np.nan)
+    nearest_r = np.where(has_any, r[rows, nearest], np.nan)
 
-    return handed, nearest_cos
+    shells = None
+    if shell_edges is not None:
+        edges = np.asarray(shell_edges, dtype=float)
+        shells = np.empty((n_frames, len(edges) - 1))
+        for k in range(len(edges) - 1):
+            in_shell = safe & (r >= edges[k]) & (r < edges[k + 1])
+            shells[:, k] = np.sum(np.where(in_shell, cos_signed, 0.0), axis=1)
+
+    return handed, nearest_cos, nearest_r, shells
 
 
 def compute_signed_azimuth(coords_tetra, coords_lipid, box):
@@ -801,6 +859,151 @@ def compute_signed_azimuth(coords_tetra, coords_lipid, box):
     dot = px * lx + py * ly
 
     return np.degrees(np.arctan2(cross_z, dot))
+
+
+def compute_local_chain_tilt(pro_xy, coords_c2, coords_cc, z_mid, box, radius=1.0):
+    """
+    Tilt of the acyl-chain region relative to the glycerol region, locally.
+
+    Nandi's effective-pair-potential geometry has two orientational
+    coordinates, not one: the mutual azimuth (see `compute_signed_azimuth`) and
+    the tilt mu of the lipid tail with respect to the surface normal, which he
+    fixes at the GIXD value of 24.91 deg. In a simulation mu fluctuates and can
+    be measured - but only as a *local average*, not per lipid, because the
+    CN_*.ndx groups cannot be paired by index (see below). A local average is
+    in any case the closer analogue of what Nandi uses, since the GIXD tilt is
+    a collective monolayer property rather than a single-molecule one.
+
+    Chain carbons are selected geometrically rather than by leaflet label, and
+    `coords_cc` is therefore expected to hold *both* leaflets' chain atoms
+    pooled. The CN_*.ndx leaflet groups are cut by a static z threshold at
+    frame 0, which is exact for the headgroup and glycerol markers (C2, P, N,
+    O22, O32 all split 55/55 in DOPC) but not for the deep chain carbons: C210
+    splits 54/56 and C310 51/59, because chains from opposing leaflets
+    interdigitate across the midplane. Trusting those labels here would let a
+    handful of far-leaflet carbons into the mean and tilt it. Instead a chain
+    atom counts toward this leaflet only if it lies in the z band between the
+    midplane and the local glycerol layer, which is where that leaflet's chains
+    are by construction and where the other leaflet's are not.
+
+    Both means are taken over atoms within `radius` of the permeant *in the
+    membrane plane*, so the same local patch contributes to each and the tilt
+    reported is the one the permeant actually sits in. Selecting laterally
+    rather than in 3D is deliberate: the chain extends along z, so a 3D cutoff
+    would pick the C2 and C210 of different lipids.
+
+    Parameters
+    ----------
+    z_mid : (n_frames,) local bilayer midplane, e.g. the mean of the two
+            leaflet phosphorus z values from `compute_local_deformation`.
+
+    Returns
+    -------
+    cos_tilt : (n_frames,)  cosine between the mean-C2 -> mean-CC vector and
+               +z. Where fewer than `min_count` atoms of either group qualify,
+               the whole-leaflet tilt is substituted rather than NaN - the same
+               fallback `compute_local_deformation` makes for its local z, and
+               it keeps a sparse patch from voiding the frame for every
+               downstream analysis that requires all-finite rows.
+    count    : (n_frames,)  number of C2 atoms in range, as a float, so the
+               substituted frames can be identified after the fact.
+    """
+    min_count = 3
+
+    c2 = np.asarray(coords_c2, dtype=float)
+    n_frames = c2.shape[0]
+    c2 = c2.reshape(n_frames, -1, 3)
+    cc = np.asarray(coords_cc, dtype=float).reshape(n_frames, -1, 3)
+    box = _normalize_box(box, n_frames)
+    z_mid = np.asarray(z_mid, dtype=float).reshape(n_frames)
+
+    pro_xy = np.asarray(pro_xy, dtype=float).reshape(n_frames, -1)[:, :2]
+    bxy = box[:, None, :2]
+
+    def _in_range(group):
+        dxy = group[:, :, :2] - pro_xy[:, None, :]
+        dxy = dxy - bxy * np.round(dxy / bxy)
+        return np.linalg.norm(dxy, axis=-1) < radius
+
+    def _mean_pos(group, mask):
+        count = mask.sum(axis=1)
+        total = np.where(mask[:, :, None], group, 0.0).sum(axis=1)
+        return total / np.maximum(count, 1)[:, None], count
+
+    lat_c2 = _in_range(c2)
+    n_c2 = lat_c2.sum(axis=1)
+
+    # The glycerol layer this tilt belongs to, from the local patch where there
+    # is one and from the whole leaflet otherwise.
+    z_ref_local, _ = _mean_pos(c2, lat_c2)
+    z_ref = np.where(n_c2 >= min_count, z_ref_local[:, 2], c2[:, :, 2].mean(axis=1))
+
+    # Chain atoms of *this* leaflet: between the midplane and its glycerols.
+    lo = np.minimum(z_mid, z_ref)[:, None]
+    hi = np.maximum(z_mid, z_ref)[:, None]
+    band = (cc[:, :, 2] >= lo) & (cc[:, :, 2] <= hi)
+    m_cc = _in_range(cc) & band
+
+    # Means are taken on raw coordinates: both groups sit in the same periodic
+    # image as the permeant by construction of the lateral cutoff, and the
+    # difference below is what carries the tilt.
+    mean_cc, n_cc = _mean_pos(cc, m_cc)
+    mean_c2, _ = _mean_pos(c2, lat_c2)
+    vec_local = mean_cc - mean_c2
+
+    mean_cc_all, n_cc_all = _mean_pos(cc, band)
+    vec_global = mean_cc_all - c2.mean(axis=1)
+    vec_global = np.where((n_cc_all >= 1)[:, None], vec_global, 0.0)
+
+    ok = (n_c2 >= min_count) & (n_cc >= min_count)
+    vec = np.where(ok[:, None], vec_local, vec_global)
+    return _unit(vec)[:, 2], n_c2.astype(float)
+
+
+def compute_group_orientations(coords_cn_ref, coords_ring, box):
+    """
+    Which face of the permeant is turned along the membrane normal.
+
+    Nandi enumerates four discrete 'modes' of the odorant relative to the
+    lipid, differing in which molecular group is directed toward the interface,
+    and finds that the *sign* of the chiral discrimination differs between them
+    - modes I and II favour one enantiomer, III and IV the other (Table 2 of
+    J Phys Chem A 107 (2003) 4588). Averaging over modes therefore cancels much
+    of the effect; these cosines let an analysis condition on the mode instead.
+
+    Each is the cosine between +z and a vector from the stereocentre CA to one
+    group: the pyrrolidine ring centroid, the carboxyl oxygen O01, and the ring
+    nitrogen N.
+
+    Like `compute_signed_azimuth`, the sign is taken about the lab +z axis, so
+    these are leaflet-conventioned: a configuration and its mirror image across
+    the bilayer midplane give opposite values. Compare them within a leaflet.
+
+    Parameters
+    ----------
+    coords_cn_ref : (n_frames, 5, 3) or (n_frames, 15)  CA, O01, N, HA, CD
+    coords_ring   : (n_frames, 15)                      CA, CB, CG, CD, N
+
+    Returns
+    -------
+    (cos_ring, cos_O, cos_N) : each (n_frames,)
+    """
+    ref = np.asarray(coords_cn_ref, dtype=float)
+    n_frames = ref.shape[0]
+    ref = ref.reshape(n_frames, -1, 3)
+    ring = np.asarray(coords_ring, dtype=float).reshape(n_frames, -1, 3)
+    box = _normalize_box(box, n_frames)
+
+    ca = ref[:, 0, :]
+    # The ring is a bonded group that may straddle a periodic boundary, so it
+    # is unwrapped relative to its own first atom before the centroid is taken.
+    ring_rel = _min_image(ring - ring[:, 0:1, :], box)
+    v_ring = ring_rel.mean(axis=1)
+
+    v_o = _min_image(ref[:, 1, :] - ca, box)
+    v_n = _min_image(ref[:, 2, :] - ca, box)
+
+    return tuple(_unit(v)[:, 2] for v in (v_ring, v_o, v_n))
 
 
 def compute_cremer_pople(coords_ring, box):
@@ -1430,16 +1633,37 @@ def process_single_path(path_number, overwrite, lambda_A, lambda_B, lambda_minus
         lip_C2u_POPC = small['popc_5'].reshape(n_frames, -1)
         lip_C2l_POPC = small['popc_6'].reshape(n_frames, -1)
 
-        hcn_C2u_DOPC, ncos_C2u_DOPC = compute_handed_cn(tetra_coords, lip_C2u_DOPC, pbc_box)
-        hcn_C2l_DOPC, ncos_C2l_DOPC = compute_handed_cn(tetra_coords, lip_C2l_DOPC, pbc_box)
-        hcn_O22u_DOPC, _ = compute_handed_cn(tetra_coords, lip_O22u_DOPC, pbc_box)
-        hcn_O22l_DOPC, _ = compute_handed_cn(tetra_coords, lip_O22l_DOPC, pbc_box)
-        hcn_C2u_POPC, _ = compute_handed_cn(tetra_coords, lip_C2u_POPC, pbc_box)
-        hcn_C2l_POPC, _ = compute_handed_cn(tetra_coords, lip_C2l_POPC, pbc_box)
-        hcn_Pu, _ = compute_handed_cn(tetra_coords, lip_Pu, pbc_box)
-        hcn_Pl, _ = compute_handed_cn(tetra_coords, lip_Pl, pbc_box)
+        # (column tag, lipid atom positions). The tag orders the hCN columns
+        # exactly as the original schema had them, so the shell/rMin/nCos
+        # columns appended later stay in a predictable order too.
+        #
+        # Leaflet is spelled as a *medial* "_u_"/"_l_" field - <quantity>_<
+        # leaflet>_<target> - never trailing. That is what lets one -exclude /
+        # -name-cv-cols pattern ("_u_") reach every leaflet-marked column in
+        # the file, the coordination numbers (CA_C2_u_DOPC) included, when two
+        # simulations entered the membrane from opposite leaflets. A trailing
+        # "_u" cannot be matched that way without a bare "_l", which also hits
+        # Mem_thick_loc.
+        HCN_TARGETS = [
+            ('u_C2_DOPC', lip_C2u_DOPC), ('l_C2_DOPC', lip_C2l_DOPC),
+            ('u_O22_DOPC', lip_O22u_DOPC), ('l_O22_DOPC', lip_O22l_DOPC),
+            ('u_C2_POPC', lip_C2u_POPC), ('l_C2_POPC', lip_C2l_POPC),
+            ('u_P', lip_Pu), ('l_P', lip_Pl),
+        ]
+        hcn = {}
+        for tag, lip_pos in HCN_TARGETS:
+            hcn[tag] = compute_handed_cn(
+                tetra_coords, lip_pos, pbc_box, shell_edges=HCN_SHELL_EDGES
+            )
 
-        azim_P = compute_signed_azimuth(tetra_coords, np.hstack([lip_Pu, lip_Pl]), pbc_box)
+        # Split by leaflet rather than pooled. The azimuth's sense is taken
+        # about lab +z, so a lower-leaflet contact carries the mirror-image
+        # sign of the equivalent upper-leaflet one; pooling the two phosphorus
+        # groups and taking the single nearest P (as this did) mixed the two
+        # conventions in one column. Each column is now internally consistent.
+        azim_Pu = compute_signed_azimuth(tetra_coords, lip_Pu, pbc_box)
+        azim_Pl = compute_signed_azimuth(tetra_coords, lip_Pl, pbc_box)
+
         cp_q2, cp_phi2 = compute_cremer_pople(ring_coords, pbc_box)
 
         # ORP is a single, small, bonded molecule, so -- unlike the lipid
@@ -1451,6 +1675,35 @@ def process_single_path(path_number, overwrite, lambda_A, lambda_B, lambda_minus
 
         def_u, locz_u, _ = compute_local_deformation(pro_xy, lip_Pu, pbc_box, radius=1.0)
         def_l, locz_l, _ = compute_local_deformation(pro_xy, lip_Pl, pbc_box, radius=1.0)
+
+        # Nandi's second orientational coordinate: the tilt of the acyl chain
+        # relative to the surface normal. C210 is the sn-2 chain carbon, i.e.
+        # the tail attached to the glycerol stereocentre C2 through the ester,
+        # so C2 -> C210 is the closest available analogue of his "first tail"
+        # vector. Both species contribute, since the local patch is mixed.
+        #
+        # The C210 groups are pooled across leaflets on purpose: their .ndx
+        # split is a frame-0 z cutoff and the chains interdigitate through it
+        # (54/56 for DOPC C210, 51/59 for C310), so the label is not reliable
+        # at that depth. compute_local_chain_tilt reassigns them by geometry.
+        # The C2 groups, which do split exactly 55/55, are used as given.
+        c2_u = np.hstack([lip_C2u_DOPC, lip_C2u_POPC])
+        c2_l = np.hstack([lip_C2l_DOPC, lip_C2l_POPC])
+        cc_all = np.hstack([small['dopc_11'].reshape(n_frames, -1),
+                            small['dopc_12'].reshape(n_frames, -1),
+                            small['popc_11'].reshape(n_frames, -1),
+                            small['popc_12'].reshape(n_frames, -1)])
+        z_mid = 0.5 * (locz_u + locz_l)
+        tilt_u, ntilt_u = compute_local_chain_tilt(
+            pro_xy, c2_u, cc_all, z_mid, pbc_box, radius=1.0
+        )
+        tilt_l, ntilt_l = compute_local_chain_tilt(
+            pro_xy, c2_l, cc_all, z_mid, pbc_box, radius=1.0
+        )
+
+        mode_ring, mode_O, mode_N = compute_group_orientations(
+            small['cn_ref'], ring_coords, pbc_box
+        )
 
         rmsd_vals = compute_rmsd_series(small['backbone'], REF_BACKBONE_POS, pbc_box)
         rg_vals = compute_rg(small['heavy'], HEAVY_MASSES, pbc_box)
@@ -1523,24 +1776,53 @@ def process_single_path(path_number, overwrite, lambda_A, lambda_B, lambda_minus
             distances = group_distances(ref_pos, small[sel_key], pbc_box)
             params[name] = np.squeeze(compute_coordination_number(distances))
 
-        params['PRO_hCN_C2u_DOPC'] = np.squeeze(hcn_C2u_DOPC)
-        params['PRO_hCN_C2l_DOPC'] = np.squeeze(hcn_C2l_DOPC)
-        params['PRO_hCN_O22u_DOPC'] = np.squeeze(hcn_O22u_DOPC)
-        params['PRO_hCN_O22l_DOPC'] = np.squeeze(hcn_O22l_DOPC)
-        params['PRO_hCN_C2u_POPC'] = np.squeeze(hcn_C2u_POPC)
-        params['PRO_hCN_C2l_POPC'] = np.squeeze(hcn_C2l_POPC)
-        params['PRO_hCN_Pu'] = np.squeeze(hcn_Pu)
-        params['PRO_hCN_Pl'] = np.squeeze(hcn_Pl)
-        params['PRO_nCos_C2u_DOPC'] = np.squeeze(ncos_C2u_DOPC)
-        params['PRO_nCos_C2l_DOPC'] = np.squeeze(ncos_C2l_DOPC)
-        params['PRO_azim_P'] = np.squeeze(azim_P)
+        for tag, _ in HCN_TARGETS:
+            params[f'PRO_hCN_{tag}'] = np.squeeze(hcn[tag][0])
+        params['PRO_azim_u_P'] = np.squeeze(azim_Pu)
+        params['PRO_azim_l_P'] = np.squeeze(azim_Pl)
         params['PRO_CP_phi2'] = np.squeeze(cp_phi2)
         params['PRO_CP_q2'] = np.squeeze(cp_q2)
-        params['Mem_def_u'] = np.squeeze(def_u)
-        params['Mem_def_l'] = np.squeeze(def_l)
+        params['Mem_u_def'] = np.squeeze(def_u)
+        params['Mem_l_def'] = np.squeeze(def_l)
         params['Mem_thick_loc'] = np.squeeze(locz_u - locz_l)
         params['Water_06'] = np.squeeze(scalars['water_06'] / 3)
         params['Water_10'] = np.squeeze(scalars['water_10'] / 3)
+
+        # ── Geometry-resolved chirality CVs (appended) ────────────────────────
+        # Appended after Water_10 so the columns above keep their positions in
+        # the historical ML.txt schema.
+        #
+        # These exist because an r-integrated hCN averages across the sign
+        # crossover in the chiral pair interaction (see compute_handed_cn).
+        # rMin + nCos give the (separation, mutual orientation) pair that
+        # Nandi's effective pair potential is a surface over; the shell columns
+        # give the same signed cosines resolved in r.
+        #
+        # Every kind is emitted for all eight targets, so each hCN column has a
+        # matching rMin and nCos - POPC and O22 and P included. The two DOPC
+        # nCos columns used to sit up in the hCN block to hold their historical
+        # position; renaming them to the medial-leaflet convention gave that up
+        # anyway, so all eight now live together.
+        for tag, _ in HCN_TARGETS:
+            params[f'PRO_rMin_{tag}'] = np.squeeze(hcn[tag][2])
+        for tag, _ in HCN_TARGETS:
+            params[f'PRO_nCos_{tag}'] = np.squeeze(hcn[tag][1])
+        for tag, _ in HCN_TARGETS:
+            for k, shell in enumerate(HCN_SHELL_NAMES):
+                params[f'PRO_hCN_{tag}_{shell}'] = np.squeeze(hcn[tag][3][:, k])
+
+        params['Mem_u_tilt'] = np.squeeze(tilt_u)
+        params['Mem_l_tilt'] = np.squeeze(tilt_l)
+        # Diagnostics: how many glycerols were in the local patch, so the
+        # frames where the whole-leaflet tilt was substituted stay identifiable.
+        # Named "tiltN" rather than "tilt_N" so that a "_tilt" pattern selects
+        # only the two cosines - these counts are true scalars and must never
+        # be caught by a -flip-*/-mirror-* aimed at the tilt itself.
+        params['Mem_u_tiltN'] = np.squeeze(ntilt_u)
+        params['Mem_l_tiltN'] = np.squeeze(ntilt_l)
+        params['PRO_mode_ring'] = np.squeeze(mode_ring)
+        params['PRO_mode_O'] = np.squeeze(mode_O)
+        params['PRO_mode_N'] = np.squeeze(mode_N)
 
         write_ML_txt(path_number, reactive, ensemble, lambda_A, lambda_minus_one, **params)
         return (path_number, "ok")
