@@ -255,9 +255,6 @@ FLUSH_EVERY = 500          # paths per intermediate chunk
 
 SKIP_PARSING = False       # True: reuse existing intermediates, do not touch xtc
 
-TESTING    = False
-test_value = 20            # paths per run when TESTING
-
 # Recycle a worker process after this many paths (None = never).  A worker that
 # leaks -- the MDAnalysis reader holds on to per-trajectory state -- grows until
 # the scheduler kills it, which on an HPC node looks like a silent stall.  Set
@@ -270,10 +267,13 @@ MAX_TASKS_PER_CHILD = None
 # whatever Python had buffered on stdout is lost.  DEBUG mirrors every print
 # and every uncaught error into a file, flushed line by line, and installs
 # faulthandler so a segfault or a scheduler signal still leaves a stack trace.
-DEBUG            = True
+DEBUG            = False
 DEBUG_LOG        = "debug.log"      # inside OUTPUT_DIR
 DEBUG_WORKER_DIR = "debug"          # inside OUTPUT_DIR, one log per worker PID
 DEBUG_TRUNCATE   = True             # False: append across runs
+
+TESTING          = False
+test_value       = 60            # paths per run when TESTING
 
 # Paths between plain-text progress lines.  These replace the tqdm bar whenever
 # the output is not a terminal: a redraw-in-place bar written into a redirected
@@ -1814,10 +1814,12 @@ def analyse(bin_info):
             z_centers, s_centers, data["hist2d"],
             Z_LABEL, SASA_LABEL, label,
             os.path.join(OUTPUT_DIR, f"sasa_vs_z_hist2d_{tag}.png"))
-        make_2d_histogram_free_energy(
-            z_centers, s_centers, data["hist2d"],
-            Z_LABEL, SASA_LABEL, label,
-            os.path.join(OUTPUT_DIR, f"sasa_vs_z_fes_{tag}.png"))
+        if tag == "combined_plus":
+            # This is conditional free energy as the inverse hist is not added here
+            make_2d_histogram_free_energy(
+                z_centers, s_centers, data["hist2d"],
+                Z_LABEL, SASA_LABEL, label,
+                os.path.join(OUTPUT_DIR, f"sasa_vs_z_fes_{tag}.png"))
 
         write_stats_csv(
             {"SASA":       column_stats_from_bins(s_centers, sasa_1d),
@@ -1838,8 +1840,8 @@ def sasa(
     runs: Annotated[str, typer.Option("-runs", help="REQUIRED. TOML file listing the simulations to combine as [[run]] tables (load_dir, weights, ml_dir, tpr, scale, mirror_z). See examples/sasa_runs.toml.", rich_help_panel=panels.INPUT)] = ...,
 
     # ── Dataset construction ──────────────────────────────────────────────
-    z_range: Annotated[Optional[str], typer.Option("-z-range", help="z axis relative to the membrane centre as 'min,max' in Angstrom.", rich_help_panel=panels.DATASET)] = None,
-    z_bin_width: Annotated[float, typer.Option("-z-bin-width", help="z bin width in Angstrom.", rich_help_panel=panels.DATASET)] = Z_BIN_WIDTH,
+    z_range: Annotated[Optional[str], typer.Option("-z-range", help="z axis relative to the membrane centre as 'min,max' in Angstrom (default -40,40).", rich_help_panel=panels.DATASET)] = None,
+    z_bin_width: Annotated[float, typer.Option("-z-bin-width", help="z bin width in Angstrom (default 1.0).", rich_help_panel=panels.DATASET)] = Z_BIN_WIDTH,
     sasa_range: Annotated[Optional[str], typer.Option("-sasa-range", help="SASA axis as 'min,max,nbins' in Angstrom^2.", rich_help_panel=panels.DATASET)] = None,
     fold_symmetric: Annotated[bool, typer.Option("-fold-symmetric/-no-fold-symmetric", help="Fold the profile about the membrane centre.", rich_help_panel=panels.DATASET)] = FOLD_SYMMETRIC,
     occlude_with_water: Annotated[bool, typer.Option("-occlude-with-water/-no-occlude-with-water", help="Count water and ions as occluding the solute surface.", rich_help_panel=panels.DATASET)] = OCCLUDE_WITH_WATER,

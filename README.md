@@ -17,7 +17,7 @@ combined without bias, and everything is resolved **per interface**
 pip install -e .
 ```
 
-`chiroflux train-deeptda` additionally needs torch, lightning and mlcolvar,
+`chiroflux train-deeptda` additionally needs torch, lightning and [mlcolvar](https://mlcolvar.readthedocs.io/en/stable/),
 which are kept out of the base install because they are large:
 
 ```bash
@@ -28,7 +28,6 @@ pip install -e '.[dev]'          # pytest + ruff
 `generate-cvs` is the only command that reads MD trajectories; everything else
 works from the `.txt` files it produces. It needs the trajectories, the
 topology and the `.ndx` index files alongside them.
-[mlcolvar](https://mlcolvar.readthedocs.io/en/stable/installation.html)
 
 ## Input layout
 

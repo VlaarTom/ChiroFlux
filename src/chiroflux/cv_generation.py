@@ -1610,7 +1610,7 @@ def loop_over_paths_parallel(path_start, path_end, overwrite, lambda_A, lambda_B
 def generate_cvs(
     # ── Input data ────────────────────────────────────────────────────────
     data: Annotated[str, typer.Option("-data", help="The infretis_data.txt file listing the paths to process.", rich_help_panel=panels.INPUT)] = "infretis_data.txt",
-    toml: Annotated[str, typer.Option("-toml", help="The infretis .toml config, read for the interface positions.", rich_help_panel=panels.INPUT)] = "../infretis.toml",
+    toml: Annotated[str, typer.Option("-toml", help="The infretis .toml config, read for the interface positions.", rich_help_panel=panels.INPUT)] = "infretis.toml",
     gromacs_input: Annotated[str, typer.Option("-gromacs-input", help="Directory holding topol.tpr, conf.gro and the .ndx index files that define the atom groups.", rich_help_panel=panels.INPUT)] = "../gromacs_input",
 
     # ── Dataset construction ──────────────────────────────────────────────
