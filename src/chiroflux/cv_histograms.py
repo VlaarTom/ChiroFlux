@@ -967,7 +967,7 @@ DOPC_POPC_PAIRS = [
     ("CA_CC2_u_DOPC",   "CA_CC2_u_POPC",    "CA_CC2_upper"),
     ("CA_CC2_l_DOPC",   "CA_CC2_l_POPC",    "CA_CC2_lower"),
     ("CA_CC3_u_DOPC",   "CA_CC3_u_POPC",    "CA_CC3_upper"),
-    ("CA_CC3_l_DOPC",   "CA_CC3_l_POPC",    "CA_CC2_lower"),
+    ("CA_CC3_l_DOPC",   "CA_CC3_l_POPC",    "CA_CC3_lower"),
     ("HA_P_u_DOPC",     "HA_P_u_POPC",      "HA_P_u_upper"),
     ("HA_P_l_DOPC",     "HA_P_l_POPC",      "HA_P_l_lower"),
     ("HA_O22_u_DOPC",   "HA_O22_u_POPC",    "HA_O22_u_upper"),
@@ -997,36 +997,66 @@ DOPC_POPC_PAIRS = [
 
 def _compute_enrichment_from_chunks(chunks_dopc, chunks_popc, lamb_centers):
     """
-    Given a list of per-chunk 2D arrays (counts_2d, shape (n_cn, n_lamb))
-    for DOPC and POPC, compute the observed DOPC enrichment ratio
-    E_DOPC[i] = frac_DOPC[i] / F_DOPC at each OP_Lamb bin i.
+    Weighted DOPC contact fraction and enrichment per OP_Lamb bin.
+
+    Each chunk is a 2D histogram over (coordination number, OP_Lamb): entry
+    ``counts[j, i]`` is the weight of frames whose CN fell in bin j at OP bin i,
+    and ``centers_y[j]`` is the CN that bin stands for. The number of *contacts*
+    at OP bin i is therefore the **first** moment along the CN axis,
+
+        contacts[i] = sum_j centers_y[j] * counts[j, i]
+
+    and not ``sum_j counts[j, i]``, which is only the frame weight. That
+    distinction is the whole calculation here: every frame carries a value in
+    both the DOPC and the POPC column, so the zeroth moments of the two species
+    are the *same number*, and building the fraction from them pins frac_DOPC at
+    exactly 0.5 in every bin no matter what the simulation did. The enrichment
+    then sits at a constant 0.5 / F_DOPC = 0.6, the bootstrap spread collapses
+    because resampling cannot move a structural constant, and the plot shows two
+    flat lines with no confidence band and no significant bins.
+
+    Sparse bins are still masked on frame weight rather than on contacts: it is
+    sampling density that makes a bin untrustworthy, and a bin can legitimately
+    have zero contacts while being well sampled.
 
     Returns
     -------
-    dopc_counts : np.ndarray (n_lamb,)  — marginal DOPC weighted count
-    popc_counts : np.ndarray (n_lamb,)  — marginal POPC weighted count
-    frac_dopc   : np.ndarray (n_lamb,)  — DOPC fraction (NaN where masked)
-    enrich_dopc : np.ndarray (n_lamb,)  — DOPC enrichment (NaN where masked)
-    mask        : np.ndarray (n_lamb,)  bool — True where data is too sparse
+    dict with keys
+        contacts_dopc / contacts_popc : (n_lamb,) weighted contact counts
+        frames_dopc   / frames_popc   : (n_lamb,) weighted frame counts
+        frac_dopc                     : (n_lamb,) NaN where masked
+        enrich_dopc                   : (n_lamb,) NaN where masked
+        mask                          : (n_lamb,) bool, True = excluded
     """
     n_lamb = len(lamb_centers)
-    dopc_counts = np.zeros(n_lamb, dtype=np.float64)
-    popc_counts = np.zeros(n_lamb, dtype=np.float64)
+    acc = {k: np.zeros(n_lamb, dtype=np.float64) for k in
+           ("contacts_dopc", "contacts_popc", "frames_dopc", "frames_popc")}
 
-    for c2d, _, _ in chunks_dopc:
-        dopc_counts += np.nansum(c2d, axis=0)
-    for c2d, _, _ in chunks_popc:
-        popc_counts += np.nansum(c2d, axis=0)
+    for chunks, c_key, f_key in ((chunks_dopc, "contacts_dopc", "frames_dopc"),
+                                 (chunks_popc, "contacts_popc", "frames_popc")):
+        for c2d, _, cn_centers in chunks:
+            cn = np.asarray(cn_centers, dtype=np.float64)[:, np.newaxis]
+            acc[c_key] += np.nansum(c2d * cn, axis=0)
+            acc[f_key] += np.nansum(c2d, axis=0)
 
-    total  = dopc_counts + popc_counts
-    peak   = np.nanmax(total)
-    mask   = (peak == 0) | (total < MIN_PEAK_FRACTION * peak)
+    frames = acc["frames_dopc"] + acc["frames_popc"]
+    peak   = np.nanmax(frames) if frames.size else 0.0
+    mask   = (peak == 0) | (frames < MIN_PEAK_FRACTION * peak)
+
+    contacts = acc["contacts_dopc"] + acc["contacts_popc"]
+    # A bin with no contacts of either species has no fraction to report.
+    mask = mask | ~(contacts > 0)
 
     with np.errstate(invalid="ignore", divide="ignore"):
-        frac_dopc   = np.where(~mask, dopc_counts / total, np.nan)
-        enrich_dopc = np.where(~mask, frac_dopc / F_DOPC,  np.nan)
+        frac_dopc   = np.where(~mask, acc["contacts_dopc"] / contacts, np.nan)
+        enrich_dopc = np.where(~mask, frac_dopc / F_DOPC, np.nan)
 
-    return dopc_counts, popc_counts, frac_dopc, enrich_dopc, mask
+    return {
+        **acc,
+        "frac_dopc":   frac_dopc,
+        "enrich_dopc": enrich_dopc,
+        "mask":        np.asarray(mask, dtype=bool),
+    }
 
 
 def compute_dopc_popc_preference_statistics(group_key, col_dopc, col_popc,
@@ -1049,9 +1079,13 @@ def compute_dopc_popc_preference_statistics(group_key, col_dopc, col_popc,
     H0: E_DOPC = 1  (no preference beyond the 5:1 bulk stoichiometry)
     Two-sided alternative: H1: E_DOPC ≠ 1
 
-    For each OP_Lamb bin the p-value is the fraction of bootstrap enrichments
-    at least as extreme as observed (|E_boot - 1| >= |E_obs - 1|), clamped
-    to [1/n_bootstrap, 1].
+    For each OP_Lamb bin the p-value is the fraction of resamples whose
+    deviation from the observed enrichment is at least as large as the
+    observation's own distance from the null
+    (|E_boot - E_obs| >= |E_obs - 1|), clamped to [1/n_bootstrap, 1]. The
+    resamples are centred on E_obs, so this is the deviation that has to be
+    pivoted; see the comment at the computation for what comparing
+    |E_boot - 1| instead does.
 
     Parameters
     ----------
@@ -1071,8 +1105,10 @@ def compute_dopc_popc_preference_statistics(group_key, col_dopc, col_popc,
         enrich_popc   : np.ndarray (observed; = frac_POPC / F_POPC)
         frac_dopc     : np.ndarray (observed)
         frac_popc     : np.ndarray (observed)
-        dopc_counts   : np.ndarray
+        dopc_counts   : np.ndarray  (weighted frame count per bin)
         popc_counts   : np.ndarray
+        dopc_contacts : np.ndarray  (weighted contact count; drives frac_dopc)
+        popc_contacts : np.ndarray
         ci_lo_dopc    : np.ndarray  (ALPHA/2 percentile of bootstrap E_DOPC)
         ci_hi_dopc    : np.ndarray  (1-ALPHA/2 percentile)
         ci_lo_popc    : np.ndarray
@@ -1101,10 +1137,12 @@ def compute_dopc_popc_preference_statistics(group_key, col_dopc, col_popc,
     n_lamb = len(lamb_centers)
 
     # ── Observed enrichment ───────────────────────────────────────────────────
-    (dopc_counts_obs, popc_counts_obs,
-     frac_dopc_obs, enrich_dopc_obs, mask) = _compute_enrichment_from_chunks(
+    obs             = _compute_enrichment_from_chunks(
         chunks_dopc, chunks_popc, lamb_centers
     )
+    mask            = obs["mask"]
+    frac_dopc_obs   = obs["frac_dopc"]
+    enrich_dopc_obs = obs["enrich_dopc"]
     frac_popc_obs   = np.where(~mask, 1.0 - frac_dopc_obs, np.nan)
     enrich_popc_obs = np.where(~mask, frac_popc_obs / F_POPC, np.nan)
 
@@ -1112,21 +1150,18 @@ def compute_dopc_popc_preference_statistics(group_key, col_dopc, col_popc,
     boot_enrich_dopc = np.full((n_bootstrap, n_lamb), np.nan)
     boot_enrich_popc = np.full((n_bootstrap, n_lamb), np.nan)
 
-    idx_pool = np.arange(n_chunks)
-
     for b in range(n_bootstrap):
-        boot_idx        = rng.integers(0, n_chunks, size=n_chunks)
-        boot_cd         = [chunks_dopc[i] for i in boot_idx]
-        boot_cp         = [chunks_popc[i] for i in boot_idx]
-        _, _, _, be_d, bmask = _compute_enrichment_from_chunks(
-            boot_cd, boot_cp, lamb_centers
+        boot_idx = rng.integers(0, n_chunks, size=n_chunks)
+        boot     = _compute_enrichment_from_chunks(
+            [chunks_dopc[i] for i in boot_idx],
+            [chunks_popc[i] for i in boot_idx],
+            lamb_centers,
         )
-        bf_d = np.where(~bmask, be_d * F_DOPC, np.nan)   # recover frac
-        bf_p = np.where(~bmask, 1.0 - bf_d, np.nan)
-        be_p = np.where(~bmask, bf_p / F_POPC, np.nan)
+        bmask = boot["mask"]
+        bf_p  = np.where(~bmask, 1.0 - boot["frac_dopc"], np.nan)
 
-        boot_enrich_dopc[b] = be_d
-        boot_enrich_popc[b] = be_p
+        boot_enrich_dopc[b] = boot["enrich_dopc"]
+        boot_enrich_popc[b] = np.where(~bmask, bf_p / F_POPC, np.nan)
 
     # ── Confidence intervals (percentile method) ───────────────────────────────
     ci_lo_q = alpha / 2 * 100
@@ -1138,14 +1173,24 @@ def compute_dopc_popc_preference_statistics(group_key, col_dopc, col_popc,
     ci_hi_popc = np.nanpercentile(boot_enrich_popc, ci_hi_q, axis=0)
 
     # ── Two-sided p-values (H0: E = 1) ────────────────────────────────────────
+    # The resamples are centred on the *observed* enrichment, not on the null,
+    # so the deviation to count is |E_boot - E_obs| against |E_obs - 1| - how
+    # often resampling alone moves the statistic as far as the observation sits
+    # from the null. Comparing |E_boot - 1| against |E_obs - 1| instead, as this
+    # did, asks how often a resample is at least as far from the null as an
+    # observation the resamples are centred on: that is ~0.5 for any symmetric
+    # bootstrap however large the effect, so no bin could ever be called
+    # significant, and the marker contradicted the CI band drawn beside it.
     obs_dev_d   = np.abs(enrich_dopc_obs - 1.0)           # (n_lamb,)
     obs_dev_p   = np.abs(enrich_popc_obs - 1.0)
     valid_d     = ~np.isnan(boot_enrich_dopc)              # (n_bootstrap, n_lamb)
     valid_p     = ~np.isnan(boot_enrich_popc)
     n_valid_d   = valid_d.sum(axis=0)                      # (n_lamb,)
     n_valid_p   = valid_p.sum(axis=0)
-    extreme_d   = (np.abs(boot_enrich_dopc - 1.0) >= obs_dev_d[np.newaxis, :]).sum(axis=0).astype(float)
-    extreme_p   = (np.abs(boot_enrich_popc - 1.0) >= obs_dev_p[np.newaxis, :]).sum(axis=0).astype(float)
+    dev_boot_d  = np.abs(boot_enrich_dopc - enrich_dopc_obs[np.newaxis, :])
+    dev_boot_p  = np.abs(boot_enrich_popc - enrich_popc_obs[np.newaxis, :])
+    extreme_d   = np.nansum(dev_boot_d >= obs_dev_d[np.newaxis, :], axis=0).astype(float)
+    extreme_p   = np.nansum(dev_boot_p >= obs_dev_p[np.newaxis, :], axis=0).astype(float)
     safe_n_d    = np.where(n_valid_d > 0, n_valid_d, 1)
     safe_n_p    = np.where(n_valid_p > 0, n_valid_p, 1)
 
@@ -1169,8 +1214,14 @@ def compute_dopc_popc_preference_statistics(group_key, col_dopc, col_popc,
         "enrich_popc":       enrich_popc_obs,
         "frac_dopc":         frac_dopc_obs,
         "frac_popc":         frac_popc_obs,
-        "dopc_counts":       dopc_counts_obs,
-        "popc_counts":       popc_counts_obs,
+        # Frame weight per bin (the sampling density that drives the mask) and
+        # the contact totals the fraction is actually built from. Both are
+        # reported because their ratio is the sanity check: if the contacts
+        # ever equal the frames, the first moment has been lost again.
+        "dopc_counts":       obs["frames_dopc"],
+        "popc_counts":       obs["frames_popc"],
+        "dopc_contacts":     obs["contacts_dopc"],
+        "popc_contacts":     obs["contacts_popc"],
         "ci_lo_dopc":        ci_lo_dopc,
         "ci_hi_dopc":        ci_hi_dopc,
         "ci_lo_popc":        ci_lo_popc,
@@ -1203,6 +1254,7 @@ def write_preference_stats_csv(all_pair_stats, out_path):
         "p_value_dopc", "p_value_popc",
         "significant_dopc", "significant_popc",
         "dopc_counts", "popc_counts",
+        "dopc_contacts", "popc_contacts",
     ]
 
     with open(out_path, "w", newline="") as fh:
@@ -1232,6 +1284,8 @@ def write_preference_stats_csv(all_pair_stats, out_path):
                     "significant_popc": st["significant_popc"][i],
                     "dopc_counts":      f"{st['dopc_counts'][i]:.6g}",
                     "popc_counts":      f"{st['popc_counts'][i]:.6g}",
+                    "dopc_contacts":    f"{st['dopc_contacts'][i]:.6g}",
+                    "popc_contacts":    f"{st['popc_contacts'][i]:.6g}",
                 })
     print(f"  Preference stats -> {os.path.relpath(out_path)}")
 
