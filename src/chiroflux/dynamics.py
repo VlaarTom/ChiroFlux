@@ -70,6 +70,7 @@ prediction. Use ``-window-mode pre`` for the causal version.
 """
 
 import datetime
+import os
 import warnings
 from pathlib import Path
 from typing import Annotated, Optional
@@ -722,7 +723,7 @@ def dynamics(
     plot_top: Annotated[int, typer.Option("-plot-top", help="Draw only this many features per figure, chosen by effect size; 0 draws all. A dynamics run has N_cvs x N_kinds features, and an uncapped figure exceeds matplotlib's size limit", rich_help_panel=panels.OUTPUT)] = 40,
     plot_dir: Annotated[str, typer.Option("-plot-dir", help="Root directory for output plots", rich_help_panel=panels.OUTPUT)] = "dynamics_plots",
     out: Annotated[str, typer.Option("-out", help="Output file for the feature rankings", rich_help_panel=panels.OUTPUT)] = "dynamics_ranking.txt",
-    redundancy_out: Annotated[str, typer.Option("-redundancy-out", help="Output file for the feature-kind redundancy table", rich_help_panel=panels.OUTPUT)] = "dynamics_redundancy.txt",
+    redundancy_file: Annotated[str, typer.Option("-redundancy-file", help="Output file for the feature-kind redundancy table", rich_help_panel=panels.OUTPUT)] = "dynamics_redundancy.txt",
     overw: Annotated[bool, typer.Option("-O", help="Force overwriting of existing files", rich_help_panel=panels.OUTPUT)] = False,
 ):
     """Per-interface CV *dynamics* — fluctuation amplitude, timescale and event ordering.
@@ -775,7 +776,9 @@ def dynamics(
     pnr, maxop, path_f, path_w = _load_path_table(data, nskip, M)
     path_weights = _compute_path_weights(maxop, path_f, path_w, interfaces)
 
-    _check_overwrite(out, overw)
+    ranking_out = os.path.join(plot_dir, out)
+    redundancy_out = os.path.join(plot_dir, redundancy_file)
+    _check_overwrite(ranking_out, overw)
     _check_overwrite(redundancy_out, overw)
     Path(plot_dir).mkdir(parents=True, exist_ok=True)
 
@@ -953,7 +956,7 @@ def dynamics(
                 )
 
     # --- rankings ------------------------------------------------------------
-    with open(out, "w") as f:
+    with open(ranking_out, "w") as f:
         f.write(f"# window = {width} frames, mode = {window_mode}, dt = {dt} {time_unit}\n")
         f.write("# interface\tlambda\trank\tfeature\tabs_cohens_d\tcohens_d\tspearman\tks\n")
         for r in results:
@@ -967,4 +970,4 @@ def dynamics(
                     f"{abs_d_val:.6f}\t{m['cohens_d'][k]:.6f}\t"
                     f"{m['spearman'][k]:.6f}\t{m['ks'][k]:.6f}\n"
                 )
-    print(f"\nRankings saved to {out}.")
+    print(f"\nRankings saved to {ranking_out}.")

@@ -2078,9 +2078,9 @@ def run_op_merge(all_bin_infos):
 
     if ml_dir is None or weights is None:
         print("\n  ERROR: could not locate the other run.")
-        print(f"    OTHER_SIM_ML_DIR  = {other_ml_path!r} -> "
+        print(f"    OTHER_ML_DIR  = {other_ml_path!r} -> "
               f"{ml_dir or 'NOT FOUND'}")
-        print(f"    OTHER_SIM_WEIGHTS = {other_weights_path!r} -> "
+        print(f"    OTHER_WEIGHTS = {other_weights_path!r} -> "
               f"{weights or 'NOT FOUND'}")
         print(f"    (searched relative to {os.getcwd()!r} and up to three "
               f"parent levels)")
