@@ -210,9 +210,9 @@ REF_COL = "OP_Lamb"
 #                     run's OP convention.  None = every overlapping bin.
 # MERGE_MIN_FRAC    : bins below this fraction of a histogram's peak are ignored
 #                     when fitting the "match" factor (they are the noisy tails).
-MERGE_OTHER_SIM   = True
-OTHER_SIM_ML_DIR  = "../../analysis_esc/analysis/ML"
-OTHER_SIM_WEIGHTS = "../../analysis_esc/analysis/path_weights.txt"
+MERGE_OTHER_SIM   = False
+OTHER_ML_DIR  = "ML_mda"
+OTHER_SIM_WEIGHTS = "path_weights.txt"
 SYMMETRIC_OP      = True
 SELF_MIRROR       = False
 MERGE_ENSEMBLES   = ("plus",)
@@ -2018,14 +2018,16 @@ def run_op_merge(all_bin_infos):
     parts   = []
 
     # ── The other run ────────────────────────────────────────────────────────
-    ml_dir  = resolve_data_path(OTHER_SIM_ML_DIR,  must_be_dir=True)
-    weights = resolve_data_path(OTHER_SIM_WEIGHTS, must_be_dir=False)
+    other_ml_path = os.path.join(OTHER_DIR, OTHER_ML_DIR)
+    other_weights_path = os.path.join(OTHER_DIR, OTHER_WEIGHTS)
+    ml_dir  = resolve_data_path(other_ml_path,  must_be_dir=True)
+    weights = resolve_data_path(other_weights_path, must_be_dir=False)
 
     if ml_dir is None or weights is None:
         print("\n  ERROR: could not locate the other run.")
-        print(f"    OTHER_SIM_ML_DIR  = {OTHER_SIM_ML_DIR!r} -> "
+        print(f"    OTHER_SIM_ML_DIR  = {other_ml_path!r} -> "
               f"{ml_dir or 'NOT FOUND'}")
-        print(f"    OTHER_SIM_WEIGHTS = {OTHER_SIM_WEIGHTS!r} -> "
+        print(f"    OTHER_SIM_WEIGHTS = {other_weights_path!r} -> "
               f"{weights or 'NOT FOUND'}")
         print(f"    (searched relative to {os.getcwd()!r} and up to three "
               f"parent levels)")
@@ -2137,8 +2139,9 @@ def histograms(
 
     # ── Dataset construction ──────────────────────────────────────────────
     merge_other: Annotated[bool, typer.Option("-merge-other/-no-merge-other", help="Fold a second simulation's histograms into this one.", rich_help_panel=panels.DATASET)] = MERGE_OTHER_SIM,
-    other_cv_dir: Annotated[str, typer.Option("-other-cv-dir", help="The other simulation's CV folder (used when -merge-other).", rich_help_panel=panels.DATASET)] = OTHER_SIM_ML_DIR,
-    other_weights: Annotated[str, typer.Option("-other-weights", help="The other simulation's path-weights file.", rich_help_panel=panels.DATASET)] = OTHER_SIM_WEIGHTS,
+    other_dir: Annotated[str, typer.Option("-other-dir", help="The other simulation's root folder (used when -merge-other).", rich_help_panel=panels.DATASET)] = OTHER_DIR,
+    other_ml_dir: Annotated[str, typer.Option("-other-ml-dir", help="The other simulation's ML folder (used when -merge-other).", rich_help_panel=panels.DATASET)] = OTHER_ML_DIR,
+    other_weights: Annotated[str, typer.Option("-other-weights", help="The other simulation's path_weights file.", rich_help_panel=panels.DATASET)] = OTHER_WEIGHTS,
     correction_apply_to: Annotated[str, typer.Option("-correction-apply-to", help="Which run the escape/entry correction factor multiplies: 'local' or 'other'.", rich_help_panel=panels.DATASET)] = CORRECTION_APPLY_TO,
     symmetric_op: Annotated[bool, typer.Option("-symmetric-op/-no-symmetric-op", help="Treat the OP as symmetric when merging the two runs.", rich_help_panel=panels.DATASET)] = SYMMETRIC_OP,
 
@@ -2165,7 +2168,7 @@ def histograms(
     constant, edited in cv_histograms.py.
     """
     global INPUT_DIR, PATH_WEIGHTS_FILE, OUTPUT_DIR, INTERMEDIATE_DIR, N_WORKERS
-    global MERGE_OTHER_SIM, OTHER_SIM_ML_DIR, OTHER_SIM_WEIGHTS
+    global MERGE_OTHER_SIM, OTHER_DIR, OTHER_ML_DIR, OTHER_WEIGHTS
     global CORRECTION_APPLY_TO, SYMMETRIC_OP, N_BOOTSTRAP, SKIP_PARSING
 
     INPUT_DIR = cv_dir
@@ -2174,8 +2177,9 @@ def histograms(
     INTERMEDIATE_DIR = os.path.join(OUTPUT_DIR, "intermediates")
     N_WORKERS = workers
     MERGE_OTHER_SIM = merge_other
-    OTHER_SIM_ML_DIR = other_cv_dir
-    OTHER_SIM_WEIGHTS = other_weights
+    OTHER_DIR = other_dir
+    OTHER_ML_DIR = other_ml_dir
+    OTHER_WEIGHTS = other_weights
     CORRECTION_APPLY_TO = correction_apply_to
     SYMMETRIC_OP = symmetric_op
     N_BOOTSTRAP = n_bootstrap
