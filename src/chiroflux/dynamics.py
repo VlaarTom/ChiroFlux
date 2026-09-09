@@ -709,6 +709,7 @@ def dynamics(
     half_window: Annotated[int, typer.Option("-half-window", help="Frames on each side of the crossing; the window is 2N+1 frames. Must be several times the tau you want to resolve, but longer windows disqualify more paths", rich_help_panel=panels.DATASET)] = 50,
     window_mode: Annotated[str, typer.Option("-window-mode", help="'centered' on the crossing, or 'pre' for frames up to it only (no outcome leakage)", rich_help_panel=panels.DATASET)] = "centered",
     min_frames: Annotated[int, typer.Option("-min-frames", help="Accept clipped windows down to this length; 0 (default) requires the full window so every sample shares one length", rich_help_panel=panels.DATASET)] = 0,
+    min_class: Annotated[int, typer.Option("-min-class", help="Minimum number of paths in each class for an interface to be analysed", rich_help_panel=panels.DATASET)] = 100,
     dt: Annotated[float, typer.Option("-dt", help="Time between stored frames. Default 1.0 = report tau in frames and frequencies in 1/frame", rich_help_panel=panels.DATASET)] = 1.0,
     time_unit: Annotated[str, typer.Option("-time-unit", help="Name of the -dt unit, used in axis labels only", rich_help_panel=panels.DATASET)] = "frames",
     max_lag: Annotated[int, typer.Option("-max-lag", help="Largest lead/lag searched, in frames", rich_help_panel=panels.DATASET)] = 25,
@@ -841,8 +842,8 @@ def dynamics(
             f"({n_pos} reactive, {n_neg} non-reactive, {n_windows[i]} full windows)"
         )
 
-        if min(n_pos, n_neg) < 2:
-            print("  SKIP: fewer than 2 paths in one class with a usable window.")
+        if min(n_pos, n_neg) < min_class:
+            print(f"  SKIP: fewer than {min_class} paths in one class with a usable window.")
             results.append({"interface": i, "lambda": interfaces[i], "ranking": None})
             continue
 
