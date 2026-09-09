@@ -70,6 +70,7 @@ prediction. Use ``-window-mode pre`` for the causal version.
 """
 
 import datetime
+import warnings
 from pathlib import Path
 from typing import Annotated, Optional
 
@@ -91,7 +92,13 @@ from .pathdata import (
     _load_path_table,
     _load_trajectory,
 )
-from .plotting import _plot_importance_bar, _plot_interface_heatmap
+from .plotting import (
+    _fig_inches,
+    _plot_importance_bar,
+    _plot_interface_heatmap,
+    _top_n_indices,
+    _truncation_note,
+)
 from .statistical_analysis import (
     _weighted_cohens_d,
     _weighted_ks,
@@ -617,33 +624,49 @@ def _plot_redundancy(matrix, kinds, out_path, overw=False):
     print(f"Redundancy heatmap saved to {out_path}")
 
 
-def _plot_lag_profile(lag_diff, cv_names, interfaces, out_path, unit, overw=False):
+def _plot_lag_profile(lag_diff, cv_names, interfaces, out_path, unit,
+                      overw=False, top_n=None):
     """Reactive minus non-reactive mean lead/lag against the OP, per interface.
 
-    A CV whose row is systematically negative reaches its transition earlier
+    A CV whose column is systematically negative reaches its transition earlier
     in reactive paths than in unsuccessful ones - an ordering statement no
     single-frame feature can make.
+
+    `top_n` keeps the CVs with the largest |Δ lag| at any interface. Besides
+    keeping the figure inside matplotlib's size limit, it stops the colour
+    scale - which is symmetric about the largest |Δ| in the whole array - from
+    being set by one extreme CV and washing out everything else.
     """
     _check_overwrite(out_path, overw)
     finite_rows = np.any(np.isfinite(lag_diff), axis=1)
     if not np.any(finite_rows):
         return
 
+    with warnings.catch_warnings():
+        # An all-NaN column is normal: that CV reached no usable window.
+        warnings.simplefilter("ignore", RuntimeWarning)
+        per_cv = np.nanmax(np.abs(lag_diff), axis=0)
+    keep = _top_n_indices(per_cv, top_n)
+    shown_names = [cv_names[i] for i in keep]
+    lag_diff = lag_diff[:, keep]
+
     vmax = np.nanmax(np.abs(lag_diff))
     if not np.isfinite(vmax) or vmax <= 0:
         vmax = 1.0
     fig, ax = plt.subplots(
-        figsize=(max(6, 0.9 * len(cv_names)), max(4, 0.5 * len(interfaces)))
+        figsize=(_fig_inches(0.9, len(shown_names), 6),
+                 _fig_inches(0.5, len(interfaces), 4))
     )
     im = ax.imshow(lag_diff, aspect="auto", cmap="coolwarm", vmin=-vmax, vmax=vmax)
     plt.colorbar(im, ax=ax, label=f"Δ lag vs OP, reactive − non-reactive [{unit}]")
-    ax.set_xticks(np.arange(len(cv_names)))
-    ax.set_xticklabels(cv_names, rotation=45, ha="right", fontsize=8)
+    ax.set_xticks(np.arange(len(shown_names)))
+    ax.set_xticklabels(shown_names, rotation=45, ha="right", fontsize=8)
     ax.set_yticks(np.arange(len(interfaces)))
     ax.set_yticklabels([f"λ={v:.4f}" for v in interfaces], fontsize=8)
     ax.set_xlabel("Collective Variable")
     ax.set_ylabel("Interface")
-    ax.set_title("Event ordering: does the CV move earlier in reactive paths?")
+    ax.set_title("Event ordering: does the CV move earlier in reactive paths?"
+                 + _truncation_note(len(shown_names), len(cv_names)))
     plt.tight_layout()
     plt.savefig(out_path, dpi=300, bbox_inches="tight")
     plt.close()
@@ -695,6 +718,7 @@ def dynamics(
     sym_angle_cols: Annotated[Optional[str], typer.Option("-sym-angle-cols", help="Comma-separated CV columns in degrees to convert to cos²(θ) (symmetric molecules)", rich_help_panel=panels.REPR)] = None,
     spectral: Annotated[bool, typer.Option("-spectral", help="Also compute the FFT features (spectral energy, main frequency, centroid, entropy)", rich_help_panel=panels.MODEL)] = False,
     pair_lags: Annotated[int, typer.Option("-pair-lags", help="Pairwise lead/lag matrices for the top-K CVs (second pass over the files); 0 disables", rich_help_panel=panels.MODEL)] = 8,
+    plot_top: Annotated[int, typer.Option("-plot-top", help="Draw only this many features per figure, chosen by effect size; 0 draws all. A dynamics run has N_cvs x N_kinds features, and an uncapped figure exceeds matplotlib's size limit", rich_help_panel=panels.OUTPUT)] = 40,
     plot_dir: Annotated[str, typer.Option("-plot-dir", help="Root directory for output plots", rich_help_panel=panels.OUTPUT)] = "dynamics_plots",
     out: Annotated[str, typer.Option("-out", help="Output file for the feature rankings", rich_help_panel=panels.OUTPUT)] = "dynamics_ranking.txt",
     redundancy_out: Annotated[str, typer.Option("-redundancy-out", help="Output file for the feature-kind redundancy table", rich_help_panel=panels.OUTPUT)] = "dynamics_redundancy.txt",
@@ -723,6 +747,12 @@ def dynamics(
       lag_profile.png               — Δ lead/lag vs OP, reactive − non-reactive
       feature_redundancy.png        — mean |ρ| between feature kinds
       interface_heatmap.png         — |Cohen's d| across all interfaces
+
+    The first three draw only the -plot-top strongest features (40 by default,
+    0 for all) and say so in the title. This is not only legibility: these
+    figures size themselves per feature, and a run with N_cvs x N_kinds of them
+    asks for a canvas past matplotlib's limit, which used to fail at save time
+    after the whole analysis had run. Every feature is always in -out.
 
     Leave -dt at 1.0 and tau is in frames and frequencies in 1/frame; pass the
     real frame spacing to get physical units. Note that -window-mode centered
@@ -831,6 +861,7 @@ def dynamics(
             xlabel="|Cohen's d|",
             title="Dynamical feature importance (|Cohen's d|)",
             message="  Effect-size bar plot saved to",
+            top_n=plot_top,
         )
 
         abs_d = np.abs(np.nan_to_num(metrics["cohens_d"]))
@@ -849,10 +880,12 @@ def dynamics(
         str(Path(plot_dir) / "interface_heatmap.png"), overw=overw,
         value_label="|Cohen's d|",
         title="|Cohen's d| of dynamical features across interfaces",
+        top_n=plot_top,
     )
     _plot_lag_profile(
         lag_diff, cv_names, interfaces,
         str(Path(plot_dir) / "lag_profile.png"), unit=time_unit, overw=overw,
+        top_n=plot_top,
     )
 
     red = _kind_redundancy(feats, kinds, n_cvs)

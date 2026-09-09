@@ -4,7 +4,14 @@ import numpy as np
 import pytest
 
 from chiroflux.pathdata import _check_overwrite
-from chiroflux.plotting import _plot_importance_bar, _plot_interface_heatmap
+from chiroflux.plotting import (
+    MAX_FIG_INCHES,
+    _fig_inches,
+    _plot_importance_bar,
+    _plot_interface_heatmap,
+    _top_n_indices,
+    _truncation_note,
+)
 
 
 class TestCheckOverwrite:
@@ -89,3 +96,57 @@ class TestInterfaceHeatmap:
         with pytest.warns(UserWarning, match="ghost_cv"):
             _plot_interface_heatmap(results, ["cv_a"], str(out))
         assert out.stat().st_size > 0
+
+
+class TestFigureSizeCap:
+    """A dynamics run has N_cvs x N_kinds features, not N_cvs.
+
+    At 0.9 in per heatmap column and 300 dpi, ~240 features is already 64800
+    pixels wide and anything past 242 exceeds matplotlib's 2**16 Agg limit —
+    which raised at save time, at the very end of a run, leaving a broken file
+    behind. These pin both halves of the fix: pick fewer features, and never
+    ask for a figure the backend cannot draw.
+    """
+
+    def test_never_asks_for_more_than_the_backend_can_draw(self):
+        assert _fig_inches(0.9, 800, 6) == MAX_FIG_INCHES
+        assert MAX_FIG_INCHES * 300 < 65536
+
+    def test_small_inputs_are_untouched(self):
+        assert _fig_inches(0.9, 20, 6) == pytest.approx(18.0)
+        assert _fig_inches(0.9, 2, 6) == pytest.approx(6.0)  # the floor
+
+    def test_top_n_keeps_the_largest_in_original_order(self):
+        scores = np.array([0.1, 5.0, 0.3, 4.0, 0.2])
+        assert _top_n_indices(scores, 2).tolist() == [1, 3]
+
+    def test_top_n_of_zero_or_none_keeps_everything(self):
+        scores = np.arange(5.0)
+        assert _top_n_indices(scores, 0).tolist() == [0, 1, 2, 3, 4]
+        assert _top_n_indices(scores, None).tolist() == [0, 1, 2, 3, 4]
+
+    def test_nan_scores_do_not_win_a_slot(self):
+        scores = np.array([np.nan, 1.0, np.nan, 2.0])
+        assert _top_n_indices(scores, 2).tolist() == [1, 3]
+
+    def test_bar_chart_survives_a_feature_count_that_used_to_crash(self, tmp_path):
+        out = tmp_path / "bar.png"
+        names = [f"cv{i}_var" for i in range(400)]
+        _plot_importance_bar(
+            np.linspace(0, 1, 400), names, str(out), top_n=40
+        )
+        assert out.exists() and out.stat().st_size > 0
+
+    def test_heatmap_survives_a_feature_count_that_used_to_crash(self, tmp_path):
+        out = tmp_path / "heat.png"
+        names = [f"cv{i}_var" for i in range(400)]
+        results = [
+            {"lambda": 0.1 * i, "ranking": [(n, float(j)) for j, n in enumerate(names)]}
+            for i in range(3)
+        ]
+        _plot_interface_heatmap(results, names, str(out), top_n=40)
+        assert out.exists() and out.stat().st_size > 0
+
+    def test_truncation_is_declared_in_the_title(self):
+        assert _truncation_note(40, 400) == "  (top 40 of 400)"
+        assert _truncation_note(40, 40) == ""
