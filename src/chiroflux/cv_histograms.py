@@ -211,7 +211,7 @@ REF_COL = "OP_Lamb"
 # MERGE_MIN_FRAC    : bins below this fraction of a histogram's peak are ignored
 #                     when fitting the "match" factor (they are the noisy tails).
 OTHER_ML_DIR      = "ML_mda"
-OTHER_SIM_WEIGHTS = "path_weights.txt"
+OTHER_WEIGHTS = "path_weights.txt"
 SYMMETRIC_OP      = True
 SELF_MIRROR       = False
 MERGE_ENSEMBLES   = ("plus",)
