@@ -32,6 +32,77 @@ import tomli
 _PATHS_CHOICES = ("all", "reactive", "nonreactive")
 
 
+def read_traj_plan(trj_path):
+    """One (xtc filename, frame index) per phase point, in path order.
+
+    ``traj.txt`` records, for every phase point of a path, which trajectory
+    file and which frame *inside* that file the point came from. That mapping
+    is the only authoritative correspondence between the order parameter and
+    the coordinates, and following it is what makes frame i of a path the same
+    phase point as row i of ``order.txt``.
+
+    Reading whole segments instead does not work, because the .xtc files hold
+    frames that are NOT part of the path. On the reference set the surplus is
+    exactly ``2 * (n_segments - 1) + 1`` frames, sitting at the end of each
+    segment and at the start of one - not the "(n_segments - 1) shared joining
+    frames" earlier versions assumed. They are distinct frames, not duplicates,
+    so no value-based comparison finds them, and no fixed per-segment rule
+    removes the right ones.
+
+    The frame order is taken from the file as written, so a reversed (trajB)
+    segment needs no special handling: it simply lists descending indices, and
+    the direction column becomes redundant.
+
+    A ``.g96`` phase point has no .xtc frame. Its step is returned so a caller
+    can drop the matching order-parameter row and keep the two in step.
+
+    Returns
+    -------
+    plan      : list of (xtc filename, frame index), one per phase point
+    g96_index : str or None, the step of the .g96 phase point if there is one
+    """
+    plan = []
+    g96_index = None
+
+    with open(trj_path, "r") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line or line.startswith(("#", "@")):
+                continue
+            columns = line.split()
+            step, filename, frame_index = columns[0], columns[1], columns[2]
+
+            if filename.endswith(".g96"):
+                g96_index = step
+                continue
+            name = filename[:-4] + ".xtc" if filename.endswith(".trr") else filename
+            plan.append((name, int(frame_index)))
+
+    return plan, g96_index
+
+
+def traj_plan_segments(plan):
+    """Group a plan into [(filename, [frame indices])], in path order.
+
+    Each file contributes one entry per *contiguous run* of phase points, which
+    on real paths means one entry per file: a segment is entered once and left
+    once. Callers that build per-file selections before looping over frames -
+    which is every trajectory reader here - can therefore keep that structure
+    and simply take the frame list instead of ``range(len(u.trajectory))``.
+
+    Because the runs are consecutive, visiting the segments in the order
+    returned and their frames in the order listed reproduces path order
+    exactly, which is what any per-frame time series depends on.
+    """
+    segments = []
+    for filename, frame_index in plan:
+        if not segments or segments[-1][0] != filename:
+            segments.append((filename, [frame_index]))
+        else:
+            segments[-1][1].append(frame_index)
+    return segments
+
+
 def _check_overwrite(path, overw):
     """Refuse to clobber an existing output file unless -O was given.
 

@@ -149,6 +149,7 @@ from .cv_histograms import (
     update_histogram,
     write_stats_csv,
 )
+from .pathdata import read_traj_plan, traj_plan_segments
 
 try:
     from tqdm import tqdm
@@ -706,43 +707,19 @@ def wrap_delta(dz, box_z):
 
 # ── 5. PATH / TRAJECTORY BOOKKEEPING ─────────────────────────────────────────
 
-def read_traj_txt(traj_txt):
+def read_traj_plan_for(traj_txt):
+    """Segments for one path: [(segment name, [frame indices])] in path order.
+
+    Thin wrapper over pathdata.read_traj_plan / traj_plan_segments, kept here
+    only to apply this module's naming. The .xtc files hold frames that are not
+    part of the path - 2*(n_segments-1)+1 of them on the reference set - so the
+    frames actually belonging to each phase point have to come from traj.txt
+    rather than from reading whole segments and trying to spot the extras.
+
+    Returns (segments, g96_index).
     """
-    Ordered unique segment file names and their time direction.
-
-    Mirrors system_file_gen.extract_sorted_traj_names(): column 2 is the file,
-    column 4 the direction, .trr entries refer to a .xtc of the same stem, and a
-    .g96 entry is a single phase point stored outside the trajectory files.
-    That system_file_gen module cannot be imported (it parses argv and runs the
-    whole analysis at import time), so the logic is repeated here.
-
-    Returns (filenames, directions, g96_index).
-    """
-    filenames, directions, seen = [], [], set()
-    g96_index = None
-
-    with open(traj_txt, "r") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line or line.startswith(("#", "@")):
-                continue
-            cols = line.split()
-            if len(cols) < 4:
-                continue
-            step, filename, direction = cols[0], cols[1], cols[3]
-            if filename in seen:
-                continue
-            seen.add(filename)
-            if filename.endswith(".trr"):
-                filenames.append(filename[:-4] + ".xtc")
-                directions.append(direction)
-            elif filename.endswith(".g96"):
-                g96_index = step
-            else:
-                filenames.append(filename)
-                directions.append(direction)
-
-    return filenames, directions, g96_index
+    plan, g96_index = read_traj_plan(traj_txt)
+    return traj_plan_segments(plan), g96_index
 
 
 def classify_path(ml_dir, path_num):
@@ -963,36 +940,30 @@ def _process_path_impl(job):
         return {"path_num": path_num, "group": group, "error": "no traj.txt / accepted/"}
 
     try:
-        seg_names, directions, g96_index = read_traj_txt(traj_txt)
+        segments, g96_index = read_traj_plan_for(traj_txt)
     except OSError as e:
         return {"path_num": path_num, "group": group, "error": f"traj.txt: {e}"}
-    if not seg_names:
+    if not segments:
         return {"path_num": path_num, "group": group, "error": "no segments listed"}
 
     from MDAnalysis.lib.distances import capped_distance, minimize_vectors
 
     z_vals, s_tot, s_pol, s_apo, s_free = [], [], [], [], []
     zp_up, zp_lo = [], []
-    prev_sig = None
-    n_dupes  = 0
 
-    for seg, direction in zip(seg_names, directions):
+    for seg, frame_indices in segments:
         seg_path = os.path.join(acc_dir, seg)
         if not os.path.isfile(seg_path):
             return {"path_num": path_num, "group": group, "error": f"missing segment {seg}"}
         # Logged before the read: a segfault in the compiled xtc reader leaves
         # this line as the last trace of which file was open.
-        dbg(f"  path {path_num}: segment {seg} ({direction})")
+        dbg(f"  path {path_num}: segment {seg} ({len(frame_indices)} frames)")
         try:
             u.load_new(seg_path, refresh_offsets=True)
         except Exception as e:
             return {"path_num": path_num, "group": group, "error": f"{seg}: {e}"}
 
-        frames = range(len(u.trajectory))
-        if str(direction).strip() == "-1":
-            frames = reversed(frames)
-
-        for fi in frames:
+        for fi in frame_indices:
             ts    = u.trajectory[fi]
             box   = ts.dimensions
             box_z = float(box[2])
@@ -1002,13 +973,6 @@ def _process_path_impl(job):
             sol_pos = ref + minimize_vectors(solute.positions - ref, box)
             com     = np.average(sol_pos, axis=0, weights=solute.masses)
 
-            # Seam frames are shared by consecutive segments; drop the repeat.
-            sig = (round(float(com[0]), 4), round(float(com[1]), 4),
-                   round(float(com[2]), 4), round(box_z, 4))
-            if sig == prev_sig:
-                n_dupes += 1
-                continue
-            prev_sig = sig
 
             z_memb = circular_com_z(memb.positions[:, 2], memb.masses, box_z)
             z_rel  = wrap_delta(float(com[2]) - z_memb, box_z)
@@ -1099,7 +1063,6 @@ def _process_path_impl(job):
         "group":    group,
         "error":    None,
         "n_frames": int(z_vals.size),
-        "n_dupes":  int(n_dupes),
         "op_dev":   op_dev,
         "z_min":    float(z_vals.min()),
         "z_max":    float(z_vals.max()),
@@ -1630,7 +1593,6 @@ def parse_all(bin_info):
     errors   = []
     op_devs  = []
     n_frames = 0
-    n_dupes  = 0
 
     dbg(f"{len(jobs)} jobs queued")
     t_start   = time.time()
@@ -1693,7 +1655,6 @@ def parse_all(bin_info):
                 buffer[group].append(res)
                 n_done   += 1
                 n_frames += res["n_frames"]
-                n_dupes  += res["n_dupes"]
                 if np.isfinite(res["op_dev"]):
                     op_devs.append(res["op_dev"])
 
@@ -1728,7 +1689,7 @@ def parse_all(bin_info):
         dbg(f"flushed final chunk {chunk}")
 
     print(f"\n  {n_done} paths, {n_frames:,} phase points "
-          f"({n_dupes:,} seam duplicates dropped)")
+          "(frames taken from traj.txt; nothing to de-duplicate)")
     if op_devs:
         print(f"  Mean |z_computed - order.txt| = {np.mean(op_devs):.4f} A "
               f"over {len(op_devs)} paths "
@@ -1752,7 +1713,7 @@ def parse_all(bin_info):
     with open(os.path.join(OUTPUT_DIR, "path_report.txt"), "w") as fh:
         fh.write(f"paths processed : {n_done}\n")
         fh.write(f"phase points    : {n_frames}\n")
-        fh.write(f"seam duplicates : {n_dupes}\n")
+        fh.write("frame selection : traj.txt phase-point mapping\n")
         if op_devs:
             fh.write(f"mean |z - OP|   : {np.mean(op_devs):.6f} A\n")
         fh.write(f"failed paths    : {len(errors)}\n")

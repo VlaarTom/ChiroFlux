@@ -19,6 +19,7 @@ from scipy.interpolate import RBFInterpolator
 from scipy.spatial import cKDTree
 
 from . import panels
+from .pathdata import read_traj_plan, traj_plan_segments
 
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -1462,30 +1463,6 @@ def get_reactive_paths(path_number, infretis_data_file, lambda_B):
     return bool(third_cols[idx[0]] > lambda_B) if idx.size > 0 else None
 
 
-def extract_sorted_traj_names(trj_path):
-    filenames, directions, seen = [], [], set()
-    g96_index = None
-    with open(trj_path, 'r') as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
-            cols      = line.split()
-            step      = cols[0]
-            filename  = cols[1]
-            direction = cols[3]
-            if filename not in seen:
-                if filename.endswith('.trr'):
-                    filenames.append(filename[:-4] + '.xtc')
-                elif filename.endswith('.g96'):
-                    g96_index = step
-                else:
-                    filenames.append(filename)
-                seen.add(filename)
-                directions.append(direction)
-    return filenames, directions, g96_index
-
-
 def remove_first_last_frames(ensemble, lambda_minus_one, lambda_A, first, last):
     if (ensemble == "plus" and first < lambda_A) or \
        (ensemble == "minus" and (first < lambda_minus_one or first > lambda_A)):
@@ -1575,12 +1552,10 @@ def _needed_groups(csvs, overwrite, near_n=()):
 def calculate_selected_slab_profiles(
     topology,
     xtc_files,
-    xtc_directions,
+    frame_plan,
     permeant_resname,
     needed_groups,
     weight              = 1.0,
-    first_frame         = False,
-    last_frame          = False,
     lipid_resnames      = ('DOPC', 'POPC'),
     slab_width          = 1.0,
     bilayer_normal      = 'z',
@@ -1822,7 +1797,7 @@ def calculate_selected_slab_profiles(
     # ═════════════════════════════════════════════════════════════════════════
     # Frame loop
     # ═════════════════════════════════════════════════════════════════════════
-    for i, (xtc, direction) in enumerate(zip(xtc_files, xtc_directions)):
+    for xtc, frame_indices in frame_plan:
         u          = mda.Universe(topology, xtc, refresh_offsets=True)
         permeant   = u.select_atoms(f"resname {permeant_resname}")
         perm_heavy = permeant.select_atoms("not name H*")
@@ -1895,16 +1870,13 @@ def calculate_selected_slab_profiles(
                         sp: (rn_arr == sp) for sp in lipid_resnames
                     }
 
-        n_frames      = len(u.trajectory)
-        frame_indices = list(range(n_frames))
-        if direction == '-1':
-            frame_indices = list(reversed(frame_indices))
-        if first_frame and i == 0:
-            frame_indices = frame_indices[1:]
-        if last_frame and i == len(xtc_files) - 1:
-            frame_indices = frame_indices[:-1]
-        if i != 0 and i != len(xtc_files) - 1:
-            frame_indices = frame_indices[1:]
+        # Frames come from traj.txt via frame_plan: exactly this path's phase
+        # points, in path order, already trimmed of the first/last one where
+        # the ensemble requires it. This matters more here than elsewhere -
+        # z_series feeds MSD and autocorrelation estimates, so a frame that was
+        # never on the path inserts a spurious jump and corrupts the effective
+        # time step. The rule this replaces dropped one frame per junction
+        # where the .xtc files carry 2*(n_segments-1)+1 frames outside the path.
 
         for fi in frame_indices:
             u.trajectory[fi]
@@ -2796,10 +2768,14 @@ def process_single_path(
             ensemble, lambda_minus_one, lambda_A, first, last
         )
 
-        xtc_names, directions, _ = extract_sorted_traj_names(
-            f"../load/{path_number}/traj.txt"
-        )
-        xtc_files = [os.path.join(path_folder, f) for f in xtc_names]
+        plan, _ = read_traj_plan(f"../load/{path_number}/traj.txt")
+        if first_frame:
+            plan = plan[1:]
+        if last_frame:
+            plan = plan[:-1]
+        frame_plan = [(os.path.join(path_folder, name), indices)
+                      for name, indices in traj_plan_segments(plan)]
+        xtc_files = [xtc for xtc, _ in frame_plan]
 
         if not xtc_files:
             return (path_number, 'skipped', 'No xtc files found.')
@@ -2814,12 +2790,10 @@ def process_single_path(
         results = calculate_selected_slab_profiles(
             topology            = topol_file,
             xtc_files           = xtc_files,
-            xtc_directions      = directions,
+            frame_plan          = frame_plan,
             permeant_resname    = permeant_resname,
             needed_groups       = needed,
             weight              = weight,
-            first_frame         = first_frame,
-            last_frame          = last_frame,
             lipid_resnames      = lipid_resnames,
             slab_width          = slab_width,
             bilayer_normal      = bilayer_normal,

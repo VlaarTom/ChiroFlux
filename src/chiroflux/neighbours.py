@@ -14,6 +14,7 @@ import typer
 from MDAnalysis.analysis import distances
 
 from . import panels
+from .pathdata import read_traj_plan, traj_plan_segments
 
 # ── PARALLELISM CONFIGURATION ─────────────────────────────────────────────────
 ERROR_LOG  = "errors_neighbour.log"
@@ -170,34 +171,6 @@ def get_reactive_paths(path_number, infretis_data_file, lambda_B):
         return None
 
 
-def extract_sorted_traj_names(trj_path):
-    filenames  = []
-    directions = []
-    seen       = set()
-    g96_index  = None
-
-    with open(trj_path, 'r') as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
-            columns   = line.split()
-            step      = columns[0]
-            filename  = columns[1]
-            direction = columns[3]
-            if filename not in seen:
-                if filename.endswith('.trr'):
-                    filenames.append(filename[:-4] + '.xtc')
-                elif filename.endswith('.g96'):
-                    g96_index = step
-                else:
-                    filenames.append(filename)
-                seen.add(filename)
-                directions.append(direction)
-
-    return filenames, directions, g96_index
-
-
 def contains_key(d: dict[int, float], key: int) -> bool:
     # Only include paths in histogram that have weights
     return key in d
@@ -279,11 +252,9 @@ def _precompute_chain_groups(lipid_residues):
 def calculate_neighbour_slab_counts(
     topology,
     xtc_files,
-    xtc_directions,
+    frame_plan,
     permeant_resname,
     weight           = 1.0,
-    first_frame      = False,
-    last_frame       = False,
     lipid_resnames   = ('DOPC', 'POPC'),
     slab_width       = 1.0,
     bilayer_normal   = 'z',
@@ -307,7 +278,7 @@ def calculate_neighbour_slab_counts(
     ----------
     topology         : str
     xtc_files        : list of str
-    xtc_directions   : list of str  ('1' or '-1')
+    frame_plan       : [(xtc path, [frame indices])] in path order
     permeant_resname : str
     weight           : float — path weight applied to every observation
     first_point      : bool  — whether to exclude the first frame (to avoid double-counting)
@@ -346,7 +317,11 @@ def calculate_neighbour_slab_counts(
                        # in total, regardless of how many frames it has
 
     # ── Classify neighbours frame by frame ────────────────────────────────────
-    for i, (xtc, direction) in enumerate(zip(xtc_files, xtc_directions)):
+    for xtc, frame_indices in frame_plan:
+        # Kept for the raw records only: the plan already encodes the order, a
+        # backward segment simply listing its frames in descending order.
+        direction = ('-1' if len(frame_indices) > 1
+                     and frame_indices[1] < frame_indices[0] else '1')
         u = mda.Universe(topology, xtc, refresh_offsets=True)
         membrane   = u.select_atoms("resname DOPC POPC")
         permeant   = u.select_atoms(f"resname {permeant_resname}")
@@ -366,22 +341,12 @@ def calculate_neighbour_slab_counts(
             r for r in all_lipids.residues if r.resindex in chain_groups
         ]
 
-        # Collect frame indices, reverse if needed, then seek explicitly
-        n_frames    = len(u.trajectory)
-        frame_indices = list(range(n_frames))
-        if direction == '-1':
-            frame_indices = list(reversed(frame_indices))
-
-        # Adjust for first and last frame if lower than lambda_A or higher than lambda_B
-        if first_frame:
-            if i == 0:
-                frame_indices = frame_indices[1:]
-        if last_frame:
-            if i == len(xtc_files) - 1:
-                frame_indices = frame_indices[:-1]
-        # Always remove first frame for "inner" trajectories to avoid overlap
-        if i != 0 and i != len(xtc_files) - 1:
-            frame_indices = frame_indices[1:]
+        # Frames come from traj.txt via frame_plan: exactly this path's phase
+        # points, already in path order and already trimmed of the first/last
+        # one where the ensemble requires it. Nothing to reverse and nothing to
+        # de-overlap - the "drop the first frame of interior segments" rule
+        # this replaces removed one frame per junction where the .xtc files
+        # actually carry 2*(n_segments-1)+1 frames outside the path.
 
         for fi in frame_indices:
             u.trajectory[fi]          # seek to this frame — updates all positions
@@ -574,10 +539,14 @@ def process_single_path_neighbour(
         #Check to see if first or last frame should be deleted
         first_frame, last_frame = remove_first_last_frames(ensemble, lambda_minus_one, lambda_A, first, last)
 
-        xtc_names, directions, _ = extract_sorted_traj_names(
-            f"../load/{path_number}/traj.txt"
-        )
-        xtc_files = [os.path.join(path_folder, f) for f in xtc_names]
+        plan, _ = read_traj_plan(f"../load/{path_number}/traj.txt")
+        if first_frame:
+            plan = plan[1:]
+        if last_frame:
+            plan = plan[:-1]
+        frame_plan = [(os.path.join(path_folder, name), indices)
+                      for name, indices in traj_plan_segments(plan)]
+        xtc_files = [xtc for xtc, _ in frame_plan]
 
         if len(xtc_files) == 0:
             return (path_number, 'skipped', 'No xtc files found.')
@@ -589,11 +558,9 @@ def process_single_path_neighbour(
         counts_df, _ = calculate_neighbour_slab_counts(
             topology         = topol_file,
             xtc_files        = xtc_files,
-            xtc_directions   = directions,
+            frame_plan       = frame_plan,
             permeant_resname = permeant_resname,
             weight           = weight,
-            first_frame      = first_frame,
-            last_frame       = last_frame,
             lipid_resnames   = lipid_resnames,
             slab_width       = slab_width,
             bilayer_normal   = bilayer_normal,

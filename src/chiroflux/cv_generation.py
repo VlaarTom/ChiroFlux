@@ -14,6 +14,7 @@ import tomli
 import typer
 
 from . import panels
+from .pathdata import read_traj_plan, traj_plan_segments
 
 # MDAnalysis is a required dependency, but only this module uses it and it costs
 # ~0.5s to import, so it is bound on first use rather than at import time. That
@@ -106,36 +107,6 @@ def parse_arguments():
                         help="Recompute a path even if ML/{path}.txt already exists.")
     parser.add_argument("-w", "--workers", type=int, default=64)
     return parser.parse_args()
-
-
-def extract_sorted_traj_names(trj_path):
-    filenames = []
-    directions = []
-    seen = set()
-    g96_index = None
-
-    with open(trj_path, "r") as file:
-        for line in file:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            columns = line.split()
-            step = columns[0]
-            filename = columns[1]
-            direction = columns[3]
-
-            if filename not in seen:
-                if filename.endswith(".trr"):
-                    filenames.append(filename[:-4] + ".xtc")
-                elif filename.endswith(".g96"):
-                    g96_index = step
-                else:
-                    filenames.append(filename)
-                seen.add(filename)
-                directions.append(direction)
-
-    print(f"g96_index: {g96_index}")
-    return filenames, directions, g96_index
 
 
 def get_reactive_paths(path_number, infretis_data_file, lambda_B):
@@ -1369,14 +1340,24 @@ def _init_system(gromacs_input="../gromacs_input"):
     _SYSTEM_READY = True
 
 
-def gather_path_arrays(xtc_files, directions):
+def gather_path_arrays(plan, path_folder):
     """
-    Read every xtc segment of a path exactly once with MDAnalysis, in the order
-    (and per-segment reversal) the original script used, and return every raw
-    quantity the CVs below need. Small atom-group positions are kept as full
-    (n_frames, n_atoms, 3) arrays (cheap); bulk quantities (water/lipid contact
-    counts, hydrogen bonds, whole-membrane COM) are reduced to a scalar
-    immediately, frame by frame, so the large atom sets are never stored.
+    Read exactly the frames `plan` names, in path order, and return every raw
+    quantity the CVs below need.
+
+    `plan` is the (xtc filename, frame index) list from extract_traj_plan, one
+    entry per phase point. Frames are written straight to their output row, so
+    the result has one row per phase point by construction - there is nothing
+    to de-duplicate afterwards and nothing to trim. Reading whole segments
+    instead silently mixes in frames that are not part of the path; see
+    extract_traj_plan for what that costs.
+
+    Each file is opened once and its frames visited in ascending index order,
+    which is what .xtc seeking is cheap at, then scattered to the right output
+    rows. Small atom-group positions are kept as full (n_frames, n_atoms, 3)
+    arrays (cheap); bulk quantities (water/lipid contact counts, hydrogen
+    bonds, whole-membrane COM) are reduced to a scalar immediately, frame by
+    frame, so the large atom sets are never stored.
     """
     small_keys = (['backbone', 'heavy', 'c_cg', 'ang_oh', 'ring5', 'ring6',
                    'dih_chiral', 'dih_oh', 'tetra5', 'orp_all', 'lipPu', 'lipPl',
@@ -1400,20 +1381,26 @@ def gather_path_arrays(xtc_files, directions):
                     'hb_po', 'hb_co', 'hb_n']
                    + [f'zcom_{gi}' for gi in ZCOM_SCALAR_GROUPS])
 
-    box_segs = []
-    small_segs = {k: [] for k in small_keys}
-    scalar_segs = {k: [] for k in scalar_keys}
+    n_frames = len(plan)
+    box = np.empty((n_frames, 3))
+    small = {k: np.empty((n_frames, len(small_idx[k]), 3)) for k in small_keys}
+    scalars = {k: np.empty(n_frames) for k in scalar_keys}
 
-    for xtc_file, direction in zip(xtc_files, directions):
-        u = mda.Universe(topol_file, xtc_file)
-        n = len(u.trajectory)
-        order = range(n - 1, -1, -1) if direction == "-1" else range(n)
+    # Segments in path order; each file is opened once and its frames are
+    # consecutive, so out_i simply advances across the whole path.
+    out_i = -1
+    for fname, frame_indices in traj_plan_segments(plan):
+        u = mda.Universe(topol_file, os.path.join(path_folder, fname))
+        n_avail = len(u.trajectory)
 
-        seg_box = np.empty((n, 3))
-        seg_small = {k: np.empty((n, len(small_idx[k]), 3)) for k in small_keys}
-        seg_scalar = {k: np.empty(n) for k in scalar_keys}
-
-        for out_i, frame_i in enumerate(order):
+        for frame_i in frame_indices:
+            out_i += 1
+            if not 0 <= frame_i < n_avail:
+                raise ValueError(
+                    f"{fname}: traj.txt asks for frame {frame_i}, but the file "
+                    f"holds {n_avail} frames. The trajectory and traj.txt "
+                    f"disagree; the path cannot be assembled."
+                )
             ts = u.trajectory[frame_i]
             # MDAnalysis's native length unit is Angstrom regardless of the
             # source file (GROMACS itself is nm-native) -- every distance
@@ -1425,28 +1412,28 @@ def gather_path_arrays(xtc_files, directions):
             dims = ts.dimensions.copy()
             dims[:3] *= 0.1                 # lengths only; dims[3:6] are angles
             box3 = dims[:3]
-            seg_box[out_i] = box3
+            box[out_i] = box3
 
             for k in small_keys:
-                seg_small[k][out_i] = pos[small_idx[k]]
+                small[k][out_i] = pos[small_idx[k]]
 
             orp_pos = pos[IDX_ORP_ALL]
-            seg_scalar['water_03'][out_i] = count_atoms_within(orp_pos, pos[IDX_WATER], dims, 0.3)
-            seg_scalar['dopc_05'][out_i]  = count_atoms_within(orp_pos, pos[IDX_DOPC_ALL], dims, 0.5)
-            seg_scalar['popc_05'][out_i]  = count_atoms_within(orp_pos, pos[IDX_POPC_ALL], dims, 0.5)
-            seg_scalar['water_06'][out_i] = count_atoms_within(orp_pos, pos[IDX_WATER], dims, 0.6)
-            seg_scalar['water_10'][out_i] = count_atoms_within(orp_pos, pos[IDX_WATER], dims, 1.0)
+            scalars['water_03'][out_i] = count_atoms_within(orp_pos, pos[IDX_WATER], dims, 0.3)
+            scalars['dopc_05'][out_i]  = count_atoms_within(orp_pos, pos[IDX_DOPC_ALL], dims, 0.5)
+            scalars['popc_05'][out_i]  = count_atoms_within(orp_pos, pos[IDX_POPC_ALL], dims, 0.5)
+            scalars['water_06'][out_i] = count_atoms_within(orp_pos, pos[IDX_WATER], dims, 0.6)
+            scalars['water_10'][out_i] = count_atoms_within(orp_pos, pos[IDX_WATER], dims, 1.0)
 
             h01, n1, o01, h02 = pos[IDX_ORP_H01], pos[IDX_ORP_N], pos[IDX_ORP_O01], pos[IDX_ORP_H02]
-            seg_scalar['hb_po'][out_i] = (
+            scalars['hb_po'][out_i] = (
                 count_hbonds(h01, n1, pos[IDX_PHOSPHATE], dims, 0.35)
                 + count_hbonds(h02, o01, pos[IDX_PHOSPHATE], dims, 0.35)
             )
-            seg_scalar['hb_co'][out_i] = (
+            scalars['hb_co'][out_i] = (
                 count_hbonds(h01, n1, pos[IDX_CARBONYL], dims, 0.35)
                 + count_hbonds(h02, o01, pos[IDX_CARBONYL], dims, 0.35)
             )
-            seg_scalar['hb_n'][out_i] = (
+            scalars['hb_n'][out_i] = (
                 count_hbonds(h01, n1, pos[IDX_NITROGEN], dims, 0.35)
                 + count_hbonds(h02, o01, pos[IDX_NITROGEN], dims, 0.35)
             )
@@ -1468,17 +1455,9 @@ def gather_path_arrays(xtc_files, directions):
             # which is a materially bigger change than a per-frame fix.
             for gi, masses in zip(ZCOM_SCALAR_GROUPS, [ZCOM_MASSES[g] for g in ZCOM_SCALAR_GROUPS]):
                 idx = ZCOM_GROUPS[gi]
-                seg_scalar[f'zcom_{gi}'][out_i] = np.average(pos[idx, 2], weights=masses)
+                scalars[f'zcom_{gi}'][out_i] = np.average(pos[idx, 2], weights=masses)
 
-        box_segs.append(seg_box)
-        for k in small_keys:
-            small_segs[k].append(seg_small[k])
-        for k in scalar_keys:
-            scalar_segs[k].append(seg_scalar[k])
 
-    box = np.vstack(box_segs)
-    small = {k: np.vstack(v) for k, v in small_segs.items()}
-    scalars = {k: np.concatenate(v) for k, v in scalar_segs.items()}
     return box, small, scalars
 
 
@@ -1495,27 +1474,24 @@ def write_ML_txt(path_number, reactive, ensemble, lambda_A, lambda_minus_one, **
     data = np.column_stack(arrays[1:])
     n_op = arrays[0].shape[0]
 
-    if data.shape[0] > 1:
-        adjacent_duplicate = np.all(
-            np.isclose(data[1:], data[:-1], equal_nan=True), axis=1)
-        keep = np.concatenate(([True], ~adjacent_duplicate))
-        n_seam = int((~keep).sum())
-        if n_seam:
-            print(f"Seam frames removed at positions: {np.where(~keep)[0]}")
-        data = data[keep]
-    else:
-        n_seam = 0
-    print(f"Total {n_seam} seam frame(s) removed.")
-
-    size_difference = data.shape[0] - n_op
-    if size_difference > 0:
-        print(f"[!] WARNING: {size_difference} more feature row(s) than order "
-              f"parameters after seam removal - trimming features from the end.")
-        data = data[:n_op]
-    elif size_difference < 0:
-        print(f"[!] WARNING: {-size_difference} fewer feature row(s) than order "
-              f"parameters - trimming the order parameter from the end.")
-        arrays[0] = arrays[0][:data.shape[0]]
+    # No de-duplication and no trimming: gather_path_arrays visits exactly the
+    # frames traj.txt assigns to this path's phase points, in order, so row i
+    # of the feature block is phase point i by construction.
+    #
+    # Earlier versions tried to repair a mismatch here instead, and could not:
+    # the surplus frames are not duplicates of their neighbours but distinct
+    # frames the .xtc files carry outside the path, so no value comparison
+    # finds them. Whatever was then removed - random rows in the first version,
+    # the last few rows in the second - left the intruders in place and shifted
+    # every row after the first segment boundary against its order parameter.
+    # A length mismatch now means the inputs genuinely disagree, so say so
+    # rather than produce a well-formed file whose rows are misaligned.
+    if data.shape[0] != n_op:
+        raise ValueError(
+            f"path {path_number}: {data.shape[0]} feature rows against {n_op} "
+            f"order-parameter rows. traj.txt and order.txt disagree about this "
+            f"path; not writing a file whose rows cannot be trusted."
+        )
 
     data = np.column_stack((arrays[0], data))
     deleted = []
@@ -1541,14 +1517,12 @@ def write_ML_txt(path_number, reactive, ensemble, lambda_A, lambda_minus_one, **
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(f"# {'reactive' if reactive else 'non-reactive'}\n")
         f.write(f"# {ensemble} ensemble\n")
-        if size_difference > 0:
-            trimmed = f"{size_difference} feature row(s) trimmed from the end"
-        elif size_difference < 0:
-            trimmed = f"{-size_difference} order-parameter row(s) trimmed from the end"
-        else:
-            trimmed = "no trimming needed"
+        # Deliberately worded unlike either earlier version, whose line 3 read
+        # "... randomly removed ..." or "... trimmed from the end ...". Grepping
+        # this line is how a file generated before the frame-mapping fix - and
+        # so carrying rows shifted against the order parameter - is identified.
         f.write(
-            f"# {n_seam} seam frame(s) removed, {trimmed}, "
+            f"# {n_op} phase points mapped from traj.txt, "
             f"deleted phase points: {', '.join(deleted) if deleted else 'none'}\n"
         )
         df.to_csv(f, sep=' ', index=False, float_format='%.5f')
@@ -1597,20 +1571,26 @@ def process_single_path(path_number, overwrite, lambda_A, lambda_B, lambda_minus
         print("=" * 80)
         print(f"[Worker] Path: {path_number}, {status}")
 
-        xtc_files_sorted, xtc_files_direction, g96_index = extract_sorted_traj_names(
-            f"../load/{path_number}/traj.txt"
-        )
-        xtc_files = [os.path.join(path_folder, f) for f in xtc_files_sorted]
-        print(f"{len(xtc_files)} xtc files found: {xtc_files_sorted}")
+        plan, g96_index = read_traj_plan(f"../load/{path_number}/traj.txt")
+        print(f"g96_index: {g96_index}")
+        segments = sorted({fname for fname, _ in plan})
+        print(f"{len(segments)} xtc files found: {segments}")
+        print(f"{len(plan)} phase points mapped to frames")
 
         if g96_index is not None:
             order_parameter = np.delete(order_parameter, int(g96_index), axis=0)
 
-        if len(xtc_files) == 0:
-            return (path_number, "skipped", "No xtc files found")
+        if not plan:
+            return (path_number, "skipped", "No xtc frames found")
 
-        # ── One pass over every frame of every segment ────────────────────────
-        box, small, scalars = gather_path_arrays(xtc_files, xtc_files_direction)
+        if len(plan) != order_parameter.shape[0]:
+            return (path_number, "error",
+                    f"traj.txt maps {len(plan)} phase points but order.txt has "
+                    f"{order_parameter.shape[0]} rows after the g96 deletion; "
+                    "refusing to guess the correspondence.")
+
+        # ── Exactly the frames traj.txt names, in path order ──────────────────
+        box, small, scalars = gather_path_arrays(plan, path_folder)
         n_frames = box.shape[0]
 
         lx, ly, lz = box[:, 0], box[:, 1], box[:, 2]
