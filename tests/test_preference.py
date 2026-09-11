@@ -221,6 +221,73 @@ class TestPairTable:
 
     def test_each_pair_names_a_dopc_and_a_popc_column(self):
         for col_d, col_p, label in cvh.DOPC_POPC_PAIRS:
-            assert col_d.endswith("_DOPC"), label
-            assert col_p.endswith("_POPC"), label
-            assert col_d[:-5] == col_p[:-5], label
+            assert "DOPC" in col_d, label
+            assert "POPC" in col_p, label
+            assert col_d.replace("DOPC", "*") == col_p.replace("POPC", "*"), label
+
+    def test_the_whole_lipid_pair_is_present(self):
+        """The most direct preference measure: every atom of each species
+        near the permeant, not one marker atom."""
+        assert ("DOPC", "POPC", "whole_lipid") in cvh.DOPC_POPC_PAIRS
+
+
+class TestEmptyColumnMasking:
+    """A leaflet a run never touches must read as missing, not as 50/50.
+
+    Its whole weight sits in the lowest CN bin. If that bin's centre is not
+    exactly zero — it is 0.05 for these columns — the first moment becomes
+    0.05 x frame weight for *both* species, the frame weights cancel because
+    both histograms hold the same frames, and frac_DOPC lands on exactly 0.5
+    in every bin. That reads as a clean flat line at E_POPC = 3.0, which is
+    how it went unnoticed.
+    """
+
+    #: Bin centres as the real ranges file produces them: the lowest is 0.05,
+    #: not 0.0, which is exactly why the `contacts > 0` check does not fire.
+    CENTERS = np.array([0.05, 0.15, 0.25, 0.35, 0.45, 0.55])
+
+    def _chunks(self, rows_d, rows_p):
+        def build(rows):
+            c = np.zeros((len(self.CENTERS), N_OP))
+            for j, w in rows.items():
+                c[j, :] = w
+            return [(c, None, self.CENTERS)]
+        return build(rows_d), build(rows_p)
+
+    def test_all_weight_in_the_zero_bin_is_masked(self):
+        cd, cp = self._chunks({0: 100.0}, {0: 100.0})
+        r = _compute_enrichment_from_chunks(cd, cp, np.arange(N_OP))
+        assert r["mask"].all()
+        assert np.isnan(r["frac_dopc"]).all()
+
+    def test_without_the_guard_it_would_have_read_as_exactly_one_half(self):
+        """Pin the arithmetic the guard exists to suppress."""
+        cd, cp = self._chunks({0: 100.0}, {0: 100.0})
+        r = _compute_enrichment_from_chunks(cd, cp, np.arange(N_OP))
+        raw = r["contacts_dopc"] / (r["contacts_dopc"] + r["contacts_popc"])
+        assert raw == pytest.approx(0.5)          # what used to be reported
+        assert np.isnan(r["frac_dopc"]).all()      # what is reported now
+
+    def test_one_species_with_real_contacts_still_counts(self):
+        """'Neither', not 'either' — POPC absent is a result, not missing data."""
+        cd, cp = self._chunks({3: 100.0}, {0: 100.0})
+        r = _compute_enrichment_from_chunks(cd, cp, np.arange(N_OP))
+        assert not r["mask"].any()
+        assert np.all(r["frac_dopc"] > 0.8)
+
+    def test_a_species_pinned_at_a_nonzero_cn_is_real_data(self):
+        """Single-bin occupancy is not itself the pathology: every frame having
+        exactly 5 DOPC and 1 POPC contact is the textbook no-preference case."""
+        centers = np.arange(6.0)
+        cd = [(np.array([[0.0] * N_OP] * 5 + [[100.0] * N_OP]), None, centers)]
+        cp = [(np.array([[0.0] * N_OP, [100.0] * N_OP] + [[0.0] * N_OP] * 4),
+               None, centers)]
+        r = _compute_enrichment_from_chunks(cd, cp, np.arange(N_OP))
+        assert not r["mask"].any()
+        assert r["enrich_dopc"] == pytest.approx(1.0)
+
+    def test_partial_occupancy_of_the_zero_bin_survives(self):
+        """Most frames uncontacted but some contacted is ordinary approach data."""
+        cd, cp = self._chunks({0: 990.0, 2: 10.0}, {0: 999.0, 1: 1.0})
+        r = _compute_enrichment_from_chunks(cd, cp, np.arange(N_OP))
+        assert not r["mask"].any()

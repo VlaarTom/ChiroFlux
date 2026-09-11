@@ -36,6 +36,7 @@ def test_documented_entry_points_are_importable():
         ("neighbours", "neighbours"),
         ("sasa", "sasa"),
         ("sasa_compare", "sasa_compare"),
+        ("preference_compare", "preference_compare"),
         ("shap_analysis", "shap_ml"),
         ("shap_analysis_ld", "shap_enantiomer"),
         ("statistical_analysis", "statistics"),
@@ -61,6 +62,7 @@ def test_cli_registry_covers_every_entry_point():
         ("neighbours", "neighbours"),
         ("sasa", "sasa"),
         ("sasa_compare", "sasa_compare"),
+        ("preference_compare", "preference_compare"),
         ("shap_analysis", "shap_ml"),
         ("shap_analysis_ld", "shap_enantiomer"),
         ("statistical_analysis", "statistics"),
@@ -234,6 +236,7 @@ PANELLED_COMMANDS = [
     ("neighbours", "neighbours"),
     ("sasa", "sasa"),
     ("sasa_compare", "sasa_compare"),
+    ("preference_compare", "preference_compare"),
     ("shap_analysis", "shap_ml"),
     ("shap_analysis_ld", "shap_enantiomer"),
     ("statistical_analysis", "statistics"),
@@ -327,7 +330,7 @@ def test_histograms_exposes_the_settings_that_differed_between_copies():
     names = set(inspect.signature(histograms).parameters)
     # "ranges" covers what -op-range used to patch: the whole binning table is
     # now an input file, so no histogram range needs a code edit.
-    for setting in ("out_dir", "ranges", "other_cv_dir",
+    for setting in ("out_dir", "ranges", "other_dir",
                     "other_weights", "correction_apply_to"):
         assert setting in names, f"{setting} is not settable from the CLI"
 

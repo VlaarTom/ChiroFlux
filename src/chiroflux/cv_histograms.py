@@ -682,7 +682,7 @@ def load_and_sum_intermediates(group_key, col, kind="1d"):
         else (centers_x, centers_y, total_counts)
 
 
-def load_per_chunk_2d(group_key, col):
+def load_per_chunk_2d(group_key, col, root=None):
     """
     Load each chunk's 2D intermediate separately and return a list of
     (counts_2d, centers_x, centers_y) — one entry per chunk.
@@ -697,8 +697,11 @@ def load_per_chunk_2d(group_key, col):
     react, ens = group_key
     tag      = f"{react.replace('-', '')}_{ens}"
     safe_col = col.replace("/", "_").replace("\\", "_")
+    # `root` lets a caller read a *different* run's intermediates than the one
+    # this process is configured for, which is what comparing two simulations
+    # needs; default None keeps the module-global behaviour.
     pattern  = os.path.join(
-        INTERMEDIATE_DIR,
+        INTERMEDIATE_DIR if root is None else root,
         f"[0-9][0-9][0-9][0-9]__{tag}__2d__{safe_col}.npz"
     )
     npz_files = sorted(glob.glob(pattern))
@@ -988,6 +991,13 @@ DOPC_POPC_PAIRS = [
     ("O_CC2_l_DOPC",    "O_CC2_l_POPC",     "O_CC2_l_lower"),
     ("O_CC3_u_DOPC",    "O_CC3_u_POPC",     "O_CC3_u_upper"),
     ("O_CC3_l_DOPC",    "O_CC3_l_POPC",     "O_CC3_l_lower"),
+    # Whole-lipid coordination numbers: every atom of each species within
+    # 5 A of the permeant, divided by that species' atoms per lipid. The most
+    # direct preference measure of the set, since it does not privilege one
+    # marker atom. It carries no leaflet split and needs none — a permeant
+    # that only ever reaches one leaflet makes the whole-system count the
+    # near-leaflet count.
+    ("DOPC",            "POPC",             "whole_lipid"),
 ]
 
 
@@ -1031,13 +1041,20 @@ def _compute_enrichment_from_chunks(chunks_dopc, chunks_popc, lamb_centers):
     n_lamb = len(lamb_centers)
     acc = {k: np.zeros(n_lamb, dtype=np.float64) for k in
            ("contacts_dopc", "contacts_popc", "frames_dopc", "frames_popc")}
+    above_zero_bin = {}
 
-    for chunks, c_key, f_key in ((chunks_dopc, "contacts_dopc", "frames_dopc"),
-                                 (chunks_popc, "contacts_popc", "frames_popc")):
+    for chunks, key in ((chunks_dopc, "dopc"), (chunks_popc, "popc")):
+        total_2d = np.zeros((0, n_lamb))
         for c2d, _, cn_centers in chunks:
+            arr = np.nan_to_num(np.asarray(c2d, dtype=np.float64))
+            total_2d = arr.copy() if total_2d.size == 0 else total_2d + arr
             cn = np.asarray(cn_centers, dtype=np.float64)[:, np.newaxis]
-            acc[c_key] += np.nansum(c2d * cn, axis=0)
-            acc[f_key] += np.nansum(c2d, axis=0)
+            acc[f"contacts_{key}"] += np.sum(arr * cn, axis=0)
+            acc[f"frames_{key}"] += np.sum(arr, axis=0)
+        above_zero_bin[key] = (
+            (total_2d[1:] > 0).any(axis=0) if total_2d.shape[0] > 1
+            else np.zeros(n_lamb, dtype=bool)
+        )
 
     frames = acc["frames_dopc"] + acc["frames_popc"]
     peak   = np.nanmax(frames) if frames.size else 0.0
@@ -1046,6 +1063,20 @@ def _compute_enrichment_from_chunks(chunks_dopc, chunks_popc, lamb_centers):
     contacts = acc["contacts_dopc"] + acc["contacts_popc"]
     # A bin with no contacts of either species has no fraction to report.
     mask = mask | ~(contacts > 0)
+
+    # When NEITHER species has any weight outside the lowest CN bin, there are
+    # no contacts here to apportion. The check above misses this whenever that
+    # bin's centre is not exactly zero (it is 0.05 for these columns): the first
+    # moment becomes 0.05 x frame weight for both species, the frame weights are
+    # identical because both share the same frames, and frac_DOPC comes out at
+    # exactly 0.5. That is not a 50/50 contact split, it is an empty column —
+    # what a run that never touches this leaflet produces — and it looks like a
+    # clean flat line at E_POPC = 3.0 rather than like missing data.
+    #
+    # Deliberately "neither", not "either": a species genuinely pinned at a
+    # *non-zero* coordination number is real data, so an OP bin where every
+    # frame has, say, 5 DOPC and 1 POPC contact must survive.
+    mask = mask | ~(above_zero_bin["dopc"] | above_zero_bin["popc"])
 
     with np.errstate(invalid="ignore", divide="ignore"):
         frac_dopc   = np.where(~mask, acc["contacts_dopc"] / contacts, np.nan)

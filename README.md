@@ -60,6 +60,7 @@ chiroflux COMMAND --help
 | `histograms` | Weighted CV histograms, statistics and 2D maps over a path ensemble, optionally merging a second simulation onto a common OP axis. Requires a `-ranges` file (see below). |
 | `sasa` | Weighted solvent-accessible surface area profile across the membrane, from a Shrake–Rupley construction on the trajectories. Requires a `-runs` file (see below). |
 | `membrane-spatial` | Spatial membrane structure around the permeant: radial/z maps, curvature, local thickness and bonded metrics. |
+| `preference-compare` | Difference the DOPC/POPC contact preference of two simulations along the OP, with a bootstrapped CI on the difference. |
 | `neighbours` | Lipid neighbour composition around the permeant per membrane slab, with bootstrap enrichment statistics against bulk composition. |
 | `shap-ml` | Fits WHAM-weighted classifiers (random forest, logistic regression, gradient boosting, LightGBM, SVM) per interface and explains them with SHAP. |
 | `shap-enantiomer` | Same, but the label is *which of two simulations* a path came from. |
@@ -580,6 +581,66 @@ simulations' files and re-run `generate-cvs`.
 The old shell recipe also hardcodes `ZMID=4.06` nm where the actual mean
 headgroup plane is 3.87 nm; `leaflet-index` computes the midplane from the
 structure, and takes `-midplane` if you need to pin it.
+
+### Comparing the lipid preference of two runs
+
+`preference-compare` differences `frac_DOPC(OP_Lamb)` between two simulations.
+Two things make this less obvious than it looks.
+
+**The enrichment curves cannot be differenced directly.** Since
+`frac_POPC = 1 - frac_DOPC` and `E = frac/F`, the two are locked together as
+`E_POPC = 6 - 5*E_DOPC` — the same number drawn twice, on lever arms that
+differ fivefold. E_DOPC lives in [0, 1.20] and E_POPC in [0, 6.00], so one
+observation ("DOPC takes 66% of contacts where its abundance predicts 83%")
+reads as *E_DOPC = 0.795, just under 1* and *E_POPC = 2.02, doubly enriched*.
+Differencing either inherits that distortion. `frac_DOPC` is the one free
+quantity and the only undistorted scale, so that is what is compared.
+
+**A leaflet a run never touches does not read as blank.** A permeant entering
+from below has empty `*_u_*` columns; all their weight sits in the lowest CN
+bin, the first moment collapses to (bin centre 0.05) x (frame weight), the
+frame weights cancel between the species, and `frac_DOPC` comes out at exactly
+0.5 in every bin — a clean flat line at `E_POPC = 3.0`. Pairing two runs by
+like-named label therefore compares real data against a fabrication, and
+differencing two empty columns gives exactly zero, which reads as perfect
+agreement.
+
+`-leaflet-l`/`-leaflet-d` declare which leaflet each run contacts, and pairs
+are matched on the contact-type name, so L's `CA_C2_l_DOPC` is compared with
+D's `CA_C2_u_DOPC` under the name `CA_C2`. The name drops the species as well
+as the leaflet: every pair *is* a DOPC-against-POPC comparison, so a trailing
+`_DOPC` in a file name or a row label would suggest a DOPC-only quantity.
+Degenerate bins are masked rather than counted as agreement. Both runs must
+have been through `chiroflux histograms` first, since this reads their
+per-chunk `intermediates/`.
+
+There are 17 comparisons: 16 marker-atom contact types, plus `whole_lipid`
+from the plain `DOPC`/`POPC` columns (every atom of a species within 5 A of
+the permeant, over that species' atoms per lipid). That last one is the most
+direct preference measure of the set, since it privileges no marker atom, and
+it carries no leaflet split — none is needed, because a permeant that only
+reaches one leaflet makes the whole-system count the near-leaflet count.
+
+Note that the *signed* chirality CVs (`PRO_hCN_*`, `PRO_nCos_*`) cannot join
+this table: an enrichment ratio needs a non-negative contact count and those
+are 40-43% negative, so `frac = D/(D+P)` is undefined for them. `PRO_rMin_*`
+is excluded for a different reason — it is a distance, not a count. Those
+belong in `shap-enantiomer`.
+
+```bash
+chiroflux preference-compare \
+  -dir-l L/analysis_output -dir-d D/analysis_output \
+  -label-l L -label-d D \
+  -leaflet-l lower -leaflet-d upper \
+  -paths reactive -ensemble plus
+```
+
+The confidence interval comes from resampling chunks in *both* runs inside one
+loop, so it is an interval on the difference rather than two independent
+intervals combined after the fact. Measured false-positive rate under a true
+null is 5.3% at 40 chunks against a nominal 5%, rising to 8.3% at 10 chunks —
+the usual mild over-rejection of a percentile bootstrap with few resampling
+units, worth remembering for a run with few chunks.
 
 ### `PRO_ang_OH` measures the wrong angle
 

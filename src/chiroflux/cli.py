@@ -63,6 +63,11 @@ _COMMANDS = {
         "sasa",
         "Weighted solvent-accessible surface area profile across the membrane.",
     ),
+    "preference-compare": _Command(
+        "preference_compare",
+        "preference_compare",
+        "Difference the DOPC/POPC contact preference of two simulations.",
+    ),
     "sasa-compare": _Command(
         "sasa_compare",
         "sasa_compare",
