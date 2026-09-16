@@ -63,6 +63,11 @@ _COMMANDS = {
         "sasa",
         "Weighted solvent-accessible surface area profile across the membrane.",
     ),
+    "permeation": _Command(
+        "permeation_process",
+        "permeation_process",
+        "Permeability from the solubility-diffusion resistance integral.",
+    ),
     "preference-compare": _Command(
         "preference_compare",
         "preference_compare",

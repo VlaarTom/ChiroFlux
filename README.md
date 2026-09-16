@@ -60,6 +60,7 @@ chiroflux COMMAND --help
 | `histograms` | Weighted CV histograms, statistics and 2D maps over a path ensemble, optionally merging a second simulation onto a common OP axis. Requires a `-ranges` file (see below). |
 | `sasa` | Weighted solvent-accessible surface area profile across the membrane, from a Shrake–Rupley construction on the trajectories. Requires a `-runs` file (see below). |
 | `membrane-spatial` | Spatial membrane structure around the permeant: radial/z maps, curvature, local thickness and bonded metrics. |
+| `permeation` | Permeability from the inhomogeneous solubility-diffusion model: free energy and local diffusion combined into a resistance integral. |
 | `preference-compare` | Difference the DOPC/POPC contact preference of two simulations along the OP, with a bootstrapped CI on the difference. |
 | `neighbours` | Lipid neighbour composition around the permeant per membrane slab, with bootstrap enrichment statistics against bulk composition. |
 | `shap-ml` | Fits WHAM-weighted classifiers (random forest, logistic regression, gradient boosting, LightGBM, SVM) per interface and explains them with SHAP. |
@@ -581,6 +582,187 @@ simulations' files and re-run `generate-cvs`.
 The old shell recipe also hardcodes `ZMID=4.06` nm where the actual mean
 headgroup plane is 3.87 nm; `leaflet-index` computes the midplane from the
 structure, and takes `-midplane` if you need to pin it.
+
+### Per-path output of `membrane-spatial`
+
+Each path's results go into **one** compressed file, `Memb_OP/<path>.npz`. It
+used to be seven CSVs plus a spatial `.npz` per path — 80,000 files at 10,000
+paths. Measured with the real column counts and a path that visits ~20% of the
+depth range:
+
+```
+                         per path        at 10,000 paths
+7 CSVs + spatial.npz     3.1 MB, 8 files     ~31 GB, 80,000 files
+one .npz                 0.9 MB, 1 file       ~9 GB, 10,000 files
+```
+
+Reading all seven tables back takes 3.6 ms per path against ~40 ms for the
+CSVs. The spatial maps are now ~90% of the file (342 accumulators × 10 depth
+bins × 169 grid points, as sums and weights); the tables are ~80 kB.
+
+Each table is stored as three members — `<table>__columns`, `<table>__axis`
+(float64, since the axis is matched across paths) and `<table>__data`
+(float32) — and the spatial accumulators are stacked into
+`spatial__wsum`/`spatial__wcount` of shape (observables, depth, grid). Stacking
+matters: storing one member per column made the file *slower* to read than the
+CSVs. float32 is not a precision loss against the old files, which were written
+with `%.6e` (7 significant digits, what float32 holds).
+
+A run that only recomputes some groups merges them into the existing file, so
+`-overwrite`-free reruns still skip what is done. Files are written through a
+temporary name and renamed, so a killed worker never leaves a truncated file.
+Files in the old CSV layout are ignored — the run says how many it found — and
+can be deleted. Read one path back with
+`membrane_spatial.read_path_tables(path)` / `read_path_spatial(path)`.
+
+### Local diffusion along the normal
+
+`membrane-spatial` writes `diffusion_aggregate.csv`: `D_z`,
+its block-jackknife `_err`/`_neff`, and `D_z_lag2`. The estimate is the
+short-time limit of the mean squared displacement, taken over the windows that
+**start** in each slab,
+
+    D(z) = < [z(t+tau) - z(t)]^2 >_{z(t) in slab} / (2 tau)
+
+with `tau` set by `-lag-frames` (default 1 frame). The axis is
+`membrane_z - permeant_z`, the permeant's depth relative to the bilayer centre
+— the same coordinate as the order parameter, which is why `permeation` needs
+no conversion. `-slab-range` fixes the grid (default `-40,40`) and should stay
+fixed: the per-path CSVs are pooled bin by bin, so every path has to be on the
+same grid.
+
+**Why it is binned by the starting position.** An earlier version cut each path
+into *sojourns* — runs of consecutive frames in one slab — and fitted D to
+each. That conditions the sample on the permeant not leaving, which keeps the
+slowest excursions and throws the rest away, and it bites hardest where the
+motion is fastest. Measured on a Brownian walk of known D, 1 A slabs, dt = 1 ps:
+
+```
+                         slow region (D=0.05)   fast region (D=0.30)   ratio
+sojourns, >=5 frames            66%                    22%             0.49
+start-binned windows           100%                   100%             0.167   (true 0.167)
+```
+
+So it was not only ~3x low, it compressed a true 6:1 contrast in D(z) to 2:1.
+The sojourn scheme could be rescued by widening the slabs to about six times
+the rms per-frame step, but the start-binned windows need no such tuning and
+are correct at 1 A. `-min-slab-points` and `-max-lag-ps` are gone with it; the
+latter never did anything anyway, since the R^2 window scan it fed always
+returned the single-lag fit.
+
+**Check `D_z_lag2` before trusting `D_z`.** It is the same estimator at twice
+the lag. In the diffusive regime the two agree; where they do not, the motion
+is not yet diffusive at the frame spacing and no single D describes it. The
+Hummer position-autocorrelation estimate that used to sit in this file has been
+removed: it is correct only for confined sampling (verified against an
+Ornstein-Uhlenbeck process, 0.196 against 0.200 true), and a slab sojourn is
+not that — in the same test it read 49% of the truth at 1 A slabs and 230% at
+4 A, with no width in between where it was right.
+
+`D` scales as `1/dt`, and `dt` is read from the first trajectory's own header;
+`-dt` overrides it if that header is wrong.
+
+### Permeability from the resistance integral
+
+`permeation` is the Marrink-Berendsen route (J. Phys. Chem. 100 (1996) 16729)
+to the number RETIS also computes:
+
+    1/P = integral of exp(beta dG(z)) / D(z) dz
+
+It rests on different assumptions from path sampling - overdamped, Markovian
+motion along z. Both inputs already exist: the staged WHAM histograms, and
+`D(z)` from `membrane-spatial`'s `diffusion_aggregate.csv` (column `D_z`, in
+A^2/ps).
+
+```bash
+chiroflux permeation \
+  -runs infinit_entry,infinit_internal,infinit_escape \
+  -diffusion membrane_plots/diffusion_aggregate.csv
+```
+
+`-runs` takes the run directories in order along the permeation coordinate and
+reads everything referencing needs from each one's `wham/` folder:
+`histo_probability.txt` (with `lA`/`lB` on its header line), the last row of
+`Pcross.txt` and the cycle counter in `runav_rate.txt`. Nothing is typed in by
+hand.
+
+**The stages are conditional histograms, and they are combined as histograms.**
+Stage k (entry, internal or escape) says where the permeant is *given that it started at that stage's own
+state A*, so putting it on stage 1's scale costs a factor per junction:
+
+    factor_(k+1) / factor_k = (N_k / N_(k+1)) * (P_k^+ / P_(k+1)^-)
+
+with `P_k^+` stage k's total crossing probability, `P_(k+1)^-` the probability
+of escaping backward out of stage k+1's state A, and `N` the total number of paths.
+Call the three stages **A** (entry), **M** (internal) and **B** (escape) — each
+letter names a *run*, so `P_A` is the entry run's own total crossing
+probability — and the chain writes out as
+
+    factor_M = N_A * (P_A / P_M_min) / N_M
+    factor_B = N_A * (P_A / P_M_min) * (P_M / P_B_min) / N_B
+
+which is the escape correction `cv_histograms` applies (C and D there for M
+and B). The backward probabilities are not simulated directly, but in a
+symmetric bilayer they are the mirrored runs — reversing `[lA_k, lB_k]` is
+traversing `[-lB_k, -lA_k]` forwards — so they are looked up among the stages by
+their own interfaces: `P_B_min` is the escape run and `P_M_min` the internal
+run, which is its own mirror, so `P_M / P_M_min` is simply 1.
+`-pcross-back` overrides the lookup if the staging is not symmetric.
+If the histograms were made with the WHAM weights, the number of paths`N` is
+already taken into account and can be set to 1.
+
+The factor multiplies the **histogram**, not the free energy: each stage is
+scaled, cut below its own `lA` and added, and `-ln` is taken once at the end.
+That is what lets the counts pool instead of having to splice profiles.
+
+**`-symmetrize` is on by default.** A forward histogram
+is biased by its own conditioning - on its own it climbs to `-ln(P_tot)` by its
+target state, so the forward stages alone step by ~8 kT at each junction.
+Adding the combined histogram to its mirror image about z = 0 hands every
+region its backward histogram: A mirrored is the B region run backwards, M
+mirrored is M itself reversed, and B mirrored is the A region run backwards.
+Forward + backward is the unbiased density. That reproduces the D-proline
+profile these runs are usually quoted with: minima of -2.1 kT at the two
+interfaces and a barrier at the midplane. Turn it off only for a genuinely
+asymmetric membrane, and expect the junctions to show.
+
+**Check the stitching before the number.** With `-runs`, the command also writes
+`stitching.png` and `stitching.csv`. The top panel shows each stage exactly as
+it enters the sum (after its factor and its cut), with the mirror term and the
+total. The bottom panel shows the free energy of the forward sum alone next to
+the symmetrised total, on the full range, with the free-energy step across
+every junction annotated in kT (also printed). On the D-proline stages the
+forward sum alone steps by −8.0 and −12.7 kT at ±13.5 Å, and the total by
+−0.01 and +0.01 kT.
+
+**The diffusion axis needs no conversion.** `membrane-spatial` bins the
+permeant on the z-displacement i.e. the order-parameter coordinate itself,
+not lab-frame z — so its `slab_center` is already on the free energy's axis and
+the defaults (`-midplane 0 -no-flip`) leave it alone. `-midplane`/`-flip` are
+for a diffusion profile that really is on lab z, and `-midplane auto` measures
+that offset from the CV trajectories: every frame reports both the order
+parameter and the permeant's own z, and `op = ±(z_lab - midplane)`, so
+averaging `z_lab ∓ op` gives it. The regression slope throws in the rest — its
+sign settles `-flip`, its magnitude says whether the CV files write z in nm
+(~0.1) or Angstrom (~1). On the reference data that is 37.689 A from 60 paths
+and 154k frames, with a 1.1 A frame-to-frame spread.
+
+Either way the mapping checks itself: get it wrong and the resistance peak
+lands away from the free-energy barrier.
+
+**Read the resistance profile, not just the scalar.** Because dG enters
+exponentially, the integral is dominated by a few angstroms near the barrier,
+which is also where D is worst determined. The bottom panel of
+`permeation_profile.png` gives the cumulative resistance and the summary says
+how narrow the dominant region is; if 90% of the resistance comes from three
+bins, P is a statement about those three bins. The reported 95% interval
+propagates the uncertainty on D only, so it is a lower bound on the total. A
+profile that does not span the membrane gives a partial integral, which
+underestimates 1/P and so **overestimates** P - the command says so.
+
+`-fe` remains for a free-energy profile you already have; staged profiles given
+that way need their crossing probabilities with `-pcross`, which shifts them by
+`-sum ln(P_tot,j)` and warns if they are missing. Prefer `-runs`.
 
 ### Comparing the lipid preference of two runs
 

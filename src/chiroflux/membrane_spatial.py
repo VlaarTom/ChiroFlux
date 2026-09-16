@@ -2,6 +2,8 @@ import os
 
 os.environ["OMP_NUM_THREADS"] = "1"
 import traceback
+import warnings
+import zipfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,7 +16,6 @@ import pandas as pd
 import tomli
 import typer
 from MDAnalysis.analysis import distances
-from scipy.integrate import trapezoid
 from scipy.interpolate import RBFInterpolator
 from scipy.spatial import cKDTree
 
@@ -988,19 +989,6 @@ def _make_spatial_accumulators(M, chain_bonds, lipid_resnames=('DOPC', 'POPC'),
     return acc
 
 
-def _save_spatial_accumulators(accumulators, x_coords, y_coords, depth_edges,
-                               npz_path):
-    arrays = {
-        'x_coords'   : x_coords,
-        'y_coords'   : y_coords,
-        'depth_edges': np.asarray(depth_edges, dtype=float),
-    }
-    for name, (wsum, wcount) in accumulators.items():
-        arrays[name]             = wsum      # (n_depth, M)
-        arrays[name + '_wcount'] = wcount
-    np.savez_compressed(str(npz_path), **arrays)
-
-
 def _regrid_map(src_x, src_y, src_2d, dst_x, dst_y):
     from scipy.interpolate import RegularGridInterpolator
     interp = RegularGridInterpolator(
@@ -1023,86 +1011,89 @@ def _depth_edges_of(data):
 
 
 def aggregate_spatial_maps(path_start, path_end, weights):
-    ref_x     = None
-    ref_y     = None
-    ref_depth = None
-    agg_acc   = None
-    obs_keys  = None
+    """Pool every path's spatial accumulators onto the first path's grid.
+
+    The accumulators are stacked (n_observables, n_depth, M) in the per-path
+    file, so paths on the reference grid are added in one operation each;
+    only a path on a different lateral grid falls back to regridding the
+    observables one depth bin at a time.
+    """
+    ref = None
+    agg_wsum = agg_wcnt = None
+    no_file = bad_depth = 0
 
     for pn in range(path_start, path_end + 1):
         if pn not in weights:
             continue
-        npz_path = Path(ORDER_OUT) / f"{pn}_spatial.npz"
-        if not npz_path.exists():
-            print(f"  [spatial-agg] {npz_path.name} not found, skipping.")
+        sp = read_path_spatial(path_output_file(pn))
+        if sp is None:
+            no_file += 1
             continue
 
-        data     = np.load(str(npz_path))
-        px       = data['x_coords']
-        py       = data['y_coords']
-        p_depth  = _depth_edges_of(data)
-
-        if ref_x is None:
-            ref_x     = px
-            ref_y     = py
-            ref_depth = p_depth
-            obs_keys  = [k for k in data.files
-                         if k not in ('x_coords', 'y_coords', 'depth_edges')
-                         and not k.endswith('_wcount')]
-            M_ref   = len(ref_x) * len(ref_y)
-            D_ref   = len(ref_depth) - 1
-            agg_acc = {k: [np.zeros((D_ref, M_ref)), np.zeros((D_ref, M_ref))]
-                       for k in obs_keys}
+        if ref is None:
+            ref = sp
+            ref_index = {name: i for i, name in enumerate(sp['names'])}
+            agg_wsum = np.zeros_like(sp['wsum'])
+            agg_wcnt = np.zeros_like(sp['wcount'])
 
         # Depth bins are derived deterministically from --slab-range and
         # --n-depth-bins, so a mismatch means the path was produced by a
         # different invocation. Pooling those would silently mix depths;
         # skip instead of interpolating along a coarse, physical axis.
-        if (len(p_depth) != len(ref_depth)
-                or not np.allclose(p_depth, ref_depth, atol=1e-6,
-                                   equal_nan=True)):
-            print(f"  [spatial-agg] {npz_path.name} has incompatible depth "
-                  f"bins ({len(p_depth) - 1} vs {D_ref}), skipping.")
+        p_depth, r_depth = sp['depth_edges'], ref['depth_edges']
+        if (len(p_depth) != len(r_depth)
+                or not np.allclose(p_depth, r_depth, atol=1e-6, equal_nan=True)):
+            bad_depth += 1
             continue
 
+        if sp['names'] == ref['names']:
+            src_idx = dst_idx = slice(None)
+        else:
+            common = [n for n in sp['names'] if n in ref_index]
+            lookup = {name: i for i, name in enumerate(sp['names'])}
+            src_idx = [lookup[n] for n in common]
+            dst_idx = [ref_index[n] for n in common]
+
+        px, py = sp['x_coords'], sp['y_coords']
+        rx, ry = ref['x_coords'], ref['y_coords']
         same_grid = (
-            len(px) == len(ref_x) and len(py) == len(ref_y)
-            and np.allclose(px, ref_x, atol=0.01)
-            and np.allclose(py, ref_y, atol=0.01)
+            len(px) == len(rx) and len(py) == len(ry)
+            and np.allclose(px, rx, atol=0.01)
+            and np.allclose(py, ry, atol=0.01)
         )
 
-        for key in obs_keys:
-            wk, wck = key, key + '_wcount'
-            if wk not in data or wck not in data:
-                continue
+        if same_grid:
+            agg_wsum[dst_idx] += sp['wsum'][src_idx]
+            agg_wcnt[dst_idx] += sp['wcount'][src_idx]
+            continue
 
-            src_wsum = np.atleast_2d(data[wk])      # (D, M)
-            src_wcnt = np.atleast_2d(data[wck])
+        src_shape = (len(px), len(py))
+        src_list = (range(len(sp['names'])) if isinstance(src_idx, slice)
+                    else src_idx)
+        dst_list = (range(len(sp['names'])) if isinstance(dst_idx, slice)
+                    else dst_idx)
+        for si, di in zip(src_list, dst_list):
+            for d in range(agg_wsum.shape[1]):
+                w_d = sp['wsum'][si, d].reshape(src_shape)
+                c_d = sp['wcount'][si, d].reshape(src_shape)
+                with np.errstate(invalid='ignore', divide='ignore'):
+                    src_avg = np.where(c_d > 0, w_d / c_d, np.nan)
+                dst_avg = _regrid_map(px, py, src_avg, rx, ry).ravel()
+                dst_cnt = _regrid_map(px, py, c_d, rx, ry).ravel()
+                valid = np.isfinite(dst_avg) & (dst_cnt > 0)
+                agg_wsum[di, d][valid] += dst_avg[valid] * dst_cnt[valid]
+                agg_wcnt[di, d][valid] += dst_cnt[valid]
 
-            if same_grid:
-                agg_acc[key][0] += src_wsum.reshape(D_ref, M_ref)
-                agg_acc[key][1] += src_wcnt.reshape(D_ref, M_ref)
-            else:
-                src_shape = (len(px), len(py))
-                for d in range(D_ref):
-                    w_d = src_wsum[d].reshape(src_shape)
-                    c_d = src_wcnt[d].reshape(src_shape)
+    if ref is None:
+        raise RuntimeError("No spatial maps found to aggregate.")
+    if no_file or bad_depth:
+        print(f"  [spatial-agg] skipped {no_file} path(s) without spatial maps "
+              f"and {bad_depth} with incompatible depth bins.")
 
-                    with np.errstate(invalid='ignore', divide='ignore'):
-                        src_avg = np.where(c_d > 0, w_d / c_d, np.nan)
-
-                    dst_avg = _regrid_map(px, py, src_avg, ref_x, ref_y)
-                    dst_cnt = _regrid_map(px, py, c_d,     ref_x, ref_y)
-
-                    valid = np.isfinite(dst_avg.ravel()) & (dst_cnt.ravel() > 0)
-                    agg_acc[key][0][d][valid] += (dst_avg.ravel()[valid]
-                                                  * dst_cnt.ravel()[valid])
-                    agg_acc[key][1][d][valid] += dst_cnt.ravel()[valid]
-
-    if agg_acc is None:
-        raise RuntimeError("No spatial map .npz files found to aggregate.")
-
-    return (agg_acc, ref_x, ref_y, (len(ref_x), len(ref_y)), ref_depth)
+    agg_acc = {name: [agg_wsum[i], agg_wcnt[i]]
+               for i, name in enumerate(ref['names'])}
+    rx, ry = ref['x_coords'], ref['y_coords']
+    return (agg_acc, rx, ry, (len(rx), len(ry)), ref['depth_edges'])
 
 
 def save_spatial_maps(accumulators, grid_shape, x_coords, y_coords,
@@ -1270,71 +1261,64 @@ def load_spatial_maps(npz_path, depth=None, depth_weights=None):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Diffusion helpers (unchanged)
+# Local diffusion along the bilayer normal
 # ═════════════════════════════════════════════════════════════════════════════
-
-def _short_time_msd(z_series, dt, max_lag_steps):
-    N    = len(z_series)
-    lags = np.arange(1, max_lag_steps + 1, dtype=float) * dt
-    msd  = np.full(max_lag_steps, np.nan)
-    for k in range(1, max_lag_steps + 1):
-        diffs = z_series[k:] - z_series[:-k]
-        if len(diffs) > 0:
-            msd[k - 1] = np.mean(diffs ** 2)
-    return lags, msd
-
-
-def _position_autocorrelation_D(z_series, dt):
-    if len(z_series) < 4:
-        return np.nan
-    dz      = z_series - z_series.mean()
-    var     = np.mean(dz ** 2)
-    if var < 1e-12:
-        return np.nan
-    N       = len(dz)
-    fft_z   = np.fft.rfft(dz, n=2 * N)
-    acf_raw = np.fft.irfft(fft_z * np.conj(fft_z))[:N]
-    acf_raw /= (np.arange(N, 0, -1))
-    C        = acf_raw / acf_raw[0]
-
-    zero_cross = np.where(C <= 0)[0]
-    cutoff     = zero_cross[0] if len(zero_cross) > 0 else N
-    integral   = trapezoid(C[:cutoff], dx=dt)
-
-    if integral < 1e-12:
-        return np.nan
-    return float(var / integral)
+#
+# D(z) is the short-time limit of the mean squared displacement of the
+# permeant, taken among the frames that *start* in a slab:
+#
+#     D(z) = < [z(t+tau) - z(t)]^2 >_{z(t) in slab} / (2 tau)
+#
+# The binning is by the starting position and nothing else. An earlier version
+# instead cut the trajectory into "sojourns" - runs of consecutive frames in
+# the same slab - and estimated D from each. That conditions the sample on the
+# permeant *not leaving*, which keeps the slowest excursions and throws the
+# rest away, and it does so hardest where the motion is fastest. On a Brownian
+# walk of known D with 1 A slabs it recovered 31% of the true D in a fast
+# region and 66% in a slow one, flattening a true 6:1 contrast between them to
+# 2:1. The start-binned windows below recover both to 100% on the same test.
+#
+# `lag` is in frames. One frame is the right default: the estimator wants the
+# shortest lag that is already diffusive, and a longer one only smears D over
+# the +/- sqrt(2 D tau) the permeant wanders in the meantime. The lag-2 value
+# is accumulated alongside as a diagnostic - in the diffusive regime the two
+# agree, and they part company where the motion is not yet diffusive at the
+# frame spacing.
 
 
-def _estimate_sojourn_D(z_run, _dt, max_lag_steps):
-    D_ein = np.nan
-    lag_steps = min(max_lag_steps, len(z_run) - 1)
-    if lag_steps >= 1:
-        lags, msd = _short_time_msd(z_run, _dt, lag_steps)
-        best_D  = np.nan
-        best_r2 = -np.inf
-        for k in range(1, lag_steps + 1):
-            sub_lag = lags[:k]
-            sub_msd = msd[:k]
-            if np.any(np.isnan(sub_msd)):
-                continue
-            slope = np.dot(sub_lag, sub_msd) / np.dot(sub_lag, sub_lag)
-            resid = sub_msd - slope * sub_lag
-            ss_res = np.dot(resid, resid)
-            ss_tot = np.dot(sub_msd - sub_msd.mean(),
-                            sub_msd - sub_msd.mean()) + 1e-30
-            r2 = 1.0 - ss_res / ss_tot
-            if r2 > best_r2:
-                best_r2 = r2
-                best_D  = slope / 2.0
-        if np.isfinite(best_D) and best_D > 0:
-            D_ein = best_D
+def slab_binned_msd(series, slab_idx, n_slabs, lag):
+    """(sum of squared displacement, window count) per starting slab.
 
-    D_hum = _position_autocorrelation_D(z_run, _dt)
-    if not (np.isfinite(D_hum) and D_hum > 0):
-        D_hum = np.nan
+    `series` is (N,) for the normal or (N, 2) for the lateral plane; the
+    squared displacement sums over the trailing axis either way. Windows are
+    every consecutive pair `lag` frames apart, binned by where they started.
+    """
+    series = np.asarray(series, dtype=float)
+    n_frames = series.shape[0]
+    total = np.zeros(n_slabs)
+    count = np.zeros(n_slabs)
+    if lag < 1 or n_frames <= lag:
+        return total, count
 
-    return D_ein, D_hum
+    delta = series[lag:] - series[:-lag]
+    squared = delta ** 2 if delta.ndim == 1 else np.sum(delta ** 2, axis=1)
+    start = np.asarray(slab_idx[:-lag], dtype=int)
+
+    np.add.at(total, start, squared)
+    np.add.at(count, start, 1.0)
+    return total, count
+
+
+def diffusion_from_msd(total, count, lag, dt, n_dim=1):
+    """D per slab from accumulated squared displacements, in A^2/ps.
+
+    MSD = 2 n_dim D t, so D = <dz^2> / (2 n_dim tau). Empty slabs come back
+    NaN rather than zero - no windows is not a measurement of zero mobility.
+    """
+    denominator = 2.0 * n_dim * lag * dt
+    with np.errstate(invalid='ignore', divide='ignore'):
+        return np.where(count > 0, total / (denominator * np.maximum(count, 1.0)),
+                        np.nan)
 
 
 def _unwrap_xy_pbc(raw_xy, prev_xy, jump_xy, box_xy, cutoff=0.5):
@@ -1349,68 +1333,49 @@ def _unwrap_xy_pbc(raw_xy, prev_xy, jump_xy, box_xy, cutoff=0.5):
     return raw_xy + jump_xy
 
 
-def _msd_xy_from_series(xy_series, _dt, max_lag_steps):
-    xy  = np.asarray(xy_series, dtype=float)
-    N   = len(xy)
-    if N < 4:
-        return np.nan, np.nan, np.nan
-
-    lag_steps = min(max_lag_steps, N - 1)
-    lags      = np.arange(1, lag_steps + 1, dtype=float) * _dt
-    msd_xy    = np.full(lag_steps, np.nan)
-    for k in range(1, lag_steps + 1):
-        dr  = xy[k:] - xy[:-k]
-        msd_xy[k - 1] = np.mean(np.sum(dr ** 2, axis=1))
-
-    best_D  = np.nan
-    best_r2 = -np.inf
-    for k in range(1, lag_steps + 1):
-        sub_lag = lags[:k]
-        sub_msd = msd_xy[:k]
-        if np.any(np.isnan(sub_msd)):
-            continue
-        slope  = np.dot(sub_lag, sub_msd) / np.dot(sub_lag, sub_lag)
-        resid  = sub_msd - slope * sub_lag
-        ss_res = np.dot(resid, resid)
-        ss_tot = np.dot(sub_msd - sub_msd.mean(),
-                        sub_msd - sub_msd.mean()) + 1e-30
-        r2 = 1.0 - ss_res / ss_tot
-        if r2 > best_r2:
-            best_r2 = r2
-            best_D  = slope / 4.0
-    D_ein_xy = best_D if (np.isfinite(best_D) and best_D > 0) else np.nan
-
-    D_hum_x = _position_autocorrelation_D(xy[:, 0], _dt)
-    D_hum_y = _position_autocorrelation_D(xy[:, 1], _dt)
-    if not (np.isfinite(D_hum_x) and D_hum_x > 0):
-        D_hum_x = np.nan
-    if not (np.isfinite(D_hum_y) and D_hum_y > 0):
-        D_hum_y = np.nan
-
-    return D_ein_xy, D_hum_x, D_hum_y
-
-
 # ═════════════════════════════════════════════════════════════════════════════
 # Slab grid construction
 # ═════════════════════════════════════════════════════════════════════════════
 
 def build_slab_grid(topology, xtc_files, permeant_resname,
-                    bilayer_normal, slab_width, slab_range=None):
+                    bilayer_normal, slab_width, slab_range=None,
+                    lipid_resnames=('DOPC', 'POPC')):
+    """Slab edges and centres for the permeant-depth axis.
+
+    The axis is the same one the frame loop bins on,
+    ``membrane_z - permeant_z`` - the permeant's depth relative to the bilayer
+    centre, running the same way as the order parameter, not lab-frame z.
+
+    `slab_range` should normally be given and is what the CLI passes: the grid
+    has to be identical for every path, because the per-path CSVs are pooled
+    bin by bin afterwards, and a grid derived from one path's own sampling
+    would differ from the next path's. Deriving it is therefore a fallback
+    only, and it warns.
+    """
     axis = {'x': 0, 'y': 1, 'z': 2}[bilayer_normal.lower()]
     if slab_range is not None:
         z_min, z_max = float(slab_range[0]), float(slab_range[1])
     else:
-        all_z = []
+        warnings.warn(
+            "build_slab_grid: no slab_range given, so the grid is derived from "
+            "this path's own sampling. Different paths then get different "
+            "grids, which cannot be pooled bin by bin - pass -slab-range.",
+            stacklevel=2,
+        )
+        lipid_sel = " or ".join(f"resname {r}" for r in lipid_resnames)
+        depths = []
         for xtc in xtc_files:
             u = mda.Universe(topology, xtc, refresh_offsets=True)
             perm = u.select_atoms(f"resname {permeant_resname} and not name H*")
             if len(perm) == 0:
                 perm = u.select_atoms(f"resname {permeant_resname}")
+            membrane = u.select_atoms(lipid_sel)
             for _ts in u.trajectory:
-                all_z.append(perm.positions[:, axis].copy())
-        all_z = np.concatenate(all_z)
-        z_min = all_z.min() - slab_width
-        z_max = all_z.max() + slab_width
+                depths.append(membrane.positions[:, axis].mean()
+                              - perm.positions[:, axis].mean())
+        depths = np.asarray(depths, dtype=float)
+        z_min = depths.min() - slab_width
+        z_max = depths.max() + slab_width
     edges   = np.arange(z_min, z_max + slab_width, slab_width)
     centers = 0.5 * (edges[:-1] + edges[1:])
     return edges, centers
@@ -1489,58 +1454,228 @@ OBSERVABLE_GROUPS = {
     'spatial'      : ('spatial',),
 }
 
-_CSV_KEY_TO_GROUP = {
-    csv_key: group
-    for group, keys in OBSERVABLE_GROUPS.items()
-    for csv_key in keys
-}
+# ═════════════════════════════════════════════════════════════════════════════
+# Per-path output file
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# Everything one path produces goes into a single compressed Memb_OP/<n>.npz.
+# It used to be seven CSVs and a spatial .npz per path, and at the path counts
+# RETIS reaches that was the dominant cost of the analysis: ~1.4 MB and eight
+# files per path, 87% of the bytes being `0.000000e+00` written out as text,
+# since one path only visits a fraction of the membrane. The same content is
+# ~0.19 MB in one file and reads back ~10x faster at aggregation.
+#
+# Layout. Each table is stored as three members rather than one per column -
+# the zip overhead of ~1200 small members made a column-wise file *slower* to
+# read than the CSVs it replaced:
+#
+#     <key>__columns   names, the axis column first
+#     <key>__axis      the axis (slab_center, r_center, z_center), float64
+#     <key>__data      every other column, float32
+#
+# and the spatial accumulators are stacked the same way into
+# spatial__wsum / spatial__wcount of shape (n_observables, n_depth, M), with
+# spatial__names giving the order. float32 is not a precision loss against
+# what was there before: the CSVs were written with %.6e, 7 significant
+# digits, which is what float32 holds.
+#
+# Per-path granularity is kept on purpose. Workers write concurrently, each to
+# its own file; a missing or partial group is recomputed on its own and merged
+# into the file; and re-aggregating after the path weights change re-reads
+# every path, which one run-wide file would not make any cheaper.
+
+PATH_FILE_VERSION = 1
+
+_TABLE_KEYS = ('p2', 'tilt', 'thick', 'deform', 'water_z', 'diff', 'diff_xy')
 
 
-def _all_csv_paths(path_number):
-    base = Path(ORDER_OUT)
+def path_output_file(path_number, out_dir=None):
+    """The one file a path's results live in."""
+    return Path(out_dir if out_dir is not None else ORDER_OUT) / f"{path_number}.npz"
+
+
+def _pack_table(key, df):
     return {
-        'p2'     : base / f"{path_number}_p2.csv",
-        'tilt'   : base / f"{path_number}_tilt.csv",
-        'thick'  : base / f"{path_number}_thick.csv",
-        'deform' : base / f"{path_number}_deform.csv",
-        'water_z': base / f"{path_number}_water_z.csv",
-        'diff'   : base / f"{path_number}_diffusion.csv",
-        'diff_xy': base / f"{path_number}_diffusion_xy.csv",
-        'spatial': base / f"{path_number}_spatial.npz",
+        f'{key}__columns': np.array([str(c) for c in df.columns]),
+        f'{key}__axis'   : df.iloc[:, 0].to_numpy(dtype=np.float64),
+        f'{key}__data'   : df.iloc[:, 1:].to_numpy(dtype=np.float32),
     }
 
 
-def _has_near_columns(csvs, group, near_n):
+def _pack_spatial(accumulators, x_coords, y_coords, depth_edges):
+    names = list(accumulators)
+    if not names:
+        raise ValueError("No spatial accumulators to write.")
+    return {
+        'spatial__names'      : np.array(names),
+        'spatial__wsum'       : np.stack([np.atleast_2d(accumulators[n][0])
+                                          for n in names]).astype(np.float32),
+        'spatial__wcount'     : np.stack([np.atleast_2d(accumulators[n][1])
+                                          for n in names]).astype(np.float32),
+        'spatial__x_coords'   : np.asarray(x_coords, dtype=np.float64),
+        'spatial__y_coords'   : np.asarray(y_coords, dtype=np.float64),
+        'spatial__depth_edges': np.asarray(depth_edges, dtype=np.float64),
+    }
+
+
+def _open_path_output(path):
+    """np.load the file, or None if it is missing or unreadable.
+
+    Unreadable covers a file left behind by something other than
+    `write_path_output` - that writes through a temporary file and a rename,
+    so a killed worker leaves the previous file intact rather than a truncated
+    one.
     """
-    Peek at an existing CSV's header for the near-permeant columns expected
-    for every requested N. Guards against silently skipping recomputation
-    when the near-N feature is adopted on top of pre-existing per-path CSVs
-    written before that schema existed.
+    try:
+        return np.load(str(path))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, EOFError, zipfile.BadZipFile) as exc:
+        warnings.warn(f"{path}: unreadable ({exc}); treating it as absent.",
+                      stacklevel=3)
+        return None
+
+
+def path_output_contents(path):
+    """The table keys, plus 'spatial', that the file holds."""
+    data = _open_path_output(path)
+    if data is None:
+        return set()
+    with data:
+        files = set(data.files)
+    present = {key for key in _TABLE_KEYS if f'{key}__data' in files}
+    if 'spatial__wsum' in files:
+        present.add('spatial')
+    return present
+
+
+def write_path_output(path, tables=None, spatial=None, meta=None):
+    """Write a path's tables and spatial maps, merging into what is there.
+
+    `tables` maps table keys to DataFrames whose first column is the axis;
+    `spatial` is (accumulators, x_coords, y_coords, depth_edges); `meta` is a
+    dict of scalars. Groups already in the file and not supplied here are
+    carried over, so a run that recomputes only the diffusion keeps the order
+    parameters from an earlier one.
+
+    The file is written to a temporary name and renamed into place, so readers
+    never see a half-written file.
+    """
+    path = Path(path)
+    tables = dict(tables or {})
+    meta = dict(meta or {})
+    replaced = set(tables) | ({'spatial'} if spatial is not None else set())
+
+    arrays = {}
+    old = _open_path_output(path) if path.exists() else None
+    if old is not None:
+        with old:
+            for name in old.files:
+                group, _, field = name.partition('__')
+                if group in replaced:
+                    continue
+                if group == 'meta' and (field in meta or field == 'version'):
+                    continue
+                arrays[name] = old[name]
+
+    for key, df in tables.items():
+        if key not in _TABLE_KEYS:
+            raise ValueError(f"Unknown table '{key}'; expected one of {_TABLE_KEYS}.")
+        arrays.update(_pack_table(key, df))
+    if spatial is not None:
+        arrays.update(_pack_spatial(*spatial))
+
+    arrays['meta__version'] = np.array(PATH_FILE_VERSION)
+    for field, value in meta.items():
+        arrays[f'meta__{field}'] = np.array(value)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + '.tmp')
+    # A file object, not a name: np.savez would append '.npz' to 'x.npz.tmp'.
+    with open(tmp, 'wb') as handle:
+        np.savez_compressed(handle, **arrays)
+    os.replace(tmp, path)
+
+
+def _unpack_table(data, key):
+    columns = data[f'{key}__columns'].tolist()
+    df = pd.DataFrame(data[f'{key}__data'].astype(np.float64),
+                      columns=columns[1:])
+    df.insert(0, columns[0], data[f'{key}__axis'])
+    return df
+
+
+def read_path_tables(path, keys=_TABLE_KEYS):
+    """{key: DataFrame} for whichever of `keys` the file holds."""
+    data = _open_path_output(path)
+    if data is None:
+        return {}
+    with data:
+        files = set(data.files)
+        return {key: _unpack_table(data, key)
+                for key in keys if f'{key}__data' in files}
+
+
+def read_path_columns(path, key):
+    """Column names of one table, without reading its data."""
+    data = _open_path_output(path)
+    if data is None:
+        return []
+    with data:
+        name = f'{key}__columns'
+        return data[name].tolist() if name in data.files else []
+
+
+def read_path_spatial(path):
+    """The stacked spatial accumulators, or None if the file has none.
+
+    Returns a dict with 'names', 'wsum' and 'wcount' (n_obs, n_depth, M) in
+    float64, and the grid's 'x_coords', 'y_coords' and 'depth_edges'.
+    """
+    data = _open_path_output(path)
+    if data is None:
+        return None
+    with data:
+        if 'spatial__wsum' not in data.files:
+            return None
+        return {
+            'names'      : data['spatial__names'].tolist(),
+            'wsum'       : data['spatial__wsum'].astype(np.float64),
+            'wcount'     : data['spatial__wcount'].astype(np.float64),
+            'x_coords'   : data['spatial__x_coords'],
+            'y_coords'   : data['spatial__y_coords'],
+            'depth_edges': data['spatial__depth_edges'],
+        }
+
+
+def _has_near_columns(path, group, near_n):
+    """
+    Whether an existing file already carries the near-permeant columns for
+    every requested N. Guards against silently skipping recomputation when
+    the near-N feature is adopted on top of files written before that schema
+    existed.
     """
     if group == 'order':
-        probe_path  = csvs['p2']
-        probe_chain = next(iter(CHAIN_BONDS))
-        probe_cols  = [f'near{N}_{probe_chain}_p2_chain_wsum' for N in near_n]
+        key, probe_chain = 'p2', next(iter(CHAIN_BONDS))
+        probe_cols = [f'near{N}_{probe_chain}_p2_chain_wsum' for N in near_n]
     else:  # 'structural'
-        probe_path = csvs['thick']
+        key = 'thick'
         probe_cols = [f'near{N}_thickness_wsum' for N in near_n]
-    try:
-        header = pd.read_csv(probe_path, comment='#', nrows=0).columns
-    except Exception:
-        return False
-    return all(c in header for c in probe_cols)
+    columns = set(read_path_columns(path, key))
+    return all(c in columns for c in probe_cols)
 
 
-def _needed_groups(csvs, overwrite, near_n=()):
+def _needed_groups(path, overwrite, near_n=()):
     if overwrite:
         return set(OBSERVABLE_GROUPS.keys())
+    present = path_output_contents(path)
     needed = set()
     for group, keys in OBSERVABLE_GROUPS.items():
-        if not all(csvs[k].exists() for k in keys):
+        if not all(k in present for k in keys):
             needed.add(group)
             continue
         if near_n and group in ('order', 'structural') and \
-           not _has_near_columns(csvs, group, near_n):
+           not _has_near_columns(path, group, near_n):
             needed.add(group)
     return needed
 
@@ -1571,8 +1706,7 @@ def calculate_selected_slab_profiles(
     water_z_range       = WATER_Z_RANGE,
     curvature_smoothing = 0.0,
     dt                  = None,
-    max_lag_ps          = 500.0,
-    min_slab_points     = 5,
+    lag_frames          = 1,
     grid_spacing        = 5.0,
     stamp_radius        = None,
     near_n              = (),
@@ -1612,7 +1746,7 @@ def calculate_selected_slab_profiles(
 
     edges, centers = build_slab_grid(
         topology, xtc_files, permeant_resname,
-        bilayer_normal, slab_width, slab_range,
+        bilayer_normal, slab_width, slab_range, lipid_resnames,
     )
     n_slabs = len(centers)
 
@@ -1746,26 +1880,26 @@ def calculate_selected_slab_profiles(
         water_z_wtot = np.zeros(n_z_bins)
         _water_z_range_checked = False
 
-    # ── Diffusion accumulators (unchanged) ────────────────────────────────────
+    # ── Diffusion accumulators ────────────────────────────────────────────────
+    # wsum holds summed squared displacement over 2*n_dim*tau and wtot the
+    # window count, so the aggregate's ratio is the pooled MSD estimate.
     if run_diffusion:
-        D_ein_wsum  = np.zeros(n_slabs)
-        D_ein_wtot  = np.zeros(n_slabs)
-        D_hum_wsum  = np.zeros(n_slabs)
-        D_hum_wtot  = np.zeros(n_slabs)
-        nsoj_wsum   = np.zeros(n_slabs)
-        nsoj_wtot   = np.zeros(n_slabs)
+        D_z_wsum      = np.zeros(n_slabs)
+        D_z_wtot      = np.zeros(n_slabs)
+        D_z_lag2_wsum = np.zeros(n_slabs)
+        D_z_lag2_wtot = np.zeros(n_slabs)
+        nwin_wsum     = np.zeros(n_slabs)
+        nwin_wtot     = np.zeros(n_slabs)
         z_full        = []
         slab_idx_full = []
 
     if run_diffusion_xy:
-        D_xy_ein_wsum  = np.zeros(n_slabs)
-        D_xy_ein_wtot  = np.zeros(n_slabs)
-        D_xy_hx_wsum   = np.zeros(n_slabs)
-        D_xy_hx_wtot   = np.zeros(n_slabs)
-        D_xy_hy_wsum   = np.zeros(n_slabs)
-        D_xy_hy_wtot   = np.zeros(n_slabs)
-        nsoj_xy_wsum   = np.zeros(n_slabs)
-        nsoj_xy_wtot   = np.zeros(n_slabs)
+        D_xy_wsum      = np.zeros(n_slabs)
+        D_xy_wtot      = np.zeros(n_slabs)
+        D_xy_lag2_wsum = np.zeros(n_slabs)
+        D_xy_lag2_wtot = np.zeros(n_slabs)
+        nwin_xy_wsum   = np.zeros(n_slabs)
+        nwin_xy_wtot   = np.zeros(n_slabs)
         xy_full           = []
         slab_idx_xy_full  = []
 
@@ -1792,7 +1926,6 @@ def calculate_selected_slab_profiles(
 
     lipid_sel  = " or ".join(f"resname {r}" for r in lipid_resnames)
     _dt        = dt
-    _max_lag_steps = None
 
     # ═════════════════════════════════════════════════════════════════════════
     # Frame loop
@@ -1808,9 +1941,6 @@ def calculate_selected_slab_profiles(
         if _dt is None:
             u.trajectory[0]
             _dt = float(u.trajectory.dt)
-        if (run_diffusion or run_diffusion_xy) and _max_lag_steps is None:
-            _max_lag_steps = max(1, int(max_lag_ps / _dt))
-
         if run_diffusion_xy:
             _pbc_jump   = np.zeros(2)
             _pbc_prev   = None
@@ -2479,82 +2609,48 @@ def calculate_selected_slab_profiles(
                             )
                             _stamp_depth(acc_key, lip_xy_c, np.abs(hc))
 
-    # ── Diffusion post-processing (unchanged) ─────────────────────────────────
-    if run_diffusion and len(z_full) >= 2 and _dt is not None:
-        z_arr  = np.array(z_full)
-        si_arr = np.array(slab_idx_full, dtype=int)
+    # ── Diffusion post-processing ─────────────────────────────────────────────
+    # Squared displacements are pooled here, not per-slab diffusion constants:
+    # the sums and the window counts go into the weighted accumulators
+    # separately, so the aggregate's wsum/wtot ratio is the pooled
+    # <dz^2>/(2 n_dim tau) over every window of every path rather than a mean
+    # of per-path means, and a path that visited a slab twice no longer speaks
+    # as loudly as one that visited it a thousand times.
+    if run_diffusion and len(z_full) > lag_frames and _dt is not None:
+        z_arr  = np.asarray(z_full, dtype=float)
+        si_arr = np.asarray(slab_idx_full, dtype=int)
 
-        sojourn_D_ein = [[] for _ in range(n_slabs)]
-        sojourn_D_hum = [[] for _ in range(n_slabs)]
+        windows = None
+        for lag, (wsum, wtot) in (
+            (lag_frames,       (D_z_wsum, D_z_wtot)),
+            (2 * lag_frames,   (D_z_lag2_wsum, D_z_lag2_wtot)),
+        ):
+            total, count = slab_binned_msd(z_arr, si_arr, n_slabs, lag)
+            wsum += weight * total / (2.0 * lag * _dt)
+            wtot += weight * count
+            if windows is None:
+                windows = count
 
-        run_start = 0
-        for f in range(1, len(si_arr) + 1):
-            if f == len(si_arr) or si_arr[f] != si_arr[run_start]:
-                run_len = f - run_start
-                si      = si_arr[run_start]
-                if run_len >= min_slab_points:
-                    z_run = z_arr[run_start:f]
-                    D_ein, D_hum = _estimate_sojourn_D(
-                        z_run, _dt, _max_lag_steps
-                    )
-                    if np.isfinite(D_ein):
-                        sojourn_D_ein[si].append(D_ein)
-                    if np.isfinite(D_hum):
-                        sojourn_D_hum[si].append(D_hum)
-                run_start = f
+        nwin_wsum += weight * windows
+        nwin_wtot += weight * (windows > 0)
 
-        for si in range(n_slabs):
-            if sojourn_D_ein[si]:
-                D_ein_wsum[si] += weight * float(np.mean(sojourn_D_ein[si]))
-                D_ein_wtot[si] += weight
-            if sojourn_D_hum[si]:
-                D_hum_wsum[si] += weight * float(np.mean(sojourn_D_hum[si]))
-                D_hum_wtot[si] += weight
-            n_soj = len(sojourn_D_ein[si])
-            if n_soj > 0:
-                nsoj_wsum[si] += weight * n_soj
-                nsoj_wtot[si] += weight
+    if run_diffusion_xy and len(xy_full) > lag_frames and _dt is not None:
+        xy_arr = np.asarray(xy_full, dtype=float)
+        si_arr = np.asarray(slab_idx_xy_full, dtype=int)
 
-    if run_diffusion_xy and len(xy_full) >= 2 and _dt is not None:
-        xy_arr  = np.array(xy_full)
-        si_arr  = np.array(slab_idx_xy_full, dtype=int)
+        windows = None
+        for lag, (wsum, wtot) in (
+            (lag_frames,     (D_xy_wsum, D_xy_wtot)),
+            (2 * lag_frames, (D_xy_lag2_wsum, D_xy_lag2_wtot)),
+        ):
+            total, count = slab_binned_msd(xy_arr, si_arr, n_slabs, lag)
+            wsum += weight * total / (4.0 * lag * _dt)
+            wtot += weight * count
+            if windows is None:
+                windows = count
 
-        sojourn_D_xy_ein = [[] for _ in range(n_slabs)]
-        sojourn_D_xy_hx  = [[] for _ in range(n_slabs)]
-        sojourn_D_xy_hy  = [[] for _ in range(n_slabs)]
-
-        run_start = 0
-        for f in range(1, len(si_arr) + 1):
-            if f == len(si_arr) or si_arr[f] != si_arr[run_start]:
-                run_len = f - run_start
-                si      = si_arr[run_start]
-                if run_len >= min_slab_points:
-                    xy_run = xy_arr[run_start:f]
-                    D_ein_xy, D_hx, D_hy = _msd_xy_from_series(
-                        xy_run, _dt, _max_lag_steps
-                    )
-                    if np.isfinite(D_ein_xy):
-                        sojourn_D_xy_ein[si].append(D_ein_xy)
-                    if np.isfinite(D_hx):
-                        sojourn_D_xy_hx[si].append(D_hx)
-                    if np.isfinite(D_hy):
-                        sojourn_D_xy_hy[si].append(D_hy)
-                run_start = f
-
-        for si in range(n_slabs):
-            if sojourn_D_xy_ein[si]:
-                D_xy_ein_wsum[si] += weight * float(np.mean(sojourn_D_xy_ein[si]))
-                D_xy_ein_wtot[si] += weight
-            if sojourn_D_xy_hx[si]:
-                D_xy_hx_wsum[si] += weight * float(np.mean(sojourn_D_xy_hx[si]))
-                D_xy_hx_wtot[si] += weight
-            if sojourn_D_xy_hy[si]:
-                D_xy_hy_wsum[si] += weight * float(np.mean(sojourn_D_xy_hy[si]))
-                D_xy_hy_wtot[si] += weight
-            n_soj_xy = len(sojourn_D_xy_ein[si])
-            if n_soj_xy > 0:
-                nsoj_xy_wsum[si] += weight * n_soj_xy
-                nsoj_xy_wtot[si] += weight
+        nwin_xy_wsum += weight * windows
+        nwin_xy_wtot += weight * (windows > 0)
 
     # ── Assemble DataFrames ───────────────────────────────────────────────────
     output = {}
@@ -2657,28 +2753,26 @@ def calculate_selected_slab_profiles(
     if run_diffusion:
         output['diffusion'] = (
             pd.DataFrame({
-                'slab_center'    : centers,
-                'D_einstein_wsum': D_ein_wsum,
-                'D_einstein_wtot': D_ein_wtot,
-                'D_hummer_wsum'  : D_hum_wsum,
-                'D_hummer_wtot'  : D_hum_wtot,
-                'n_sojourns_wsum': nsoj_wsum,
-                'n_sojourns_wtot': nsoj_wtot,
+                'slab_center'   : centers,
+                'D_z_wsum'      : D_z_wsum,
+                'D_z_wtot'      : D_z_wtot,
+                'D_z_lag2_wsum' : D_z_lag2_wsum,
+                'D_z_lag2_wtot' : D_z_lag2_wtot,
+                'n_windows_wsum': nwin_wsum,
+                'n_windows_wtot': nwin_wtot,
             }),
         )
 
     if run_diffusion_xy:
         output['diffusion_xy'] = (
             pd.DataFrame({
-                'slab_center'       : centers,
-                'D_xy_ein_wsum'     : D_xy_ein_wsum,
-                'D_xy_ein_wtot'     : D_xy_ein_wtot,
-                'D_xy_hummer_x_wsum': D_xy_hx_wsum,
-                'D_xy_hummer_x_wtot': D_xy_hx_wtot,
-                'D_xy_hummer_y_wsum': D_xy_hy_wsum,
-                'D_xy_hummer_y_wtot': D_xy_hy_wtot,
-                'n_sojourns_wsum'   : nsoj_xy_wsum,
-                'n_sojourns_wtot'   : nsoj_xy_wtot,
+                'slab_center'    : centers,
+                'D_xy_wsum'      : D_xy_wsum,
+                'D_xy_wtot'      : D_xy_wtot,
+                'D_xy_lag2_wsum' : D_xy_lag2_wsum,
+                'D_xy_lag2_wtot' : D_xy_lag2_wtot,
+                'n_windows_wsum' : nwin_xy_wsum,
+                'n_windows_wtot' : nwin_xy_wtot,
             }),
         )
 
@@ -2693,7 +2787,7 @@ def calculate_selected_slab_profiles(
 # Per-path worker (unchanged except function calls are compatible)
 # ═════════════════════════════════════════════════════════════════════════════
 
-_GROUP_CSV_KEYS = {
+_GROUP_TABLE_KEYS = {
     'order'        : [(0, 'p2'),    (1, 'tilt')],
     'structural'   : [(0, 'thick'), (1, 'deform'), (2, 'water_z')],
     'diffusion'    : [(0, 'diff')],
@@ -2723,16 +2817,15 @@ def process_single_path(
     water_z_range       = WATER_Z_RANGE,
     curvature_smoothing = 0.0,
     dt                  = None,
-    max_lag_ps          = 500.0,
-    min_slab_points     = 5,
+    lag_frames          = 1,
     grid_spacing        = 5.0,
     stamp_radius        = None,
     near_n              = (),
     spatial_extent      = None,
     n_depth_bins        = 10,
 ):
-    csvs   = _all_csv_paths(path_number)
-    needed = _needed_groups(csvs, overwrite, near_n)
+    out_file = path_output_file(path_number)
+    needed   = _needed_groups(out_file, overwrite, near_n)
 
     if not needed:
         return (path_number, 'skipped', 'All output files already exist.')
@@ -2809,8 +2902,7 @@ def process_single_path(
             water_z_range       = water_z_range,
             curvature_smoothing = curvature_smoothing,
             dt                  = dt,
-            max_lag_ps          = max_lag_ps,
-            min_slab_points     = min_slab_points,
+            lag_frames          = lag_frames,
             grid_spacing        = grid_spacing,
             stamp_radius        = stamp_radius,
             near_n              = near_n,
@@ -2818,29 +2910,24 @@ def process_single_path(
             n_depth_bins        = n_depth_bins,
         )
 
-        header = (f"# {'reactive' if reactive else 'non-reactive'}\n"
-                  f"# {ensemble} ensemble\n")
-
-        written = []
-
+        tables = {}
         for group, df_tuple in results.items():
             if group == 'spatial':
                 continue
-            for df_idx, csv_key in _GROUP_CSV_KEYS[group]:
-                csv_path = csvs[csv_key]
-                df       = df_tuple[df_idx]
-                with open(csv_path, 'w') as fh:
-                    fh.write(header)
-                df.to_csv(csv_path, mode='a', index=False, float_format='%.6e')
-                written.append(csv_path.name)
+            for df_idx, table_key in _GROUP_TABLE_KEYS[group]:
+                tables[table_key] = df_tuple[df_idx]
 
+        spatial = None
         if 'spatial' in results:
-            sp_acc, sp_shape, sp_x, sp_y, sp_depth = results['spatial']
-            _save_spatial_accumulators(sp_acc, sp_x, sp_y, sp_depth,
-                                       csvs['spatial'])
-            written.append(csvs['spatial'].name)
+            sp_acc, _sp_shape, sp_x, sp_y, sp_depth = results['spatial']
+            spatial = (sp_acc, sp_x, sp_y, sp_depth)
 
-        print(f"  [worker] Path {path_number} -> {written}")
+        write_path_output(
+            out_file, tables=tables, spatial=spatial,
+            meta={'reactive': bool(reactive), 'ensemble': ensemble},
+        )
+        written = sorted(tables) + (['spatial'] if spatial is not None else [])
+        print(f"  [worker] Path {path_number} -> {out_file.name} {written}")
         return (path_number, 'ok')
 
     except Exception:
@@ -2850,6 +2937,22 @@ def process_single_path(
 # ═════════════════════════════════════════════════════════════════════════════
 # Parallel dispatcher (unchanged)
 # ═════════════════════════════════════════════════════════════════════════════
+
+def _note_legacy_outputs(out_dir):
+    """Say so if the folder still holds the old per-path CSV layout.
+
+    Those files are not read any more - every path is recomputed into its
+    single .npz - so they are dead weight, and without a note it looks as
+    though the earlier results were silently thrown away.
+    """
+    legacy = [f for pattern in ('*_p2.csv', '*_diffusion.csv', '*_spatial.npz')
+              for f in Path(out_dir).glob(pattern)]
+    if legacy:
+        print(f"Note: {out_dir}/ holds {len(legacy)} file(s) in the old "
+              "per-path CSV layout (e.g. {}). They are no longer read; every "
+              "path is written to a single <n>.npz, and the old files can be "
+              "deleted.".format(legacy[0].name))
+
 
 def loop_over_paths_parallel(
     path_start,
@@ -2871,8 +2974,7 @@ def loop_over_paths_parallel(
     water_z_range       = WATER_Z_RANGE,
     curvature_smoothing = 0.0,
     dt                  = None,
-    max_lag_ps          = 500.0,
-    min_slab_points     = 5,
+    lag_frames          = 1,
     grid_spacing        = 5.0,
     stamp_radius        = None,
     near_n              = (),
@@ -2880,6 +2982,7 @@ def loop_over_paths_parallel(
     n_depth_bins        = 10,
 ):
     Path(ORDER_OUT).mkdir(parents=True, exist_ok=True)
+    _note_legacy_outputs(ORDER_OUT)
 
     lambda_A, lambda_B, lambda_minus_one = read_toml('../infretis.toml')
     weights      = load_path_weights(weights_file)
@@ -2916,8 +3019,7 @@ def loop_over_paths_parallel(
                 water_z_range       = water_z_range,
                 curvature_smoothing = curvature_smoothing,
                 dt                  = dt,
-                max_lag_ps          = max_lag_ps,
-                min_slab_points     = min_slab_points,
+                lag_frames          = lag_frames,
                 grid_spacing        = grid_spacing,
                 stamp_radius        = stamp_radius,
                 near_n              = near_n,
@@ -3099,31 +3201,53 @@ def _wsum_wtot_cols(dfs):
     return wsum, wtot
 
 
-def _collect_csvs(path_start, path_end, weights, kind):
-    """Return (path_numbers, dfs) — the path numbers are needed to build
-    contiguous MC-time blocks for the jackknife in _pool_weighted_means."""
-    pns, dfs = [], []
+def _collect_tables(path_start, path_end, weights, kinds=_TABLE_KEYS):
+    """Every path's tables, read with one open per path.
+
+    Returns ({kind: path_numbers}, {kind: DataFrames}); the path numbers are
+    needed to build contiguous MC-time blocks for the jackknife in
+    _pool_weighted_means.
+    """
+    pns = {kind: [] for kind in kinds}
+    dfs = {kind: [] for kind in kinds}
+    no_weight = no_file = 0
+    missing = {kind: 0 for kind in kinds}
+
     for pn in range(path_start, path_end + 1):
-        csvs = _all_csv_paths(pn)
-        csv  = csvs.get(kind)
-        if csv and csv.exists() and contains_key(weights, pn):
-            dfs.append(pd.read_csv(csv, comment='#'))
-            pns.append(pn)
-        else:
-            print(f"  [aggregate] Path {pn} '{kind}' CSV not found or "
-                  f"no weight available, skipping.")
+        if not contains_key(weights, pn):
+            no_weight += 1
+            continue
+        tables = read_path_tables(path_output_file(pn), kinds)
+        if not tables:
+            no_file += 1
+            continue
+        for kind in kinds:
+            if kind in tables:
+                dfs[kind].append(tables[kind])
+                pns[kind].append(pn)
+            else:
+                missing[kind] += 1
+
+    # One summary rather than a line per path: at 10^4 paths the per-path
+    # messages drowned everything else the aggregation printed.
+    if no_weight or no_file:
+        print(f"  [aggregate] skipped {no_weight} path(s) without a weight and "
+              f"{no_file} without an output file.")
+    partial = {kind: n for kind, n in missing.items() if n}
+    if partial:
+        print(f"  [aggregate] paths missing individual tables: {partial}")
     return pns, dfs
 
 
 def aggregate_all_results(path_start, path_end, weights, n_blocks=20):
+    pns, dfs = _collect_tables(path_start, path_end, weights)
     results = {}
-    for kind in ('p2', 'tilt', 'thick', 'deform', 'water_z', 'diff', 'diff_xy'):
-        pns, dfs = _collect_csvs(path_start, path_end, weights, kind)
-        if not dfs:
-            raise RuntimeError(f"No '{kind}' CSVs found to aggregate.")
-        ws, wt = _wsum_wtot_cols(dfs)
-        results[kind] = _pool_weighted_means(dfs, ws, wt,
-                                             path_numbers=pns,
+    for kind in _TABLE_KEYS:
+        if not dfs[kind]:
+            raise RuntimeError(f"No '{kind}' tables found to aggregate.")
+        ws, wt = _wsum_wtot_cols(dfs[kind])
+        results[kind] = _pool_weighted_means(dfs[kind], ws, wt,
+                                             path_numbers=pns[kind],
                                              n_blocks=n_blocks)
     return (results['p2'], results['tilt'], results['thick'],
             results['deform'], results['water_z'], results['diff'],
@@ -3571,9 +3695,12 @@ def plot_diffusion_profile(diff_agg, min_neff=MIN_NEFF, output_path=None):
         2, 1, figsize=(8, 7), sharex=True,
         gridspec_kw={'height_ratios': [3, 1]}
     )
-    colors = {'D_einstein': '#1f77b4', 'D_hummer': '#d62728'}
-    labels = {'D_einstein': 'Einstein (short-time MSD)',
-              'D_hummer'  : 'Hummer (pos. autocorr.)'}
+    # D_z is the local estimate; D_z_lag2, at twice the lag, is drawn beside
+    # it as the diffusive-regime check rather than as a rival estimator - the
+    # two agreeing is the evidence that the frame spacing is long enough.
+    colors = {'D_z': '#1f77b4', 'D_z_lag2': '#d62728'}
+    labels = {'D_z'     : 'D from ⟨Δz²⟩/2τ',
+              'D_z_lag2': 'same at 2τ (diffusive check)'}
     for col, color in colors.items():
         _plot_series(ax1, diff_agg['slab_center'], diff_agg, col,
                      min_neff=min_neff, lw=2, color=color, label=labels[col])
@@ -3581,13 +3708,13 @@ def plot_diffusion_profile(diff_agg, min_neff=MIN_NEFF, output_path=None):
     ax1.set_yscale('log')
     ax1.legend(frameon=False, fontsize=11)
     ax1.set_title('Local diffusion coefficient along bilayer normal', fontsize=13)
-    if 'n_sojourns' in diff_agg.columns:
+    if 'n_windows' in diff_agg.columns:
         width = (diff_agg['slab_center'].iloc[1]
                  - diff_agg['slab_center'].iloc[0]) * 0.85
-        ax2.bar(diff_agg['slab_center'], diff_agg['n_sojourns'],
+        ax2.bar(diff_agg['slab_center'], diff_agg['n_windows'],
                 width=width, color='steelblue', alpha=0.7)
     ax2.set_xlabel('z-displacement (Å)', fontsize=13)
-    ax2.set_ylabel('# sojourns', fontsize=12)
+    ax2.set_ylabel('# windows / path', fontsize=12)
     plt.tight_layout()
     if output_path:
         plt.savefig(output_path, dpi=300)
@@ -3602,9 +3729,8 @@ def plot_diffusion_xy_profile(diff_xy_agg, min_neff=MIN_NEFF, output_path=None):
         gridspec_kw={'height_ratios': [3, 1]}
     )
     series = {
-        'D_xy_ein'      : ('#1f77b4', 'Einstein 2-D MSD'),
-        'D_xy_hummer_x' : ('#d62728', 'Hummer ACF  D_x'),
-        'D_xy_hummer_y' : ('#2ca02c', 'Hummer ACF  D_y'),
+        'D_xy'      : ('#1f77b4', 'D from ⟨Δr²⟩/4τ'),
+        'D_xy_lag2' : ('#d62728', 'same at 2τ (diffusive check)'),
     }
     for col, (color, label) in series.items():
         _plot_series(ax1, diff_xy_agg['slab_center'], diff_xy_agg, col,
@@ -3613,13 +3739,13 @@ def plot_diffusion_xy_profile(diff_xy_agg, min_neff=MIN_NEFF, output_path=None):
     ax1.set_yscale('log')
     ax1.legend(frameon=False, fontsize=11)
     ax1.set_title('Lateral diffusion coefficient along bilayer normal', fontsize=13)
-    if 'n_sojourns' in diff_xy_agg.columns:
+    if 'n_windows' in diff_xy_agg.columns:
         width = (diff_xy_agg['slab_center'].iloc[1]
                  - diff_xy_agg['slab_center'].iloc[0]) * 0.85
-        ax2.bar(diff_xy_agg['slab_center'], diff_xy_agg['n_sojourns'],
+        ax2.bar(diff_xy_agg['slab_center'], diff_xy_agg['n_windows'],
                 width=width, color='steelblue', alpha=0.7)
     ax2.set_xlabel('z-displacement (Å)', fontsize=13)
-    ax2.set_ylabel('# sojourns', fontsize=12)
+    ax2.set_ylabel('# windows / path', fontsize=12)
     plt.tight_layout()
     if output_path:
         plt.savefig(output_path, dpi=300)
@@ -3970,21 +4096,20 @@ def membrane_spatial(
     leaflets_opt: Annotated[str, typer.Option("-leaflets", "--leaflets", help="Comma-separated leaflets to include in plots, e.g. 'both,upper,lower'.", rich_help_panel=panels.INPUT)] = "both,upper,lower",
 
     # ── Dataset construction ──────────────────────────────────
-start: Annotated[int, typer.Option("-start", "--start", help="", rich_help_panel=panels.DATASET)] = ...,
+    start: Annotated[int, typer.Option("-start", "--start", help="", rich_help_panel=panels.DATASET)] = ...,
     end: Annotated[Optional[int], typer.Option("-end", "--end", help="", rich_help_panel=panels.DATASET)] = None,
-    max_lag_ps: Annotated[float, typer.Option("-max-lag-ps", "--max-lag-ps", help="", rich_help_panel=panels.DATASET)] = 500.0,
+    lag_frames: Annotated[int, typer.Option("-lag-frames", "--lag-frames", help="Lag in frames used for the local diffusion estimate, D = <dz^2>/(2 tau) over the windows starting in each slab. 1 is right unless the frame spacing is short enough that the motion is not yet diffusive; the D_z_lag2 column, taken at twice this lag, is the check.", rich_help_panel=panels.DATASET)] = 1,
     dt: Annotated[Optional[float], typer.Option("-dt", "--dt", help="", rich_help_panel=panels.DATASET)] = None,
 
     # ── CV corrections: representation ────────────────────────
     slab_width: Annotated[float, typer.Option("-slab-width", "--slab-width", help="", rich_help_panel=panels.REPR)] = 1.0,
     bilayer_normal: Annotated[str, typer.Option("-bilayer-normal", "--bilayer-normal", help="", rich_help_panel=panels.REPR)] = 'z',
-    slab_range_opt: Annotated[Optional[str], typer.Option("-slab-range", "--slab-range", help="Fixed slab range in Angstrom as 'min,max', e.g. '-40,40'.", rich_help_panel=panels.REPR)] = None,
+    slab_range_opt: Annotated[str, typer.Option("-slab-range", "--slab-range", help="Permeant-depth range in Angstrom as 'min,max', on the membrane_z - permeant_z axis (the order-parameter axis, not lab z). Fixed rather than derived so every path and every simulation share one grid - the per-path CSVs are pooled bin by bin.", rich_help_panel=panels.REPR)] = '-40,40',
     r_max: Annotated[float, typer.Option("-r-max", "--r-max", help="", rich_help_panel=panels.REPR)] = 30.0,
     n_radial_bins: Annotated[int, typer.Option("-n-radial-bins", "--n-radial-bins", help="", rich_help_panel=panels.REPR)] = 15,
     n_z_bins: Annotated[int, typer.Option("-n-z-bins", "--n-z-bins", help="Number of bins for the water z-density profile, spanning --water-z-range.", rich_help_panel=panels.REPR)] = 60,
-    water_z_range_opt: Annotated[Optional[str], typer.Option("-water-z-range", "--water-z-range", help="Window in Angstrom as 'min,max' for the water z-density profile, measured relative to the bilayer midplane. Fixed rather than box-derived so the profile is poolable across paths and comparable between simulations. Must not exceed the box height; ±40 Å suits a ~100 Å box.", rich_help_panel=panels.REPR)] = None,
+    water_z_range_opt: Annotated[str, typer.Option("-water-z-range", "--water-z-range", help="Window in Angstrom as 'min,max' for the water z-density profile, measured relative to the bilayer midplane. Fixed rather than box-derived so the profile is poolable across paths and comparable between simulations. Must not exceed the box height; ±40 Å suits a ~100 Å box.", rich_help_panel=panels.REPR)] = '-40,40',
     curvature_smoothing: Annotated[float, typer.Option("-curvature-smoothing", "--curvature-smoothing", help="", rich_help_panel=panels.REPR)] = 0.0,
-    min_slab_points: Annotated[int, typer.Option("-min-slab-points", "--min-slab-points", help="", rich_help_panel=panels.REPR)] = 5,
     grid_spacing: Annotated[float, typer.Option("-grid-spacing", "--grid-spacing", help="", rich_help_panel=panels.REPR)] = 5.0,
     stamp_radius: Annotated[Optional[float], typer.Option("-stamp-radius", "--stamp-radius", help="", rich_help_panel=panels.REPR)] = None,
     near_n_opt: Annotated[str, typer.Option("-near-n", "--near-n", help="Comma-separated N values for near-permeant local membrane metrics (nearest-N-lipid average vs bulk), e.g. '5,10'. Pass an empty string to disable.", rich_help_panel=panels.REPR)] = "5,10",
@@ -3996,10 +4121,10 @@ start: Annotated[int, typer.Option("-start", "--start", help="", rich_help_panel
     # ── Model and training ────────────────────────────────────
     workers: Annotated[int, typer.Option("-workers", "--workers", help="", rich_help_panel=panels.MODEL)] = 32,
     n_blocks: Annotated[int, typer.Option("-n-blocks", "--n-blocks", help="Number of contiguous MC-time blocks for the block-jackknife error bars on the 1-D profiles. Blocks must be longer than the path decorrelation time; fewer, longer blocks give a more conservative error.", rich_help_panel=panels.MODEL)] = 20,
-    min_neff: Annotated[float, typer.Option("-min-neff", "--min-neff", help="Blank out profile bins supported by fewer than this effective number of paths (Kish n_eff). 0 disables masking.", rich_help_panel=panels.MODEL)] = 'MIN_NEFF',
+    min_neff: Annotated[float, typer.Option("-min-neff", "--min-neff", help="Blank out profile bins supported by fewer than this effective number of paths (Kish n_eff). 0 disables masking.", rich_help_panel=panels.MODEL)] = MIN_NEFF,
 
     # ── Output ────────────────────────────────────────────────
-    overwrite: Annotated[bool, typer.Option("-overwrite", "--overwrite", help="", rich_help_panel=panels.OUTPUT)] = False,
+    overwrite: Annotated[bool, typer.Option("-O", "-overwrite", "--overwrite", help="", rich_help_panel=panels.OUTPUT)] = False,
     plot: Annotated[bool, typer.Option("-plot", "--plot", help="", rich_help_panel=panels.OUTPUT)] = False,
     plot_bonds: Annotated[bool, typer.Option("-plot-bonds", "--plot-bonds", help="", rich_help_panel=panels.OUTPUT)] = False,
 ):
@@ -4032,8 +4157,7 @@ start: Annotated[int, typer.Option("-start", "--start", help="", rich_help_panel
         water_z_range=water_z_range_opt,
         curvature_smoothing=curvature_smoothing,
         plot=plot,
-        max_lag_ps=max_lag_ps,
-        min_slab_points=min_slab_points,
+        lag_frames=lag_frames,
         dt=dt,
         grid_spacing=grid_spacing,
         stamp_radius=stamp_radius,
@@ -4048,83 +4172,11 @@ start: Annotated[int, typer.Option("-start", "--start", help="", rich_help_panel
         leaflets=leaflets_opt,
     )
 
-    import argparse
+    # The options above are the interface; there is no second argparse layer.
+    # (There used to be: this function built `args` from the Typer options and
+    # then overwrote it with `parser.parse_args()` of sys.argv, so every option
+    # was silently discarded and the command could not run at all.)
 
-    parser = argparse.ArgumentParser(
-        description='Parallel weighted lipid order-parameter / structural / '
-                    'spatial analysis (single-pass merged loop, leaflet-aware).'
-    )
-    parser.add_argument('-s', '--start',         type=int,   required=True)
-    parser.add_argument('-e', '--end',           type=int,   default=None)
-    parser.add_argument('--overwrite',           action='store_true', default=False)
-    parser.add_argument('-w', '--workers',       type=int,   default=32)
-    parser.add_argument('--weights',             type=str,   default='path_weights.txt')
-    parser.add_argument('--data',                type=str,   required=True, help='Path to infretis_data.txt.')
-    parser.add_argument('--permeant',            type=str,   default='ORP')
-    parser.add_argument('--slab-width',          type=float, default=1.0)
-    parser.add_argument('--bilayer-normal',      type=str,   default='z')
-    parser.add_argument('--slab-range',          type=float, nargs=2, metavar=('Z_MIN', 'Z_MAX'), default=(-25.0, 25.0))
-    parser.add_argument('--r-max',               type=float, default=30.0)
-    parser.add_argument('--n-radial-bins',       type=int,   default=15)
-    parser.add_argument('--n-z-bins',            type=int,   default=60,
-                        help='Number of bins for the water z-density '
-                             'profile, spanning --water-z-range.')
-    parser.add_argument('--water-z-range',       type=float, nargs=2,
-                        metavar=('Z_MIN', 'Z_MAX'), default=WATER_Z_RANGE,
-                        help='Window (Å) for the water z-density profile, '
-                             'measured relative to the bilayer midplane. '
-                             'Fixed rather than box-derived so the profile '
-                             'is poolable across paths and comparable '
-                             'between simulations. Must not exceed the box '
-                             'height; ±40 Å suits a ~100 Å box.')
-    parser.add_argument('--curvature-smoothing', type=float, default=0.0)
-    parser.add_argument('--plot',                action='store_true', default=True)
-    parser.add_argument('--max-lag-ps',          type=float, default=500.0)
-    parser.add_argument('--min-slab-points',     type=int,   default=5)
-    parser.add_argument('--dt',                  type=float, default=None)
-    parser.add_argument('--grid-spacing',        type=float, default=5.0)
-    parser.add_argument('--stamp-radius',        type=float, default=None)
-    parser.add_argument('--near-n',              type=int,   nargs='*',
-                        default=[5, 10],
-                        help='N values for near-permeant local membrane '
-                             'metrics (nearest-N-lipid average vs. bulk). '
-                             'Pass --near-n with no values to disable.')
-    parser.add_argument('--spatial-extent',      type=float, default=None,
-                        help='Half-width (Å) of the permeant-centered 2-D '
-                             'spatial map window. Defaults to --r-max.')
-    parser.add_argument('--n-depth-bins',        type=int,   default=10,
-                        help='Number of permeant-depth bins for the 2-D '
-                             'spatial maps, spanning --slab-range. Maps are '
-                             'stored per depth bin so they can be collapsed '
-                             'or compared depth-matched; 1 restores the old '
-                             'fully depth-integrated behaviour.')
-    parser.add_argument('--spatial-depth-weighting',
-                        choices=['occupancy', 'uniform'], default='occupancy',
-                        help="How to combine depth bins into the plotted "
-                             "maps. 'occupancy' weights each bin by the time "
-                             "the permeant spent there (the original, "
-                             "depth-integrated map). 'uniform' gives every "
-                             "depth equal weight — use it when comparing "
-                             "simulations whose depth sampling differs.")
-    parser.add_argument('--spatial-depth-plots', action='store_true', default=False,
-                        help='Also emit one spatial overview figure per '
-                             'depth bin.')
-    parser.add_argument('--n-blocks',            type=int,   default=20,
-                        help='Number of contiguous MC-time blocks for the '
-                             'block-jackknife error bars on the 1-D '
-                             'profiles. Blocks must be longer than the path '
-                             'decorrelation time; fewer, longer blocks give '
-                             'a more conservative error.')
-    parser.add_argument('--min-neff',            type=float, default=MIN_NEFF,
-                        help='Blank out profile bins supported by fewer than '
-                             'this effective number of paths (Kish n_eff). '
-                             '0 disables masking.')
-    parser.add_argument('--plot-bonds',          action='store_true', default=False)
-    parser.add_argument('--leaflets',            type=str,   nargs='+',
-                        default=['both', 'upper', 'lower'],
-                        choices=['both', 'upper', 'lower'],
-                        help='Which leaflets to include in plots.')
-    args = parser.parse_args()
 
     slab_range = tuple(args.slab_range) if args.slab_range else None
     end        = args.end if args.end is not None else args.start
@@ -4149,8 +4201,7 @@ start: Annotated[int, typer.Option("-start", "--start", help="", rich_help_panel
         water_z_range       = tuple(args.water_z_range),
         curvature_smoothing = args.curvature_smoothing,
         dt                  = args.dt,
-        max_lag_ps          = args.max_lag_ps,
-        min_slab_points     = args.min_slab_points,
+        lag_frames          = args.lag_frames,
         grid_spacing        = args.grid_spacing,
         stamp_radius        = args.stamp_radius,
         near_n              = tuple(args.near_n),
