@@ -152,7 +152,7 @@ def permeant_index(
     carbonyl_sel: Annotated[str, typer.Option("-carbonyl-sel", help="Membrane atom-name pattern for the carbonyl oxygens", rich_help_panel=panels.SELECT)] = "O2* O3*",
     nitrogen_sel: Annotated[str, typer.Option("-nitrogen-sel", help="Membrane atom-name pattern for the headgroup nitrogens", rich_help_panel=panels.SELECT)] = "N*",
     strict: Annotated[bool, typer.Option("-strict", help="Fail instead of warning when a group's atoms are not bonded as its rule expects", rich_help_panel=panels.MODEL)] = False,
-    out_dir: Annotated[str, typer.Option("-out-dir", help="Directory to write the .ndx files into", rich_help_panel=panels.OUTPUT)] = "gromacs_input",
+    out_dir: Annotated[str, typer.Option("-out-dir", help="Directory to write the .ndx files into", rich_help_panel=panels.OUTPUT)] = ".",
     overw: Annotated[bool, typer.Option("-O", help="Force overwriting of existing files", rich_help_panel=panels.OUTPUT)] = False,
 ):
     """Write the permeant-side .ndx files and verify their atom selections.

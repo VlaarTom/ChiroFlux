@@ -186,9 +186,9 @@ def _write_ndx(path, groups):
 
 
 def leaflet_index(
-    topology: Annotated[str, typer.Option("-topology", help="Topology with atom names: a .tpr, or a .gro/.pdb", rich_help_panel=panels.INPUT)] = "gromacs_input/topol.tpr",
+    topology: Annotated[str, typer.Option("-topology", help="Topology with atom names: a .tpr, or a .gro/.pdb", rich_help_panel=panels.INPUT)] = "topol.tpr",
     coords: Annotated[Optional[str], typer.Option("-coords", help="Coordinate frame to read positions from, when -topology carries none (e.g. conf.gro)", rich_help_panel=panels.INPUT)] = None,
-    resname: Annotated[str, typer.Option("-resname", help="Lipid residue name(s) to index, comma- or space-separated: 'DOPC' or 'DOPC,POPC'. One file is written per species", rich_help_panel=panels.INPUT)] = "DOPC",
+    resname: Annotated[str, typer.Option("-resname", help="Lipid residue name(s) to index, comma- or space-separated: 'DOPC' or 'DOPC,POPC'. One file is written per species", rich_help_panel=panels.INPUT)] = "DOPC,POPC",
     permeant_resname: Annotated[str, typer.Option("-permeant-resname", help="Residue name of the permeant", rich_help_panel=panels.INPUT)] = "ORP",
     leaflet_atom: Annotated[str, typer.Option("-leaflet-atom", help="Atom whose height decides the whole residue's leaflet. Must be unique per residue and well separated between leaflets - the headgroup phosphorus", rich_help_panel=panels.DATASET)] = "P",
     midplane: Annotated[Optional[float], typer.Option("-midplane", help="Dividing height in Angstrom; default is the mean headgroup height. Set it explicitly if the membrane straddles the periodic boundary", rich_help_panel=panels.DATASET)] = None,
