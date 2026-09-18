@@ -51,6 +51,18 @@ DEFAULT_LIPID_ATOMS = "C2,P,N,C210,C310,O22,O32"
 #: Single-atom permeant groups, written first as groups 0-4.
 DEFAULT_PERMEANT_ATOMS = "CA,O01,N,HA,CD"
 
+#: Upper/lower atom sets for the ZCOM index, pooled over every -resname
+#: species: (group label, atom names). Written after the whole-permeant group
+#: and followed by one group holding every lipid atom.
+ZCOM_MARKERS = (
+    ("N", ("N",)),
+    ("P", ("P",)),
+    ("O21_O22", ("O21", "O22")),
+    ("O31_O32", ("O31", "O32")),
+    ("C21_C22_C23", ("C21", "C22", "C23")),
+    ("C31_C32_C33", ("C31", "C32", "C33")),
+)
+
 
 def _require_mdanalysis():
     """Import MDAnalysis on demand, with an actionable error if it is absent."""
@@ -196,6 +208,7 @@ def leaflet_index(
     permeant_atoms: Annotated[str, typer.Option("-permeant-atoms", help="Comma-separated permeant atoms, written first as one group each", rich_help_panel=panels.SELECT)] = DEFAULT_PERMEANT_ATOMS,
     out: Annotated[Optional[str], typer.Option("-out", help="Output .ndx path(s), one per -resname entry, comma- or space-separated. Omit to write CN_<RESNAME>.ndx into -out-dir", rich_help_panel=panels.OUTPUT)] = None,
     out_dir: Annotated[str, typer.Option("-out-dir", help="Directory for the default CN_<RESNAME>.ndx names, when -out is not given", rich_help_panel=panels.OUTPUT)] = ".",
+    zcom_out: Annotated[Optional[str], typer.Option("-zcom-out", help="Output path for the ZCOM index (whole permeant, headgroup/glycerol/chain-start markers pooled over all species as upper/lower pairs, all lipids). Omit to write ZCOM_index.ndx into -out-dir", rich_help_panel=panels.OUTPUT)] = None,
     overw: Annotated[bool, typer.Option("-O", help="Force overwriting of existing files", rich_help_panel=panels.OUTPUT)] = False,
 ):
     """Write a CN_*.ndx whose leaflet groups are split per lipid, not per atom.
@@ -242,7 +255,9 @@ def leaflet_index(
         )
     if not out_paths:
         out_paths = [str(Path(out_dir) / f"CN_{r}.ndx") for r in resnames]
-    for path in out_paths:
+    if zcom_out is None:
+        zcom_out = str(Path(out_dir) / "ZCOM_index.ndx")
+    for path in [*out_paths, zcom_out]:
         _check_overwrite(path, overw)
 
     if coords and Path(coords).suffix.lower() == ".g96":
@@ -284,10 +299,12 @@ def leaflet_index(
                                 sorted(int(i) + 1 for i in sel.indices)))
 
     all_balanced = True
+    all_by_resindex = {}
     for species, path in zip(resnames, out_paths):
         by_resindex, _ = _assign_leaflets(
             universe, species, leaflet_atom, used_midplane
         )
+        all_by_resindex.update(by_resindex)
         n_upper = sum(by_resindex.values())
         n_lower = len(by_resindex) - n_upper
 
@@ -320,6 +337,33 @@ def leaflet_index(
 
         _write_ndx(path, groups)
         print(f"  -> {len(groups)} groups written to {path}.")
+
+    # ZCOM index: the same per-residue leaflet split, pooled over all species.
+    species_sel = " ".join(resnames)
+    permeant_all = universe.select_atoms(f"resname {permeant_resname}")
+    if len(permeant_all) == 0:
+        raise ValueError(f"No atoms matched 'resname {permeant_resname}'.")
+    species_tag = "_".join(resnames)
+    zcom_groups = [(permeant_resname, sorted(int(i) + 1 for i in permeant_all.indices))]
+    print(f"\nZCOM index ({', '.join(resnames)} pooled):")
+    print(f"  {'marker':<12} {'upper':>6} {'lower':>6}")
+    for label, names in ZCOM_MARKERS:
+        upper, lower, orphan = _marker_groups(
+            universe, species_sel, " ".join(names), all_by_resindex
+        )
+        if orphan:
+            print(f"  [warn] {orphan} {label} atoms belong to a residue with no "
+                  f"'{leaflet_atom}' and were dropped.")
+        if not upper or not lower:
+            print(f"  [warn] {label} has an empty leaflet group. Check that "
+                  f"atoms {', '.join(names)} exist in the topology.")
+        print(f"  {label:<12} {len(upper):>6} {len(lower):>6}")
+        zcom_groups.append((f"{species_tag}_{label}_upper", upper))
+        zcom_groups.append((f"{species_tag}_{label}_lower", lower))
+    lipids_all = universe.select_atoms(f"resname {species_sel}")
+    zcom_groups.append((species_tag, sorted(int(i) + 1 for i in lipids_all.indices)))
+    _write_ndx(zcom_out, zcom_groups)
+    print(f"  -> {len(zcom_groups)} groups written to {zcom_out}.")
 
     if all_balanced:
         print("\nEvery marker splits like its headgroup, as it should.")
