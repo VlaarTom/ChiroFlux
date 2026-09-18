@@ -307,6 +307,29 @@ opposite leaflet.
 Every path in the file is checked for existence before a single trajectory is
 read, and a non-positive `scale` or a duplicate run name is rejected outright.
 
+**The weights and scales are applied at analysis, and finished paths are
+reused.** The intermediates store each path's sums at weight 1, tagged with its
+run, so paths with the same number in two runs stay separate. The weights file
+and `scale` are read when the profiles are built. After extending a simulation:
+
+- `chiroflux sasa -runs runs.toml -skip-parsing` redoes the profiles with the
+  new weights and reads no trajectories;
+- `chiroflux sasa -runs runs.toml` also computes the paths that are new in the
+  weights files, and reuses every path already done.
+
+Reuse is only allowed while the settings that change the computation are the
+same: bins, probe radius, dots per atom, selections, occlusion, `fold`, and each
+run's `mirror_z`. They are recorded in `sasa_meta.json`. A change triggers a
+full recomputation, and `-skip-parsing` refuses to run on intermediates made
+with different settings. `-recompute` forces a full recomputation. Intermediates
+from before this change had the weights multiplied in, so they are removed and
+recomputed rather than mixed in. The result is identical to multiplying the
+weights in during the computation, and a test checks this.
+
+`neighbours` works the same way: its per-path CSVs store counts at weight 1, and
+`-weights` is applied at `-plot`/`-stats`, so a new weights file only needs a
+rerun of those.
+
 ### Worked example: two simulations entered from opposite leaflets
 
 L and D were run with the permeant entering from opposite sides of the
@@ -608,12 +631,29 @@ matters: storing one member per column made the file *slower* to read than the
 CSVs. float32 is not a precision loss against the old files, which were written
 with `%.6e` (7 significant digits, what float32 holds).
 
+**The files store unweighted sums; the path weights are applied at
+aggregation.** Every path is accumulated with weight 1, and `-weights` only
+comes in when the paths are pooled (`-plot`). The WHAM weights renormalise
+whenever the simulations are extended. With the weight stored in the files,
+every path would need recomputing each time, and a path that had weight 0 would
+hold only zeros that can't be rescaled. Now new weights need only a
+re-aggregation, and a path with no weight yet still has its data ready. This is
+exact, not an approximation: every accumulator is linear in the weight
+(`+= w*x`, `+= w`), and a test pins that. Paths without a positive weight are
+left out of the pool rather than pooled as zeros.
+
 A run that only recomputes some groups merges them into the existing file, so
 `-overwrite`-free reruns still skip what is done. Files are written through a
 temporary name and renamed, so a killed worker never leaves a truncated file.
-Files in the old CSV layout are ignored — the run says how many it found — and
-can be deleted. Read one path back with
-`membrane_spatial.read_path_tables(path)` / `read_path_spatial(path)`.
+Read one path back with `membrane_spatial.read_path_tables(path)` /
+`read_path_spatial(path)`; both return the unweighted sums.
+
+**Older files are recomputed, never mixed in.** Files from the first `.npz`
+version (format version 1) had the weights multiplied in. Reading one as
+unweighted would apply the weight twice, so it counts as absent: the next run
+recomputes it, and the aggregation skips it and says how many it skipped.
+Recomputing needs the path's trajectories in `../load`. Files in the old CSV
+layout are ignored too — the run says how many it found — and can be deleted.
 
 ### Local diffusion along the normal
 

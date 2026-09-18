@@ -1013,6 +1013,9 @@ def _depth_edges_of(data):
 def aggregate_spatial_maps(path_start, path_end, weights):
     """Pool every path's spatial accumulators onto the first path's grid.
 
+    Each path's stored (unweighted) sums are multiplied by its current weight
+    here; paths without a positive weight are left out.
+
     The accumulators are stacked (n_observables, n_depth, M) in the per-path
     file, so paths on the reference grid are added in one operation each;
     only a path on a different lateral grid falls back to regridding the
@@ -1023,12 +1026,16 @@ def aggregate_spatial_maps(path_start, path_end, weights):
     no_file = bad_depth = 0
 
     for pn in range(path_start, path_end + 1):
-        if pn not in weights:
+        weight = weights.get(pn, 0.0)
+        if not weight > 0.0:
             continue
         sp = read_path_spatial(path_output_file(pn))
         if sp is None:
             no_file += 1
             continue
+        # Stored unweighted; the current weight goes on here.
+        sp['wsum'] = sp['wsum'] * weight
+        sp['wcount'] = sp['wcount'] * weight
 
         if ref is None:
             ref = sp
@@ -1087,7 +1094,7 @@ def aggregate_spatial_maps(path_start, path_end, weights):
     if ref is None:
         raise RuntimeError("No spatial maps found to aggregate.")
     if no_file or bad_depth:
-        print(f"  [spatial-agg] skipped {no_file} path(s) without spatial maps "
+        print(f"  [spatial-agg] skipped {no_file} weighted path(s) without current spatial maps "
               f"and {bad_depth} with incompatible depth bins.")
 
     agg_acc = {name: [agg_wsum[i], agg_wcnt[i]]
@@ -1480,11 +1487,20 @@ OBSERVABLE_GROUPS = {
 # digits, which is what float32 holds.
 #
 # Per-path granularity is kept on purpose. Workers write concurrently, each to
-# its own file; a missing or partial group is recomputed on its own and merged
-# into the file; and re-aggregating after the path weights change re-reads
-# every path, which one run-wide file would not make any cheaper.
+# its own file, and a missing or partial group is recomputed on its own and
+# merged into the file.
+#
+# The sums are stored UNWEIGHTED (every path accumulated with weight 1) and the
+# WHAM path weight is applied in `_collect_tables` / `aggregate_spatial_maps`.
+# The weights renormalise every time the simulations are extended; with the
+# weight baked in, as version 1 did, that meant recomputing every path, and a
+# path with no weight yet held nothing that could ever be rescaled. Every
+# accumulator is linear in the weight (+= w*x, += w), so applying it afterwards
+# is exact.
 
-PATH_FILE_VERSION = 1
+#: 2: unweighted sums. 1: weighted at accumulation - not interchangeable, so a
+#: version-1 file is treated as absent and recomputed.
+PATH_FILE_VERSION = 2
 
 _TABLE_KEYS = ('p2', 'tilt', 'thick', 'deform', 'water_z', 'diff', 'diff_xy')
 
@@ -1536,9 +1552,39 @@ def _open_path_output(path):
         return None
 
 
+def _file_version(data):
+    return int(data['meta__version']) if 'meta__version' in data.files else 0
+
+
+def path_output_version(path):
+    """The file's format version, or None if there is no readable file."""
+    data = _open_path_output(path)
+    if data is None:
+        return None
+    with data:
+        return _file_version(data)
+
+
+def _open_current(path):
+    """np.load the file only if it is in the current format, else None.
+
+    An older file is not merely stale: version 1 stored sums already
+    multiplied by the path weight, and reading it as unweighted would apply the
+    weight twice. So it counts as absent - recomputed by the workers, skipped
+    by the aggregation.
+    """
+    data = _open_path_output(path)
+    if data is None:
+        return None
+    if _file_version(data) != PATH_FILE_VERSION:
+        data.close()
+        return None
+    return data
+
+
 def path_output_contents(path):
     """The table keys, plus 'spatial', that the file holds."""
-    data = _open_path_output(path)
+    data = _open_current(path)
     if data is None:
         return set()
     with data:
@@ -1567,7 +1613,7 @@ def write_path_output(path, tables=None, spatial=None, meta=None):
     replaced = set(tables) | ({'spatial'} if spatial is not None else set())
 
     arrays = {}
-    old = _open_path_output(path) if path.exists() else None
+    old = _open_current(path) if path.exists() else None
     if old is not None:
         with old:
             for name in old.files:
@@ -1606,8 +1652,8 @@ def _unpack_table(data, key):
 
 
 def read_path_tables(path, keys=_TABLE_KEYS):
-    """{key: DataFrame} for whichever of `keys` the file holds."""
-    data = _open_path_output(path)
+    """{key: DataFrame} for whichever of `keys` the file holds, unweighted."""
+    data = _open_current(path)
     if data is None:
         return {}
     with data:
@@ -1618,7 +1664,7 @@ def read_path_tables(path, keys=_TABLE_KEYS):
 
 def read_path_columns(path, key):
     """Column names of one table, without reading its data."""
-    data = _open_path_output(path)
+    data = _open_current(path)
     if data is None:
         return []
     with data:
@@ -1630,9 +1676,10 @@ def read_path_spatial(path):
     """The stacked spatial accumulators, or None if the file has none.
 
     Returns a dict with 'names', 'wsum' and 'wcount' (n_obs, n_depth, M) in
-    float64, and the grid's 'x_coords', 'y_coords' and 'depth_edges'.
+    float64, unweighted, and the grid's 'x_coords', 'y_coords' and
+    'depth_edges'.
     """
-    data = _open_path_output(path)
+    data = _open_current(path)
     if data is None:
         return None
     with data:
@@ -2798,7 +2845,6 @@ _GROUP_TABLE_KEYS = {
 def process_single_path(
     path_number,
     overwrite,
-    weights,
     lambda_A,
     lambda_B,
     lambda_minus_one,
@@ -2852,11 +2898,6 @@ def process_single_path(
         if reactive is None:
             return (path_number, 'skipped', 'Path not found in infretis_data.txt')
 
-        weight = weights.get(path_number, None)
-        if weight is None:
-            print(f"  [worker] WARNING: path {path_number} not in weights — defaulting to 0.0")
-            weight = 0.0
-
         first_frame, last_frame = remove_first_last_frames(
             ensemble, lambda_minus_one, lambda_A, first, last
         )
@@ -2875,7 +2916,7 @@ def process_single_path(
 
         skipped_groups = set(OBSERVABLE_GROUPS.keys()) - needed
         print(
-            f"[worker] Path {path_number} (weight={weight:.6e}): "
+            f"[worker] Path {path_number}: "
             f"{len(xtc_files)} xtc file(s) — computing {sorted(needed)}"
             + (f", skipping {sorted(skipped_groups)}" if skipped_groups else "")
         )
@@ -2886,7 +2927,11 @@ def process_single_path(
             frame_plan          = frame_plan,
             permeant_resname    = permeant_resname,
             needed_groups       = needed,
-            weight              = weight,
+            # Unweighted on purpose: the path weight is applied when the
+            # paths are aggregated, so a renormalisation of the weights after
+            # the simulations are extended needs a re-aggregation, not a rerun.
+            # Every accumulator is linear in it (+= w*x, += w), so that is exact.
+            weight              = 1.0,
             lipid_resnames      = lipid_resnames,
             slab_width          = slab_width,
             bilayer_normal      = bilayer_normal,
@@ -2958,7 +3003,6 @@ def loop_over_paths_parallel(
     path_start,
     path_end,
     overwrite           = False,
-    weights_file        = 'path_weights.txt',
     data_file           = None,
     permeant_resname    = 'ORP',
     lipid_resnames      = ('DOPC', 'POPC'),
@@ -2985,12 +3029,11 @@ def loop_over_paths_parallel(
     _note_legacy_outputs(ORDER_OUT)
 
     lambda_A, lambda_B, lambda_minus_one = read_toml('../infretis.toml')
-    weights      = load_path_weights(weights_file)
     path_numbers = list(range(path_start, (path_end or path_start) + 1))
 
     print(f"Merged analysis: paths {path_start}–{path_end}, "
-          f"{N_WORKERS} workers (single pass per path).")
-    print(f"Weights loaded from '{weights_file}': {len(weights)} entries.")
+          f"{N_WORKERS} workers (single pass per path). Per-path results are "
+          "stored unweighted; the path weights are applied at aggregation.")
     print("=" * 80)
 
     results = {'ok': [], 'skipped': [], 'error': []}
@@ -3003,7 +3046,7 @@ def loop_over_paths_parallel(
             # argument after it onto the wrong name.
             executor.submit(
                 process_single_path,
-                pn, overwrite, weights, lambda_A, lambda_B, lambda_minus_one,
+                pn, overwrite, lambda_A, lambda_B, lambda_minus_one,
                 data_file,
                 permeant_resname    = permeant_resname,
                 lipid_resnames      = lipid_resnames,
@@ -3183,10 +3226,6 @@ def _pool_weighted_means(all_dfs, wsum_cols, wtot_cols,
     return pd.DataFrame(result)
 
 
-def contains_key(d, key):
-    return key in d
-
-
 def _wsum_wtot_cols(dfs):
     """
     Union the '_wsum' columns across ALL supplied DataFrames, not just the
@@ -3201,29 +3240,44 @@ def _wsum_wtot_cols(dfs):
     return wsum, wtot
 
 
+def _weighted(df, weight):
+    """The table with every accumulator column multiplied by the path weight."""
+    df = df.copy()
+    columns = [c for c in df.columns[1:] if c.endswith(('_wsum', '_wtot'))]
+    df[columns] = df[columns] * weight
+    return df
+
+
 def _collect_tables(path_start, path_end, weights, kinds=_TABLE_KEYS):
-    """Every path's tables, read with one open per path.
+    """Every path's tables with its current weight applied, one open per path.
 
     Returns ({kind: path_numbers}, {kind: DataFrames}); the path numbers are
     needed to build contiguous MC-time blocks for the jackknife in
-    _pool_weighted_means.
+    _pool_weighted_means. Paths without a positive weight contribute nothing
+    and are left out rather than pooled as zeros.
     """
     pns = {kind: [] for kind in kinds}
     dfs = {kind: [] for kind in kinds}
-    no_weight = no_file = 0
+    no_weight = no_file = stale = 0
     missing = {kind: 0 for kind in kinds}
 
     for pn in range(path_start, path_end + 1):
-        if not contains_key(weights, pn):
+        weight = weights.get(pn, 0.0)
+        if not weight > 0.0:
             no_weight += 1
             continue
-        tables = read_path_tables(path_output_file(pn), kinds)
+        path = path_output_file(pn)
+        tables = read_path_tables(path, kinds)
         if not tables:
-            no_file += 1
+            version = path_output_version(path)
+            if version is not None and version != PATH_FILE_VERSION:
+                stale += 1
+            else:
+                no_file += 1
             continue
         for kind in kinds:
             if kind in tables:
-                dfs[kind].append(tables[kind])
+                dfs[kind].append(_weighted(tables[kind], weight))
                 pns[kind].append(pn)
             else:
                 missing[kind] += 1
@@ -3231,8 +3285,13 @@ def _collect_tables(path_start, path_end, weights, kinds=_TABLE_KEYS):
     # One summary rather than a line per path: at 10^4 paths the per-path
     # messages drowned everything else the aggregation printed.
     if no_weight or no_file:
-        print(f"  [aggregate] skipped {no_weight} path(s) without a weight and "
-              f"{no_file} without an output file.")
+        print(f"  [aggregate] skipped {no_weight} path(s) without a positive "
+              f"weight and {no_file} without an output file.")
+    if stale:
+        print(f"  [aggregate] skipped {stale} path file(s) in an older format "
+              "(their sums carry the weights they were computed with). A run "
+              "recomputes them automatically, provided the path's trajectories "
+              "are still in ../load.")
     partial = {kind: n for kind, n in missing.items() if n}
     if partial:
         print(f"  [aggregate] paths missing individual tables: {partial}")
@@ -4090,7 +4149,7 @@ def plot_spatial_overview(
 
 def membrane_spatial(
     # ── Input data ────────────────────────────────────────────
-    weights: Annotated[str, typer.Option("-weights", "--weights", help="", rich_help_panel=panels.INPUT)] = 'path_weights.txt',
+    weights: Annotated[str, typer.Option("-weights", "--weights", help="WHAM path weights, applied when the paths are aggregated (-plot). Computing the per-path files does not need them: those store unweighted sums, so after the weights change a rerun with -plot re-aggregates without recomputing any path", rich_help_panel=panels.INPUT)] = 'path_weights.txt',
     data: Annotated[str, typer.Option("-data", "--data", help="Path to infretis_data.txt.", rich_help_panel=panels.INPUT)] = ...,
     permeant: Annotated[str, typer.Option("-permeant", "--permeant", help="", rich_help_panel=panels.INPUT)] = 'ORP',
     leaflets_opt: Annotated[str, typer.Option("-leaflets", "--leaflets", help="Comma-separated leaflets to include in plots, e.g. 'both,upper,lower'.", rich_help_panel=panels.INPUT)] = "both,upper,lower",
@@ -4188,7 +4247,6 @@ def membrane_spatial(
         path_start          = args.start,
         path_end            = end,
         overwrite           = args.overwrite,
-        weights_file        = args.weights,
         data_file           = args.data,
         permeant_resname    = args.permeant,
         lipid_resnames      = ('DOPC', 'POPC'),

@@ -765,7 +765,7 @@ class TestWriteStitching:
 
     def test_stitch_runs_matches_free_energy_from_runs(self, tmp_path):
         runs = TestFreeEnergyFromRuns._three_stages(tmp_path)
-        st = stitch_runs(runs, symmetrize=True)
+        st, _ = stitch_runs(runs, symmetrize=True)
         z_a, g_a = free_energy_from_counts(st.centers, st.total)
         z_b, g_b = free_energy_from_runs(runs, symmetrize=True)
         assert z_a == pytest.approx(z_b) and g_a == pytest.approx(g_b)

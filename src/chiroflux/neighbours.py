@@ -137,8 +137,9 @@ def read_toml(toml_file):
         with open(toml_file, mode="rb") as read:
             config = tomli.load(read)
     else:
-        print("No toml file, exit.")
-        return
+        # Returning None here made the caller die unpacking it, with a
+        # TypeError that said nothing about the missing file.
+        raise FileNotFoundError(f"TOML not found: {toml_file}")
     interfaces = config["simulation"]["interfaces"]
     lambda_A = interfaces[0]
     lambda_B = interfaces[-1]
@@ -170,10 +171,6 @@ def get_reactive_paths(path_number, infretis_data_file, lambda_B):
     else:
         return None
 
-
-def contains_key(d: dict[int, float], key: int) -> bool:
-    # Only include paths in histogram that have weights
-    return key in d
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Slab grid construction
@@ -418,6 +415,81 @@ def _csv_path(path_number):
     return Path(NEIGH_OUT) / f"{path_number}_neighbour.csv"
 
 
+#: Third header line of a per-path CSV whose counts are stored at weight 1.
+#: The WHAM path weight is applied when the paths are loaded for aggregation,
+#: so renormalised weights after extending the simulations need a
+#: re-aggregation, not a rerun. Files without it have the weight of the day
+#: multiplied in; reading one as unweighted would apply a weight twice, so
+#: they are recomputed by the workers and skipped by the aggregation.
+UNWEIGHTED_MARKER = "# unweighted counts; path weight applied at aggregation"
+
+#: The per-path columns the path weight multiplies. Both kinds are linear in
+#: it: raw counts accumulate `+= w`, normalised counts are those over a frame
+#: count that does not depend on w.
+COUNT_PREFIXES = ("weighted_count_", "norm_count_")
+
+
+def _read_header(csv, n=3):
+    with open(csv) as handle:
+        return [handle.readline().strip() for _ in range(n)]
+
+
+def _is_current(csv):
+    """Whether a per-path CSV exists and stores unweighted counts."""
+    try:
+        return _read_header(csv)[2] == UNWEIGHTED_MARKER
+    except OSError:
+        return False
+
+
+def load_weighted_paths(path_start, path_end, weights, quiet=False):
+    """Every usable path, with its current weight applied to its counts.
+
+    Returns a list of (path_number, DataFrame, reactivity, ensemble), where
+    reactivity is 'reactive' / 'non-reactive' / None and ensemble 'plus' /
+    'minus' / None, read from the CSV header. Paths without a positive weight
+    are left out rather than carried as zeros - in the bootstrap a zero-weight
+    path would still be drawn as one of the n resamples.
+    """
+    loaded = []
+    no_weight = no_file = stale = 0
+    for pn in range(path_start, path_end + 1):
+        weight = weights.get(pn, 0.0)
+        if not weight > 0.0:
+            no_weight += 1
+            continue
+        csv = _csv_path(pn)
+        if not csv.exists():
+            no_file += 1
+            continue
+        header = _read_header(csv)
+        if header[2] != UNWEIGHTED_MARKER:
+            stale += 1
+            continue
+
+        df = pd.read_csv(csv, comment='#')
+        columns = [c for c in df.columns if c.startswith(COUNT_PREFIXES)]
+        df[columns] = df[columns] * weight
+
+        reactivity = ("non-reactive" if "non-reactive" in header[0]
+                      else "reactive" if "reactive" in header[0] else None)
+        ensemble = ("plus" if "plus" in header[1]
+                    else "minus" if "minus" in header[1] else None)
+        loaded.append((pn, df, reactivity, ensemble))
+
+    # One summary rather than a line per path, which at 10^4 paths drowned
+    # everything else the aggregation printed.
+    if not quiet:
+        print(f"  [neighbours] {len(loaded)} path(s) loaded; skipped "
+              f"{no_weight} without a positive weight and {no_file} without a "
+              "CSV.")
+        if stale:
+            print(f"  [neighbours] skipped {stale} CSV(s) written before the "
+                  "counts were stored unweighted. A run recomputes them, "
+                  "provided the path's trajectories are still in ../load.")
+    return loaded
+
+
 def remove_first_last_frames(ensemble, lambda_minus_one, lambda_A, first, last):
     """
     Remove the first and last frame from the trajectory data to avoid double-counting
@@ -437,44 +509,9 @@ def remove_first_last_frames(ensemble, lambda_minus_one, lambda_A, first, last):
     return first_frame, last_frame
 
 
-def classify_files(path_start, path_end, weights):
-    plus_reactive = []
-    plus_non_reactive = []
-    minus = []
-
-    for pn in range(path_start, path_end + 1):
-        csv = _csv_path(pn)
-        if csv.exists() and contains_key(weights, pn):
-            with open(csv, 'r') as f:
-                header1 = f.readline().strip()
-                header2 = f.readline().strip()
-            if "non-reactive" in header1:
-                reactivity = "non-reactive"
-            elif "reactive" in header1:
-                reactivity = "reactive"
-            else:
-                reactivity = None
-
-            if "plus" in header2:
-                ensemble = "plus"
-            elif "minus" in header2:
-                ensemble = "minus"
-            else:
-                ensemble = None
-
-            if reactivity == "non-reactive" and ensemble == "plus":
-                plus_non_reactive.append(csv)
-            elif reactivity == "reactive" and ensemble == "plus":
-                plus_reactive.append(csv)
-            elif ensemble == "minus":
-                minus.append(csv)
-    return plus_reactive, plus_non_reactive, minus
-
-
 def process_single_path_neighbour(
     path_number,
     overwrite,
-    weights,
     lambda_A,
     lambda_B,
     lambda_minus_one,
@@ -486,14 +523,13 @@ def process_single_path_neighbour(
     slab_range       = None,
 ):
     """
-    Process neighbour analysis for one path. Writes a CSV containing only
-    raw weighted counts (no normalisation).
+    Process neighbour analysis for one path. Writes a CSV of counts at weight 1
+    (see UNWEIGHTED_MARKER); the path weight is applied at aggregation.
 
     Parameters
     ----------
     path_number      : int
     overwrite        : bool
-    weights          : dict[int, float]
     lambda_A         : float
     lambda_B         : float
     lambda_minus_one : float or None
@@ -506,7 +542,7 @@ def process_single_path_neighbour(
     """
     out_csv = _csv_path(path_number)
 
-    if not overwrite and out_csv.exists():
+    if not overwrite and _is_current(out_csv):
         return (path_number, 'skipped', 'Output CSV already exists.')
 
     path_folder = f"../load/{path_number}/accepted/"
@@ -530,12 +566,6 @@ def process_single_path_neighbour(
         if reactive is None:
             return (path_number, "skipped", "Path not found in infretis_data.txt")
 
-        weight = weights.get(path_number, None)
-        if weight is None:
-            print(f"  [neigh-worker] WARNING: path {path_number} not found in "
-                  f"weights file — defaulting to weight=1.0")
-            weight = 1.0
-
         #Check to see if first or last frame should be deleted
         first_frame, last_frame = remove_first_last_frames(ensemble, lambda_minus_one, lambda_A, first, last)
 
@@ -551,7 +581,7 @@ def process_single_path_neighbour(
         if len(xtc_files) == 0:
             return (path_number, 'skipped', 'No xtc files found.')
 
-        print(f"[neigh-worker] Path {path_number} (weight={weight:.6e}): "
+        print(f"[neigh-worker] Path {path_number}: "
               f"{len(xtc_files)} xtc file(s)"
               + (f", slab_range={slab_range}" if slab_range else ", slab_range=auto"))
 
@@ -560,7 +590,7 @@ def process_single_path_neighbour(
             xtc_files        = xtc_files,
             frame_plan       = frame_plan,
             permeant_resname = permeant_resname,
-            weight           = weight,
+            weight           = 1.0,        # applied at aggregation
             lipid_resnames   = lipid_resnames,
             slab_width       = slab_width,
             bilayer_normal   = bilayer_normal,
@@ -570,6 +600,7 @@ def process_single_path_neighbour(
         with open(out_csv, 'w') as f:
             f.write(f"# {'reactive' if reactive else 'non-reactive'}\n")
             f.write(f"# {ensemble} ensemble\n")
+            f.write(f"{UNWEIGHTED_MARKER}\n")
 
         counts_df.to_csv(out_csv, mode='a', index=False, float_format='%.6e')
         print(f"  [neigh-worker] Path {path_number} -> {out_csv}")
@@ -588,7 +619,6 @@ def loop_over_paths_neighbour_parallel(
     path_start,
     path_end,
     overwrite          = False,
-    weights_file       = 'path_weights.txt',
     data_file          = None,
     n_workers          = 32,
     permeant_resname   = 'ORP',
@@ -611,12 +641,12 @@ def loop_over_paths_neighbour_parallel(
 
     lambda_A, lambda_B, lambda_minus_one = read_toml('../infretis.toml')
 
-    weights      = load_path_weights(weights_file)
     end          = path_start + 1 if path_end is None else path_end + 1
     path_numbers = list(range(path_start, end))
 
-    print(f"Neighbour analysis: paths {path_start}–{path_end}, {n_workers} workers.")
-    print(f"Weights loaded from '{weights_file}': {len(weights)} entries.")
+    print(f"Neighbour analysis: paths {path_start}–{path_end}, {n_workers} workers. "
+          "Per-path counts are stored unweighted; the path weights are applied "
+          "at aggregation.")
     if slab_range:
         print(f"Manual slab range: {slab_range[0]} – {slab_range[1]} Å")
     else:
@@ -629,7 +659,7 @@ def loop_over_paths_neighbour_parallel(
         future_to_path = {
             executor.submit(
                 process_single_path_neighbour,
-                pn, overwrite, weights, lambda_A, lambda_B, lambda_minus_one,
+                pn, overwrite, lambda_A, lambda_B, lambda_minus_one,
                 data_file, permeant_resname, lipid_resnames,
                 slab_width, bilayer_normal, slab_range,
             ): pn
@@ -671,11 +701,13 @@ def loop_over_paths_neighbour_parallel(
 # Aggregation across all paths  (single normalisation happens here)
 # ═════════════════════════════════════════════════════════════════════════════
 
-def aggregate_neighbour_results(path_start, path_end, weights, count_prefix='weighted_count_'):
+def aggregate_neighbour_results(path_start, path_end, weights,
+                                count_prefix='weighted_count_', paths=None):
     """
-    Sum the raw weighted counts from every per-path CSV onto a common slab
-    grid, then apply a single normalisation so that 3-DOPC + 3-POPC + Mix
-    sums to 1.0 in every slab.
+    Sum the weighted counts from every per-path CSV onto a common slab grid,
+    then apply a single normalisation so that 3-DOPC + 3-POPC + Mix sums to
+    1.0 in every slab. The weights are applied here, by load_weighted_paths;
+    pass `paths` (its return value) to reuse CSVs already loaded.
 
     count_prefix : str
         'weighted_count_' (default) — dwell-time-weighted, paths that linger
@@ -688,14 +720,9 @@ def aggregate_neighbour_results(path_start, path_end, weights, count_prefix='wei
     pd.DataFrame  columns: slab_center, 3-DOPC, 3-POPC, Mix
     """
     labels  = ('3-DOPC', '3-POPC', 'Mix')
-    all_dfs = []
-
-    for pn in range(path_start, path_end + 1):
-        csv = _csv_path(pn)
-        if csv.exists() and contains_key(weights, pn):
-            all_dfs.append(pd.read_csv(csv, comment='#'))
-        else:
-            print(f"  [aggregate] Path {pn}: CSV not found or no weight available, skipping.")
+    if paths is None:
+        paths = load_weighted_paths(path_start, path_end, weights)
+    all_dfs = [df for _, df, _, _ in paths]
 
     if not all_dfs:
         raise RuntimeError("No neighbour CSVs found to aggregate.")
@@ -732,50 +759,32 @@ def pool_results(all_dfs, labels, count_prefix='weighted_count_'):
     return pd.DataFrame(result)
 
 
-def aggregate_ensemble_reactivity_specific_results(path_start, path_end, weights):
+def aggregate_ensemble_reactivity_specific_results(path_start, path_end, weights,
+                                                   paths=None):
     """
-    Similar to aggregate_neighbour_results() but only sums paths of a specific ensemble
-    (e.g. "plus" or "minus") and reactive/non-reactive status.
-
-    Returns
-    -------
-    pd.DataFrame  columns: slab_center, 3-DOPC, 3-POPC, Mix
+    Similar to aggregate_neighbour_results() but pools the plus-reactive,
+    plus-non-reactive and minus paths separately, writing a CSV and a plot for
+    each group that has any paths.
     """
-    labels  = ('3-DOPC', '3-POPC', 'Mix')
-    plus_reactive_data = []
-    plus_non_reactive_data = []
-    minus_data = []
+    labels = ('3-DOPC', '3-POPC', 'Mix')
+    if paths is None:
+        paths = load_weighted_paths(path_start, path_end, weights)
 
-    plus_reactive, plus_non_reactive, minus = classify_files(path_start, path_end, weights)
-    for csv in plus_reactive:
-        df = pd.read_csv(csv, comment='#')
-        plus_reactive_data.append(df)
-    if plus_reactive_data:
-        results = pool_results(plus_reactive_data, labels)
-        results.to_csv(str(Path(PLOT_OUT) / "neighbours_plus_reactive.csv"), index=False, float_format='%.6e')
+    groups = {
+        "plus_reactive":     [df for _, df, r, e in paths
+                              if e == "plus" and r == "reactive"],
+        "plus_non_reactive": [df for _, df, r, e in paths
+                              if e == "plus" and r == "non-reactive"],
+        "minus":             [df for _, df, _, e in paths if e == "minus"],
+    }
+    for name, dfs in groups.items():
+        if not dfs:
+            continue
+        results = pool_results(dfs, labels)
+        results.to_csv(str(Path(PLOT_OUT) / f"neighbours_{name}.csv"),
+                       index=False, float_format='%.6e')
         plot_neighbour_probabilities(results, output_path=str(
-                Path(PLOT_OUT) / "neighbours_plus_reactive.png"
-            ))
-
-    for csv in plus_non_reactive:
-        df = pd.read_csv(csv, comment='#')
-        plus_non_reactive_data.append(df)
-    if plus_non_reactive_data:
-        results = pool_results(plus_non_reactive_data, labels)
-        results.to_csv(str(Path(PLOT_OUT) / "neighbours_plus_non_reactive.csv"), index=False, float_format='%.6e')
-        plot_neighbour_probabilities(results, output_path=str(
-                Path(PLOT_OUT) / "neighbours_plus_non_reactive.png"
-            ))
-
-    for csv in minus:
-        df = pd.read_csv(csv, comment='#')
-        minus_data.append(df)
-    if minus_data:
-        results = pool_results(minus_data, labels)
-        results.to_csv(str(Path(PLOT_OUT) / "neighbours_minus.csv"), index=False, float_format='%.6e')
-        plot_neighbour_probabilities(results, output_path=str(
-                Path(PLOT_OUT) / "neighbours_minus.png"
-            ))
+            Path(PLOT_OUT) / f"neighbours_{name}.png"))
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -839,7 +848,8 @@ def compute_enrichment_statistics(
     path_dfs     : list of (path_number, df), optional — reuse already-loaded
                    path CSVs (e.g. to compute both count_prefix variants
                    without reading every CSV twice) instead of loading them
-                   from disk again.
+                   from disk again. They must already carry the path weights,
+                   as load_weighted_paths returns them.
 
     Returns
     -------
@@ -863,13 +873,8 @@ def compute_enrichment_statistics(
 
     # ── Load all path DataFrames and build a common slab grid ─────────────────
     if path_dfs is None:
-        path_dfs = []   # list of (path_number, df)
-        for pn in range(path_start, path_end + 1):
-            csv = _csv_path(pn)
-            if csv.exists() and contains_key(weights, pn):
-                path_dfs.append((pn, pd.read_csv(csv, comment='#')))
-            else:
-                print(f"  [stats] Path {pn}: CSV not found or no weight — skipping.")
+        path_dfs = [(pn, df) for pn, df, _, _ in
+                    load_weighted_paths(path_start, path_end, weights)]
 
     if not path_dfs:
         raise RuntimeError("No neighbour CSVs found for statistical analysis.")
@@ -1098,7 +1103,7 @@ def plot_enrichment(stats_df, output_path=None, alpha=0.05, title_suffix=''):
 
 def neighbours(
     # ── Input data ────────────────────────────────────────────
-    weights: Annotated[str, typer.Option("-weights", "--weights", help="", rich_help_panel=panels.INPUT)] = 'path_weights.txt',
+    weights: Annotated[str, typer.Option("-weights", "--weights", help="WHAM path weights, applied when the paths are aggregated (-plot / -stats). The per-path CSVs store counts at weight 1, so after the weights change a rerun re-aggregates without recomputing any path", rich_help_panel=panels.INPUT)] = 'path_weights.txt',
     data: Annotated[str, typer.Option("-data", "--data", help="", rich_help_panel=panels.INPUT)] = '../infretis_data_17.txt',
     permeant: Annotated[str, typer.Option("-permeant", "--permeant", help="", rich_help_panel=panels.INPUT)] = 'ORP',
 
@@ -1117,7 +1122,7 @@ start: Annotated[int, typer.Option("-start", "--start", help="", rich_help_panel
     alpha: Annotated[float, typer.Option("-alpha", "--alpha", help="Significance level for bootstrap test (default: 0.05).", rich_help_panel=panels.MODEL)] = 0.05,
     min_count: Annotated[float, typer.Option("-min-count", "--min-count", help="Minimum total weighted count per slab to include (default: 0.0005).", rich_help_panel=panels.MODEL)] = 0.0005,
     min_count_equal_path: Annotated[float, typer.Option("-min-count-equal-path", "--min-count-equal-path", help="Minimum total path-length-normalised count per slab to include for the equal-path-weighted statistics (default: 0.0). This is on a totally different scale from --min-count, since it is not inflated by dwell time — normalised path contributions sum to at most their path weight.", rich_help_panel=panels.MODEL)] = 0.0,
-    bulk_dopc: Annotated[float, typer.Option("-bulk-dopc", "--bulk-dopc", help="Bulk DOPC mole fraction for null hypothesis (default: 5/6).", rich_help_panel=panels.MODEL)] = '5 / 6',
+    bulk_dopc: Annotated[float, typer.Option("-bulk-dopc", "--bulk-dopc", help="Bulk DOPC mole fraction for null hypothesis (default: 5/6).", rich_help_panel=panels.MODEL)] = 5.0 / 6.0,
 
     # ── Output ────────────────────────────────────────────────
     overwrite: Annotated[bool, typer.Option("-overwrite", "--overwrite", help="", rich_help_panel=panels.OUTPUT)] = False,
@@ -1151,42 +1156,10 @@ start: Annotated[int, typer.Option("-start", "--start", help="", rich_help_panel
         bulk_dopc=bulk_dopc,
     )
 
-    import argparse
+    # The options above are the interface. There used to be an argparse block
+    # here that re-parsed sys.argv into `args`, silently discarding every one
+    # of them, so the command could not run.
 
-    parser = argparse.ArgumentParser(
-        description='Parallel weighted nearest-neighbour lipid analysis.'
-    )
-    parser.add_argument('-s', '--start',         type=int,   required=True)
-    parser.add_argument('-e', '--end',           type=int,   default=None)
-    parser.add_argument('-n', '--n-workers',    type=int,   default=20)
-    parser.add_argument('--overwrite',           action='store_true', default=False)
-    parser.add_argument('--weights',             type=str,   default='path_weights.txt')
-    parser.add_argument('--data',                type=str,   default='../infretis_data_17.txt')
-    parser.add_argument('--permeant',            type=str,   default='ORP')
-    parser.add_argument('--slab-width',          type=float, default=1.0)
-    parser.add_argument('--bilayer-normal',      type=str,   default='z')
-    parser.add_argument('--slab-range',          type=float, nargs=2,
-                        metavar=('Z_MIN', 'Z_MAX'), default=(-25,25),
-                        help='Fixed slab range in Å, e.g. --slab-range -40 40.')
-    parser.add_argument('--plot',                action='store_true', default=False)
-    # ── new statistics flags ──────────────────────────────────────────────────
-    parser.add_argument('--stats',               action='store_true', default=False,
-                        help='Compute enrichment statistics and bootstrap CI after aggregation.')
-    parser.add_argument('--n-bootstrap',         type=int,   default=5000,
-                        help='Number of path-level bootstrap resamples (default: 5000).')
-    parser.add_argument('--alpha',               type=float, default=0.05,
-                        help='Significance level for bootstrap test (default: 0.05).')
-    parser.add_argument('--min-count',           type=float, default=0.0005,
-                        help='Minimum total weighted count per slab to include (default: 0.0005).')
-    parser.add_argument('--min-count-equal-path', type=float, default=0.0,
-                        help='Minimum total path-length-normalised count per slab to include '
-                             'for the equal-path-weighted statistics (default: 0.0). This is '
-                             'on a totally different scale from --min-count, since it is not '
-                             'inflated by dwell time — normalised path contributions sum to '
-                             'at most their path weight.')
-    parser.add_argument('--bulk-dopc',           type=float, default=5/6,
-                        help='Bulk DOPC mole fraction for null hypothesis (default: 5/6).')
-    args = parser.parse_args()
 
     slab_range = tuple(args.slab_range) if args.slab_range is not None else None
 
@@ -1194,7 +1167,6 @@ start: Annotated[int, typer.Option("-start", "--start", help="", rich_help_panel
         path_start       = args.start,
         path_end         = args.end,
         overwrite        = args.overwrite,
-        weights_file     = args.weights,
         data_file        = args.data,
         n_workers        = args.n_workers,
         permeant_resname = args.permeant,
@@ -1208,10 +1180,13 @@ start: Annotated[int, typer.Option("-start", "--start", help="", rich_help_panel
         os.makedirs(PLOT_OUT, exist_ok=True)
         end     = args.end if args.end is not None else args.start
         weights = load_path_weights(args.weights)
+        # Read every CSV once, with its current weight applied, and reuse it
+        # for all the aggregates and both statistics variants.
+        paths = load_weighted_paths(args.start, end, weights)
 
     if args.plot:
         print("Aggregating results (dwell-time-weighted) ...")
-        agg = aggregate_neighbour_results(args.start, end, weights)
+        agg = aggregate_neighbour_results(args.start, end, weights, paths=paths)
         out = os.path.join(PLOT_OUT, "neighbour_aggregate.csv")
         agg.to_csv(out, index=False, float_format='%.6e')
         print(f"Aggregate profile written to {out}")
@@ -1221,7 +1196,8 @@ start: Annotated[int, typer.Option("-start", "--start", help="", rich_help_panel
 
         print("Aggregating results (equal-path-weighted, dwell-time removed) ...")
         agg_eq = aggregate_neighbour_results(args.start, end, weights,
-                                              count_prefix='norm_count_')
+                                              count_prefix='norm_count_',
+                                              paths=paths)
         out_eq = os.path.join(PLOT_OUT, "neighbour_aggregate_equal_path.csv")
         agg_eq.to_csv(out_eq, index=False, float_format='%.6e')
         print(f"Equal-path aggregate profile written to {out_eq}")
@@ -1229,7 +1205,8 @@ start: Annotated[int, typer.Option("-start", "--start", help="", rich_help_panel
                 os.path.join(PLOT_OUT, "neighbours_equal_path.png")
             ))
 
-        aggregate_ensemble_reactivity_specific_results(args.start, end, weights)
+        aggregate_ensemble_reactivity_specific_results(args.start, end, weights,
+                                                       paths=paths)
 
     if args.stats:
         print("\nRunning enrichment statistics ...")
@@ -1238,15 +1215,7 @@ start: Annotated[int, typer.Option("-start", "--start", help="", rich_help_panel
             'POPC': 1.0 - args.bulk_dopc,
         }
 
-        # Load every path CSV once and reuse it for both weighting schemes —
-        # avoids reading (potentially thousands of) CSVs from disk twice.
-        path_dfs = []
-        for pn in range(args.start, end + 1):
-            csv = _csv_path(pn)
-            if csv.exists() and contains_key(weights, pn):
-                path_dfs.append((pn, pd.read_csv(csv, comment='#')))
-            else:
-                print(f"  [stats] Path {pn}: CSV not found or no weight — skipping.")
+        path_dfs = [(pn, df) for pn, df, _, _ in paths]
 
         stats_df = compute_enrichment_statistics(
             path_start   = args.start,

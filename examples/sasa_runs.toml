@@ -6,7 +6,10 @@
 #
 #   name     : label used in output filenames and plot legends.
 #   load_dir : infretis `load/` directory holding the per-path trajectories.
-#   weights  : WHAM path-weights file for this run.
+#   weights  : WHAM path-weights file for this run. Read when the profiles
+#              are built, not when paths are computed, so after extending
+#              the simulation it can be replaced and applied with
+#              -skip-parsing, without recomputing any path.
 #   ml_dir   : the run's CV .txt folder, used to classify paths
 #              reactive/non-reactive and plus/minus.
 #   tpr      : topology for this run.

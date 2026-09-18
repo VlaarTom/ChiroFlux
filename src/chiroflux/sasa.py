@@ -56,6 +56,13 @@ Binning and statistics
 - z is binned in 1 A bins (Z_RANGE / Z_BIN_WIDTH), the resolution asked for.
 - Every frame of a path carries that path's weight, exactly as in
   analysis_parallel.py (factor = weight, applied to all rows of the path).
+  The weight is applied when the intermediates are analysed, not when they are
+  computed: the workers store each path's sums at weight 1 and load_group
+  multiplies them by the path's current weight times its run's scale. The WHAM
+  weights renormalise every time the simulations are extended, and this way that
+  costs a re-analysis (-skip-parsing) instead of a recomputation of every path.
+  A normal run likewise reuses the paths already in the intermediates and only
+  computes new ones, unless a setting that changes the computation differs.
 - The profile in a bin is the weighted mean  sum_p w_p S_p / sum_p w_p.
 - Uncertainty comes from a bootstrap over PATHS -- the independent sampling unit
   -- not over frames, which are massively correlated within a path.  Unlike the
@@ -89,7 +96,10 @@ there is the crossing-probability correction documented in analysis_parallel.py
 Output layout
 -------------
     <SASA_OUTPUT_DIR>/
-      intermediates/                    per-chunk .npz (per-path binned sums)
+      intermediates/                    per-chunk .npz (per-path binned sums
+                                        at weight 1, tagged with run and path)
+      sasa_meta.json                    settings, incl. those the intermediates
+                                        were computed with
       sasa_profile_<tag>.png            SASA(z), total / polar / apolar + CI
       sasa_burial_<tag>.png             burial fraction and relative exposure
       sasa_hist_<tag>.png               1-D weighted SASA distribution
@@ -120,6 +130,7 @@ import atexit
 import csv
 import faulthandler
 import glob
+import json
 import os
 import platform
 import signal
@@ -127,6 +138,7 @@ import sys
 import time
 import traceback
 import warnings
+import zipfile
 from collections import defaultdict
 from pathlib import Path
 from typing import Annotated, Optional
@@ -914,8 +926,11 @@ def _process_path_impl(job):
 
     Returns a dict, or None when the path cannot be used.
     """
-    (path_num, load_dir, ml_dir, tpr, weight, mirror_z, group,
+    (path_num, load_dir, ml_dir, tpr, run_name, mirror_z, group,
      z_centers, z_min, z_dz, s_centers, s_min, s_ds) = job
+    # Accumulated at weight 1: the path's WHAM weight (times its run's scale)
+    # is applied in load_group, so new weights need no recomputation.
+    weight = 1.0
 
     try:
         cache = _get_universe(tpr)
@@ -1075,7 +1090,7 @@ def _process_path_impl(job):
         "hist2d":   hist2d,
         "zp_up":    float(np.mean(zp_up)) if zp_up else np.nan,
         "zp_lo":    float(np.mean(zp_lo)) if zp_lo else np.nan,
-        "weight":   weight,
+        "run":      run_name,
     }
 
 
@@ -1091,11 +1106,25 @@ def intermediate_path(group_key, chunk_idx):
                         f"{chunk_idx:04d}__{group_tag(group_key)}__sasa.npz")
 
 
+#: 2: per-path sums at weight 1 and a per-path 2-D histogram, tagged with the
+#: run. 1 (no format_version member): sums already multiplied by the weights of
+#: the day and a 2-D histogram summed over the chunk, neither of which can be
+#: reweighted - so those chunks are never mixed in.
+INTERMEDIATE_VERSION = 2
+
+
+def chunk_index(fp):
+    """The chunk number a file name starts with."""
+    return int(os.path.basename(fp)[:4])
+
+
 def flush_chunk(buffer, chunk_idx):
     """
-    Write one chunk per group: the per-path binned sums stacked row-wise (kept
-    per path so the bootstrap can resample paths exactly) and the chunk-summed
-    2-D histogram (too big to keep per path).
+    Write one chunk per group: the per-path binned sums stacked row-wise, kept
+    per path so the bootstrap can resample paths exactly and so each path can
+    take its current weight when the chunks are analysed. The 2-D histogram is
+    kept per path for the same reason, in float32; a path covers only a few z
+    bins, so it compresses to little.
     """
     os.makedirs(INTERMEDIATE_DIR, exist_ok=True)
     for group_key, records in buffer.items():
@@ -1109,46 +1138,118 @@ def flush_chunk(buffer, chunk_idx):
             apo      = np.vstack([r["apo"]  for r in records]),
             free     = np.vstack([r["free"] for r in records]),
             tot2     = np.vstack([r["tot2"] for r in records]),
-            hist2d   = np.sum([r["hist2d"] for r in records], axis=0),
+            hist2d   = np.stack([r["hist2d"] for r in records]).astype(np.float32),
             path_num = np.array([r["path_num"] for r in records]),
+            run      = np.array([r["run"]    for r in records]),
             zp_up    = np.array([r["zp_up"]  for r in records]),
             zp_lo    = np.array([r["zp_lo"]  for r in records]),
-            weight   = np.array([r["weight"] for r in records]),
+            format_version = np.array(INTERMEDIATE_VERSION),
         )
     for group_key in buffer:
         buffer[group_key] = []
 
 
-def load_group(group_key):
-    """Concatenate every chunk of one group.  Returns None when it has none."""
+def run_weights():
+    """{run name: ({path_num: weight}, scale)} from the current RUNS.
+
+    Read when the intermediates are analysed, not when they are computed, so a
+    renormalised weights file after extending the simulations only needs the
+    analysis rerun (-skip-parsing).
+    """
+    out = {}
+    for run in RUNS:
+        wfile = resolve_data_path(run["weights"], must_be_dir=False)
+        weights = dict(load_path_weights(wfile)) if wfile else {}
+        out[run["name"]] = (weights, float(run.get("scale", 1.0)))
+    return out
+
+
+def _group_chunk_files(group_key):
     pattern = os.path.join(
         INTERMEDIATE_DIR, f"[0-9][0-9][0-9][0-9]__{group_tag(group_key)}__sasa.npz")
-    files = sorted(glob.glob(pattern))
+    return sorted(glob.glob(pattern))
+
+
+def _is_current_chunk(data):
+    return ("format_version" in data.files
+            and int(data["format_version"]) == INTERMEDIATE_VERSION)
+
+
+_PER_PATH_SUMS = ("w", "tot", "pol", "apo", "free", "tot2")
+
+
+def load_group(group_key, weights_by_run):
+    """Every chunk of one group, with each path's current weight applied.
+
+    A path's weight is its entry in its run's weights file times that run's
+    scale. Paths without a positive weight - or from a run no longer listed -
+    are left out, as is a (run, path) seen twice, and so is any chunk in the
+    older, pre-weighted format. Returns None when nothing usable is left.
+    """
+    files = _group_chunk_files(group_key)
     if not files:
         return None
 
     acc = defaultdict(list)
     hist2d = None
+    seen = set()
+    stale = unweighted = duplicate = 0
+
     for fp in files:
-        d = np.load(fp)
-        for key in ("w", "tot", "pol", "apo", "free", "tot2",
-                    "path_num", "zp_up", "zp_lo", "weight"):
-            acc[key].append(d[key])
-        hist2d = d["hist2d"].copy() if hist2d is None else hist2d + d["hist2d"]
+        with np.load(fp) as d:
+            if not _is_current_chunk(d):
+                stale += 1
+                continue
+            runs = d["run"].tolist()
+            path_nums = d["path_num"].tolist()
+
+            keep, weight = [], []
+            for i, (run, pn) in enumerate(zip(runs, path_nums)):
+                key = (run, int(pn))
+                if key in seen:
+                    duplicate += 1
+                    continue
+                seen.add(key)
+                table, scale = weights_by_run.get(run, ({}, 0.0))
+                w = float(table.get(int(pn), 0.0)) * scale
+                if not w > 0.0:
+                    unweighted += 1
+                    continue
+                keep.append(i)
+                weight.append(w)
+            if not keep:
+                continue
+
+            keep = np.asarray(keep)
+            weight = np.asarray(weight, dtype=np.float64)
+            for key in _PER_PATH_SUMS:
+                acc[key].append(d[key][keep] * weight[:, None])
+            for key in ("path_num", "run", "zp_up", "zp_lo"):
+                acc[key].append(d[key][keep])
+            acc["weight"].append(weight)
+            h = np.tensordot(weight, d["hist2d"][keep].astype(np.float64), axes=1)
+            hist2d = h if hist2d is None else hist2d + h
+
+    if stale or unweighted or duplicate:
+        print(f"  [{group_tag(group_key)}] left out: {unweighted} path(s) without "
+              f"a positive weight, {duplicate} duplicate(s), {stale} chunk(s) in "
+              "the older pre-weighted format")
+    if not acc:
+        return None
 
     out = {k: np.concatenate(v, axis=0) for k, v in acc.items()}
     out["hist2d"] = hist2d
     return out
 
 
-def merge_groups(groups):
+def merge_groups(groups, weights_by_run):
     """Pool several groups into one dataset (used for the combined plus ensemble)."""
-    loaded = [g for g in (load_group(k) for k in groups) if g is not None]
+    loaded = [g for g in (load_group(k, weights_by_run) for k in groups)
+              if g is not None]
     if not loaded:
         return None
     out = {}
-    for key in ("w", "tot", "pol", "apo", "free", "tot2",
-                "path_num", "zp_up", "zp_lo", "weight"):
+    for key in _PER_PATH_SUMS + ("path_num", "run", "zp_up", "zp_lo", "weight"):
         out[key] = np.concatenate([g[key] for g in loaded], axis=0)
     out["hist2d"] = np.sum([g["hist2d"] for g in loaded], axis=0)
     return out
@@ -1423,8 +1524,10 @@ def write_profile_csv(z_centers, prof, out_path):
 
 def build_job_list(bin_info):
     """
-    (path_num, weight, group) for every weighted path of every run, together
-    with everything a worker needs to run standalone.
+    One job for every path listed in each run's weights file, together with
+    everything a worker needs to run standalone. A job carries its run's name
+    rather than a weight: the weight is looked up when the intermediates are
+    analysed, so it can change without the path being recomputed.
     """
     z_centers, z_min, z_dz = bin_info["z"]
     s_centers, s_min, s_ds = bin_info["SASA"]
@@ -1455,7 +1558,7 @@ def build_job_list(bin_info):
             print(f"    TESTING: limited to the first {len(ordered)} paths")
 
         n_unclassified = n_missing = 0
-        for path_num, weight in ordered:
+        for path_num, _weight in ordered:
             group = classify_path(ml_dir, path_num)
             if group is None or group not in ALL_GROUPS:
                 n_unclassified += 1
@@ -1463,8 +1566,7 @@ def build_job_list(bin_info):
             if not os.path.isdir(os.path.join(load_dir, str(path_num))):
                 n_missing += 1
                 continue
-            jobs.append((path_num, load_dir, ml_dir, tpr,
-                         weight * float(run.get("scale", 1.0)),
+            jobs.append((path_num, load_dir, ml_dir, tpr, name,
                          bool(run.get("mirror_z", False)), group,
                          z_centers, z_min, z_dz, s_centers, s_min, s_ds))
 
@@ -1573,8 +1675,13 @@ def _progress_line(n_seen, n_jobs, t_start, n_err):
             f"ETA {_fmt_hms(eta)}  RSS {rss_mb():.0f} MB  {n_err} failed")
 
 
-def parse_all(bin_info):
-    """Run every path through the pool, flushing per-path sums every FLUSH_EVERY."""
+def parse_all(bin_info, done=frozenset(), first_chunk=0):
+    """Run every path through the pool, flushing per-path sums every FLUSH_EVERY.
+
+    `done` holds the (run, path) pairs already in reusable intermediates; they
+    are not recomputed, and new chunks are numbered from `first_chunk` on, so
+    extending the simulations only costs the new paths.
+    """
     from multiprocessing import Pool
     from multiprocessing import TimeoutError as mp_TimeoutError
 
@@ -1583,13 +1690,22 @@ def parse_all(bin_info):
         print("\nERROR: no paths to process.  Check RUNS at the top of the file.")
         raise SystemExit(1)
 
+    n_listed = len(jobs)
+    jobs = [job for job in jobs if (job[4], job[0]) not in done]
+    if n_listed != len(jobs):
+        print(f"\n{n_listed - len(jobs)} of {n_listed} paths are already in the "
+              "intermediates and are reused.")
+    if not jobs:
+        print("Nothing new to compute.")
+        return
+
     print(f"\n{len(jobs)} paths to process with {N_WORKERS} workers "
           f"({N_SPHERE_POINTS} dots/atom, probe {PROBE_RADIUS} A, "
           f"occluders = {'membrane + water' if OCCLUDE_WITH_WATER else 'membrane'})")
 
     buffer   = {k: [] for k in ALL_GROUPS}
     n_done   = 0
-    chunk    = 0
+    chunk    = first_chunk
     errors   = []
     op_devs  = []
     n_frames = 0
@@ -1733,11 +1849,12 @@ def analyse(bin_info):
     z_centers, z_min, z_dz = bin_info["z"]
     s_centers, s_min, s_ds = bin_info["SASA"]
 
-    datasets = [(f"{r} | {e} ensemble", group_tag((r, e)), load_group((r, e)),
-                 HIST_COLOR[(r, e)])
+    weights_by_run = run_weights()
+    datasets = [(f"{r} | {e} ensemble", group_tag((r, e)),
+                 load_group((r, e), weights_by_run), HIST_COLOR[(r, e)])
                 for (r, e) in ALL_GROUPS]
 
-    combined = merge_groups(COMBINED_PLUS)
+    combined = merge_groups(COMBINED_PLUS, weights_by_run)
     if combined is not None:
         datasets.append(("non-reactive + reactive | plus ensemble",
                          "combined_plus", combined, "#4a1a6b"))
@@ -1796,6 +1913,102 @@ def analyse(bin_info):
     print(f"\n  Plots -> {os.path.relpath(OUTPUT_DIR)}/")
 
 
+# ── 10. REUSING INTERMEDIATES ────────────────────────────────────────────────
+
+META_FILE = "sasa_meta.json"
+
+
+def computation_params():
+    """Every setting that changes what a worker computes for a path.
+
+    Intermediates made under different settings cannot be pooled with new
+    ones, so these are recorded next to them and compared before any reuse.
+    The path weights and run scales are deliberately not here: they are applied
+    at analysis, which is what lets them change freely.
+    """
+    return json.loads(json.dumps({
+        "format_version": INTERMEDIATE_VERSION,
+        "z_range": list(Z_RANGE),
+        "z_bin_width": Z_BIN_WIDTH,
+        "sasa_range": list(SASA_RANGE),
+        "fold_symmetric": bool(FOLD_SYMMETRIC),
+        "probe_radius": PROBE_RADIUS,
+        "n_sphere_points": N_SPHERE_POINTS,
+        "occlude_with_water": bool(OCCLUDE_WITH_WATER),
+        "selections": {"solute": SOLUTE_SEL, "membrane": MEMBRANE_SEL,
+                       "water": WATER_SEL, "phosphate": PHOSPHATE_SEL},
+        "mirror_z": {r["name"]: bool(r["mirror_z"]) for r in RUNS},
+    }))
+
+
+def read_previous_params():
+    """The computation settings the existing intermediates were made with."""
+    try:
+        with open(os.path.join(OUTPUT_DIR, META_FILE)) as fh:
+            return json.load(fh).get("computation")
+    except (OSError, ValueError):
+        return None
+
+
+def changed_settings(previous, current):
+    """Names of the settings that differ; None means there is no record.
+
+    A run's mirror_z only matters for runs present in both: adding or dropping
+    a run leaves the other runs' paths valid.
+    """
+    if previous is None:
+        return None
+    changed = [k for k in current if k != "mirror_z"
+               and previous.get(k) != current[k]]
+    before, now = previous.get("mirror_z", {}), current.get("mirror_z", {})
+    changed += [f"mirror_z[{name}]" for name in sorted(before.keys() & now.keys())
+                if before[name] != now[name]]
+    return changed
+
+
+def prepare_intermediates(params, previous, recompute=False):
+    """Keep what can be reused; return (done (run, path) pairs, next chunk).
+
+    Everything is deleted when -recompute is given or a computation setting
+    changed. Otherwise only chunks in the older pre-weighted format (or
+    unreadable ones) go, and the (run, path) pairs in the rest are reported as
+    done so the workers skip them.
+    """
+    files = sorted(glob.glob(os.path.join(INTERMEDIATE_DIR, "*__sasa.npz")))
+    if not files:
+        return set(), 0
+
+    changed = changed_settings(previous, params)
+    reason = ("-recompute was given" if recompute
+              else "no record of the settings they were made with" if changed is None
+              else f"settings changed: {', '.join(changed)}" if changed
+              else None)
+    if reason:
+        for fp in files:
+            os.remove(fp)
+        print(f"\nRecomputing every path ({reason}); removed {len(files)} "
+              "intermediate file(s).")
+        return set(), 0
+
+    done, next_chunk, removed = set(), 0, 0
+    for fp in files:
+        try:
+            with np.load(fp) as d:
+                if not _is_current_chunk(d):
+                    raise ValueError("older format")
+                done.update((run, int(pn)) for run, pn in
+                            zip(d["run"].tolist(), d["path_num"].tolist()))
+        except (OSError, ValueError, EOFError, KeyError, zipfile.BadZipFile):
+            os.remove(fp)
+            removed += 1
+            continue
+        next_chunk = max(next_chunk, chunk_index(fp) + 1)
+    if removed:
+        print(f"\nRemoved {removed} intermediate file(s) in the older "
+              "pre-weighted format; their paths are recomputed.")
+    return done, next_chunk
+
+
 def sasa(
     # ── Input data ────────────────────────────────────────────────────────
     runs: Annotated[str, typer.Option("-runs", help="REQUIRED. TOML file listing the simulations to combine as [[run]] tables (load_dir, weights, ml_dir, tpr, scale, mirror_z). See examples/sasa_runs.toml.", rich_help_panel=panels.INPUT)] = ...,
@@ -1818,7 +2031,8 @@ def sasa(
     # ── Model and training ────────────────────────────────────────────────
     workers: Annotated[int, typer.Option("-workers", help="Worker processes; each handles one path at a time.", rich_help_panel=panels.MODEL)] = N_WORKERS,
     n_bootstrap: Annotated[int, typer.Option("-n-bootstrap", help="Path-level bootstrap resamples for the profile confidence band.", rich_help_panel=panels.MODEL)] = N_BOOTSTRAP,
-    skip_parsing: Annotated[bool, typer.Option("-skip-parsing", help="Reuse existing intermediates instead of re-reading the trajectories.", rich_help_panel=panels.MODEL)] = SKIP_PARSING,
+    skip_parsing: Annotated[bool, typer.Option("-skip-parsing", help="Only analyse the existing intermediates; read no trajectories. The path weights are applied at analysis, so this is how to redo the profiles after the weights change. Without it, paths already in the intermediates are reused and only new ones are computed", rich_help_panel=panels.MODEL)] = SKIP_PARSING,
+    recompute: Annotated[bool, typer.Option("-recompute", help="Discard the existing intermediates and recompute every path. Not needed after changing settings that affect the computation - that is detected and triggers it anyway", rich_help_panel=panels.MODEL)] = False,
 
     # ── Output ────────────────────────────────────────────────────────────
     out_dir: Annotated[str, typer.Option("-out-dir", help="Directory for profiles, plots and intermediates.", rich_help_panel=panels.OUTPUT)] = OUTPUT_DIR,
@@ -1868,10 +2082,22 @@ def sasa(
 
     setup_debug_log()
 
-    # Write a JSON file with the parameters used for this run, so the plots and CSVs can be interpreted later.
-    import json as _json
-    with open(os.path.join(OUTPUT_DIR, "sasa_meta.json"), "w") as _fh:
-        _json.dump({
+    params = computation_params()
+    previous = read_previous_params()
+    if SKIP_PARSING:
+        changed = changed_settings(previous, params)
+        if changed:
+            print("ERROR: -skip-parsing, but the intermediates were computed with "
+                  f"different settings ({', '.join(changed)}). Rerun without "
+                  "-skip-parsing to recompute them.")
+            raise SystemExit(1)
+
+    # Write a JSON file with the parameters used for this run, so the plots and
+    # CSVs can be interpreted later - and so the next run can tell whether the
+    # intermediates are still reusable.
+    with open(os.path.join(OUTPUT_DIR, META_FILE), "w") as _fh:
+        json.dump({
+            "computation": params,
             "z_range": list(Z_RANGE),
             "z_bin_width": Z_BIN_WIDTH,
             "sasa_range": list(SASA_RANGE),
@@ -1898,9 +2124,8 @@ def sasa(
             raise SystemExit(1)
         print(f"\n-skip-parsing - reusing {len(existing)} intermediate files.")
     else:
-        for stale in glob.glob(os.path.join(INTERMEDIATE_DIR, "*__sasa.npz")):
-            os.remove(stale)
-        parse_all(bin_info)
+        done, first_chunk = prepare_intermediates(params, previous, recompute)
+        parse_all(bin_info, done=done, first_chunk=first_chunk)
 
     print("\nBuilding profiles from intermediates...")
     analyse(bin_info)
