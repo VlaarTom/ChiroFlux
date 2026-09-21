@@ -343,7 +343,11 @@ def test_histograms_exposes_the_settings_that_differed_between_copies():
     [
         ("neighbours", ["slab_range"]),
         ("membrane_spatial",
-         ["N_WORKERS", "leaflets", "near_n", "slab_range", "water_z_range"]),
+         # water_z_range is deliberately absent: unlike the others it is never
+         # assigned by the command and never read as a global by any helper —
+         # it reaches everything that needs it as a parameter. Declaring it
+         # global was a no-op, so there is nothing here for it to protect.
+         ["N_WORKERS", "leaflets", "near_n", "slab_range"]),
     ],
 )
 def test_converted_scripts_still_publish_their_module_globals(

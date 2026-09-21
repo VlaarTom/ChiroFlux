@@ -375,7 +375,7 @@ class TestOlderFormat:
     def test_the_current_version_is_written(self, tmp_path):
         path = tmp_path / "1.npz"
         write_path_output(path, tables=_all_tables(np.random.default_rng(24)))
-        assert path_output_version(path) == PATH_FILE_VERSION == 2
+        assert path_output_version(path) == PATH_FILE_VERSION == 6
 
     def test_an_older_file_needs_everything_recomputed(self, tmp_path):
         rng = np.random.default_rng(25)

@@ -21,10 +21,23 @@ Inputs are the files the rest of the package already writes:
   needed to reference the stages to each other is in there, so nothing has to
   be typed in by hand.
 * ``diffusion_aggregate.csv`` from ``membrane_spatial`` - ``slab_center``
-  (already the order-parameter axis) with ``D_z`` in A^2/ps, plus its ``_err``
-  and ``_neff`` jackknife columns. ``D_z_lag2`` is the same estimate at twice
-  the lag: if it disagrees with ``D_z``, the motion is not yet diffusive at the
-  frame spacing.
+  (already the order-parameter axis) with the local diffusion coefficient in
+  A^2/ps, plus its ``_err`` and ``_neff`` jackknife columns.
+
+  The column to use is ``D_z_fit``, and it is the default. The raw ``D_z`` is
+  MSD/2tau at a single short lag, which equals D only if the motion is already
+  diffusive at the frame spacing; where it is not - the permeant still rattling
+  in a cage of lipid tails - MSD grows slower than linearly and the single-lag
+  value reads HIGH. ``D_z_fit`` instead fits MSD = c + 2 D tau across a scan of
+  lags (``D_z``, ``D_z_lag2``, ``D_z_lag3`` ...), so the bounded fast component
+  lands in the intercept c and the slope is the diffusive D.
+
+  This matters more than its size suggests. D enters 1/P linearly, so a uniform
+  20% error in D is a 20% error in P and nothing worse. But the single-lag bias
+  is NOT uniform: it grows with how far that slab is from its diffusive plateau,
+  which is largest in the ordered headgroup region - the same region where
+  exp(beta dG) peaks for a polar permeant. A position-dependent bias under an
+  exponentially weighted integral does not cancel.
 
 A single staged run covers only part of the membrane, so the three are combined.
 They cannot simply be spliced: each stage's WHAM histogram is *conditional* on
@@ -583,7 +596,7 @@ def join_profiles(profiles, shifts=None, overlap=None):
     return z[order], g[order]
 
 
-def load_diffusion(path, column="D_z", min_neff=0.0,
+def load_diffusion(path, column="D_z_fit", min_neff=0.0,
                    midplane=0.0, flip=False):
     """(z, D, D_err) from a membrane_spatial diffusion aggregate, on the OP axis.
 
@@ -606,9 +619,15 @@ def load_diffusion(path, column="D_z", min_neff=0.0,
     if "slab_center" not in frame.columns:
         raise ValueError(f"{path}: no 'slab_center' column.")
     if column not in frame.columns:
+        hint = ""
+        if column.endswith("_fit"):
+            hint = (" — an aggregate written before the lag scan has no fitted "
+                    "column; re-run membrane-spatial to get one, or pass "
+                    "-d-column D_z to use the single-lag value as it stands")
         raise ValueError(
             f"{path}: no '{column}' column. Available: "
             + ", ".join(c for c in frame.columns if c.startswith("D_"))
+            + hint
         )
 
     z = frame["slab_center"].to_numpy(dtype=float)
@@ -991,7 +1010,7 @@ def permeation_process(
     diffusion: Annotated[str, typer.Option("-diffusion", help="diffusion_aggregate.csv from membrane-spatial", rich_help_panel=panels.INPUT)] = "membrane_plots/diffusion_aggregate.csv",
     cv_dir: Annotated[Optional[str], typer.Option("-cv-dir", help="Folder of per-path CV .txt files used to locate the midplane with -midplane auto; defaults to ML/ inside the first -runs directory", rich_help_panel=panels.INPUT)] = None,
     label: Annotated[str, typer.Option("-label", help="Name for this run in the plot title and the summary", rich_help_panel=panels.INPUT)] = "permeant",
-    d_column: Annotated[str, typer.Option("-d-column", help="Which diffusion column to use: D_z is the local short-time estimate, D_z_lag2 the same at twice the lag (a diffusive-regime check, not a rival estimate)", rich_help_panel=panels.DATASET)] = "D_z",
+    d_column: Annotated[str, typer.Option("-d-column", help="Which diffusion column to use. D_z_fit is the lag-scan extrapolation MSD = c + 2D*tau and is what you want. D_z, D_z_lag2, D_z_lag3 ... are the raw per-lag MSD/2tau values behind it, useful for seeing how far from diffusive a region is, but each is biased high wherever the motion has not yet reached its plateau at that lag", rich_help_panel=panels.DATASET)] = "D_z_fit",
     midplane: Annotated[str, typer.Option("-midplane", help="Offset in Angstrom subtracted from the diffusion slab centres. membrane-spatial already bins on membrane_z - permeant_z, the order-parameter coordinate itself, so the default 0 is right for its diffusion_aggregate.csv. Use a number, or 'auto' to measure it from the CV trajectories, only for a profile that is genuinely on lab-frame z", rich_help_panel=panels.DATASET)] = "0",
     flip: Annotated[bool, typer.Option("-flip/-no-flip", help="Negate the diffusion axis, op = -(slab_center - midplane). Off by default because membrane-spatial's axis already runs the same way as the order parameter. Ignored when -midplane auto measures the sign", rich_help_panel=panels.DATASET)] = False,
     op_col: Annotated[str, typer.Option("-op-col", help="Order-parameter column in the CV files, for -midplane auto", rich_help_panel=panels.DATASET)] = "OP_Lamb",

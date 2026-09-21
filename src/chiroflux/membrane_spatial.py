@@ -105,15 +105,23 @@ def _split_values(text, flag, cast, n):
         raise typer.BadParameter(f"{flag}: bad value in {text!r}") from None
 
 
-def p2_order_parameter(bond_vectors, normal=MEMBRANE_NORMAL):
+def p2_order_parameter(bond_vectors, normal=MEMBRANE_NORMAL, box=None):
     """
     Compute the P2 order parameter.
 
     P2 uses cos²θ so it is insensitive to the sign of the bond vector —
     upper and lower leaflet bonds can safely be mixed.  No leaflet split
     is required here.
+
+    `box` (3 box lengths) minimum-images the vectors first, which is required
+    whenever they were built from raw, independently-wrapped coordinates —
+    see _min_image. A bond split across a lateral boundary otherwise reads as
+    a box-length vector lying in the membrane plane, i.e. P2 = -0.5, and the
+    error is one-directional because lipids do not wrap along the normal.
     """
     vecs  = np.asarray(bond_vectors, dtype=float)
+    if box is not None:
+        vecs = _min_image(vecs, box)
     norms = np.linalg.norm(vecs, axis=1, keepdims=True)
     valid = (norms[:, 0] > 1e-6)
     if not np.any(valid):
@@ -126,14 +134,48 @@ def p2_order_parameter(bond_vectors, normal=MEMBRANE_NORMAL):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Mean tilt angle  — leaflet-aware
+# Collective tilt angle  — leaflet-aware
 # ═════════════════════════════════════════════════════════════════════════════
 
 def mean_tilt_angle(tip_positions, base_positions, normal=MEMBRANE_NORMAL,
-                    leaflet='both', upper_mask=None):
+                    leaflet='both', upper_mask=None, box=None):
     """
-    Compute the mean tilt angle (θ) and azimuthal angle (φ) for a set of
-    lipid chains.
+    Collective tilt angle (θ) and azimuthal angle (φ) for a set of lipid
+    chains.
+
+    Returns
+    -------
+    theta_collective, phi, mean_vector, theta_individual
+
+    Two different tilt angles, both wanted
+    --------------------------------------
+    `theta_collective` averages the chain VECTORS and takes the angle of the
+    mean. That is a nematic-like order parameter: the direction the leaflet
+    leans as a whole. Because the random part of each chain's orientation
+    cancels in the vector average, it is systematically SMALLER than the
+    typical chain's tilt — a leaflet with every chain at 30° to the normal but
+    uniformly spread in azimuth gives θ_collective ≈ 0.
+
+    `theta_individual` takes the angle of each chain first and averages those.
+    That is "the average lipid is tilted by X", and for the same splayed
+    leaflet it gives 30°.
+
+    Neither is a substitute for the other, which is why both are returned:
+    θ_collective answers "is the leaflet leaning, and which way", θ_individual
+    answers "how far from the normal is a typical chain". Their difference
+    measures the splay. Both are built the same way otherwise — per leaflet
+    against that leaflet's own inward reference, then combined — so they
+    differ only in whether the averaging happens before or after the arccos.
+
+    Periodic images
+    ---------------
+    `box` (3 box lengths) minimum-images each tip-base vector. Supply it.
+    The end-to-end vector of an acyl chain is long — ~18 Å for C21→C216 —
+    so in a ~70 Å box on the order of 15% of chains straddle a lateral
+    boundary in any frame, and an unwrapped one becomes a ~L vector lying in
+    the membrane plane. Because the vectors are averaged before the angle is
+    taken, one such artifact outweighs about four genuine chains: an
+    untilted leaflet measured this way reads several degrees tilted.
 
     Vector convention
     ------------------
@@ -178,6 +220,8 @@ def mean_tilt_angle(tip_positions, base_positions, normal=MEMBRANE_NORMAL,
     """
     vecs     = np.asarray(tip_positions,  dtype=float) \
              - np.asarray(base_positions, dtype=float)
+    if box is not None:
+        vecs = _min_image(vecs, box)
     base_pos = np.asarray(base_positions, dtype=float)
     n        = np.asarray(normal, dtype=float)
     n        = n / np.linalg.norm(n)
@@ -217,9 +261,29 @@ def mean_tilt_angle(tip_positions, base_positions, normal=MEMBRANE_NORMAL,
         last_mean_vec = mean_vec
 
     if not theta_results:
-        return np.nan, np.nan, vecs.mean(axis=0)
+        return np.nan, np.nan, vecs.mean(axis=0), np.nan
 
     theta_deg = float(np.mean(theta_results))
+
+    # The mean of the INDIVIDUAL chain angles, reported alongside. Each chain
+    # is measured against its own leaflet's inward reference and the angles
+    # are averaged per leaflet before the leaflets are combined, matching how
+    # theta_deg is built — so the two differ only in whether the averaging
+    # happens before or after the arccos, which is exactly the quantity of
+    # interest: theta_ind - theta_deg is a measure of how splayed the leaflet
+    # is, and theta_ind alone is what "the average lipid is tilted by X" means.
+    ind_results = []
+    for mask, local_n in masks:
+        if not mask.any():
+            continue
+        v      = vecs[mask]
+        norms  = np.linalg.norm(v, axis=1)
+        usable = norms > 1e-12
+        if not usable.any():
+            continue
+        cos_i = np.clip((v[usable] / norms[usable, None]) @ local_n, -1.0, 1.0)
+        ind_results.append(float(np.degrees(np.arccos(cos_i)).mean()))
+    theta_ind = float(np.mean(ind_results)) if ind_results else np.nan
 
     # φ — use the last (or only) leaflet's mean vector; for 'both' use
     # the orientation-corrected combined mean vector so φ is well-defined.
@@ -249,31 +313,38 @@ def mean_tilt_angle(tip_positions, base_positions, normal=MEMBRANE_NORMAL,
     else:
         phi_deg = float('nan')
 
-    return theta_deg, phi_deg, last_mean_vec
+    return theta_deg, phi_deg, last_mean_vec, theta_ind
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Helper: assign a leaflet mask from base-atom positions
+# Helper: leaflet membership
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _leaflet_masks(base_positions):
-    """
-    Return (upper_mask, lower_mask) boolean arrays for N atoms, splitting
-    on the mean z-coordinate of base_positions.
+def _leaflet_by_resindex(p_atoms, axis=2):
+    """Sorted resindices whose lipid sits in the upper leaflet.
 
-    Parameters
-    ----------
-    base_positions : (N, 3) array
+    Leaflet membership is a property of the LIPID, taken once from its
+    phosphorus, and every leaflet-resolved observable should look it up here
+    rather than re-derive a split from whatever atoms it happens to hold. A
+    bond deep in the acyl chain has base atoms on both sides of the midplane
+    with strongly overlapping distributions, so splitting on their own mean z
+    assigns a large fraction of them to the wrong leaflet — and does so worse
+    the deeper the bond, which reads as a physical trend and is not one.
 
-    Returns
-    -------
-    upper_mask : (N,) bool — True for atoms in the upper leaflet
-    lower_mask : (N,) bool
+    Returned sorted, as an array rather than a set, so the lookup below stays
+    vectorised: it runs once per bond per chain per frame.
     """
-    z       = np.asarray(base_positions, dtype=float)[:, 2]
-    mid     = z.mean()
-    upper   = z > mid
-    return upper, ~upper
+    if p_atoms is None or len(p_atoms) == 0:
+        return np.array([], dtype=np.intp)
+    z = p_atoms.positions[:, axis]
+    return np.sort(p_atoms.resindices[z > z.mean()])
+
+
+def _upper_mask_for(resindices, upper_resix):
+    """Boolean upper-leaflet mask for rows carrying these resindices."""
+    if len(upper_resix) == 0:
+        return np.zeros(len(resindices), dtype=bool)
+    return np.isin(resindices, upper_resix, assume_unique=False)
 
 
 def _pbc_minimum_image_2d(vec_xy, box_xy):
@@ -288,125 +359,96 @@ def _pbc_minimum_image_2d(vec_xy, box_xy):
     return v
 
 
+def _min_image(vectors, box_lengths):
+    """Wrap displacement vectors into the minimum image, per axis.
+
+    For INTRAMOLECULAR vectors — a C-C bond, a chain's end-to-end vector —
+    this is not a refinement but a correctness requirement, because these
+    trajectories are not written with ``-pbc mol/whole``: an atom pair
+    straddling a boundary differs by ~L in the raw coordinates, and the
+    resulting "bond" is a box-length vector pointing along a box axis. It
+    passes any non-zero-length check and normalises to a direction that is
+    pure artifact, so it corrupts an order parameter silently rather than
+    loudly.
+
+    An axis with a zero or unset box length is left alone rather than
+    dividing by zero.
+    """
+    v = np.array(vectors, dtype=float, copy=True)
+    L = np.asarray(box_lengths, dtype=float)
+    if v.ndim == 1:
+        good = L > 0
+        v[good] -= np.round(v[good] / L[good]) * L[good]
+        return v
+    good = L > 0
+    v[:, good] -= np.round(v[:, good] / L[good]) * L[good]
+    return v
+
+
+def _whole_centroid(positions, box_lengths):
+    """Geometric centre of ONE molecule, made whole across the PBC first.
+
+    These trajectories are not pre-processed with ``-pbc mol/whole`` — the
+    same assumption cv_generation.compute_com_unwrapped is built around — so a
+    molecule's own atoms can be wrapped to opposite sides of the box. A plain
+    mean of those raw positions then lands near mid-box rather than on the
+    molecule, off by up to ~L/2. Every permeant-centred quantity here (the
+    lateral MSD, the depth CV, and every radial or stamped spatial map) is
+    measured *from* that point, so the error moves the whole reference frame,
+    not one lipid's value.
+
+    Every atom is min-imaged against the group's first atom before averaging.
+    That is valid only for a single bonded molecule, where there is one anchor
+    the rest of the group is genuinely near — do not use it for a centroid
+    built from many unrelated molecules (one marker atom per lipid, say),
+    which has no such anchor. It is an exact no-op when the molecule is
+    already whole, so it only changes the frames that were wrong.
+
+    The returned point is NOT re-wrapped into the primary cell: it tracks the
+    anchor atom rigidly, which is what makes consecutive frames differ by a
+    clean multiple of L and keeps `_unwrap_xy_pbc`'s 0.5*L cutoff reliable.
+    Callers that difference it against other positions must min-image the
+    difference, as they already do.
+    """
+    pos = np.asarray(positions, dtype=float)
+    if len(pos) == 0:
+        return np.full(pos.shape[1] if pos.ndim > 1 else 3, np.nan)
+    if len(pos) == 1:
+        return pos[0].copy()
+
+    L   = np.asarray(box_lengths, dtype=float)
+    ref = pos[0]
+    rel = pos - ref[np.newaxis, :]
+    # An unset or zero box length means "no periodicity along this axis"
+    # rather than a division by zero.
+    good = L > 0
+    rel[:, good] -= np.round(rel[:, good] / L[good]) * L[good]
+    return ref + rel.mean(axis=0)
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Local membrane thickness
 # ═════════════════════════════════════════════════════════════════════════════
 
-def local_membrane_thickness(
-    universe,
-    lipid_resnames      = ('DOPC', 'POPC'),
-    phosphorus_name     = PHOSPHORUS_NAME,
-    bilayer_normal_axis = 2,
-    n_neighbors         = 6,
-):
+def _local_thickness_dict(universe, lipid_resnames, phosphorus_name, axis,
+                          p_atoms=None):
     """
-    Local membrane thickness from P–P distances between leaflets.
+    Local membrane thickness from P-P distances between the leaflets, as a
+    dict of per-leaflet arrays so the frame loop can accumulate upper and
+    lower separately without repeating the P-P calculation.
 
-    Returns
-    -------
-    upper_xy   : (N_upper, 2) lateral positions of upper-leaflet P atoms
-    thickness  : (N_upper,) per-upper-atom thickness values
-    mean_thick : float — mean over all upper atoms
-
-    Now also returns per-leaflet mean thickness so callers can accumulate
-    them separately.
-
-    Returns (extended)
-    ------------------
-    upper_xy, thickness, mean_thick,
-    upper_xy, thickness_upper, mean_thick_upper,
-    lower_xy, thickness_lower, mean_thick_lower
-
-    For simplicity the function returns a dict when called from within the
-    main loop so that adding leaflet data does not break existing callers.
-
-    Backward-compatible signature: positional return is unchanged
-    (upper_xy, thickness, mean_thick) so old callers keep working.
-    The dict is available via the keyword-only `_return_dict` parameter.
-    """
-    ax   = bilayer_normal_axis
-    axes = [i for i in range(3) if i != ax]
-
-    lipid_sel = " or ".join(f"resname {r}" for r in lipid_resnames)
-    p_atoms   = universe.select_atoms(
-        f"({lipid_sel}) and name {phosphorus_name}"
-    )
-    if len(p_atoms) == 0:
-        return np.empty((0, 2)), np.array([]), np.nan
-
-    p_pos    = p_atoms.positions
-    midplane = p_pos[:, ax].mean()
-
-    upper_mask = p_pos[:, ax] > midplane
-    lower_mask = ~upper_mask
-
-    upper_pos = p_pos[upper_mask]
-    lower_pos = p_pos[lower_mask]
-
-    if len(upper_pos) == 0 or len(lower_pos) == 0:
-        return np.empty((0, 2)), np.array([]), np.nan
-
-    box     = universe.dimensions
-    box_lat = np.array([box[a] for a in axes])
-
-    lower_xy = lower_pos[:, axes] % box_lat[np.newaxis, :]
-    upper_xy = upper_pos[:, axes] % box_lat[np.newaxis, :]
-
-    tree = cKDTree(lower_xy, boxsize=box_lat)
-    k    = min(n_neighbors, len(lower_pos))
-    dists, idx = tree.query(upper_xy, k=k)
-
-    lower_z_mat = lower_pos[idx, ax]
-    if k == 1:
-        lower_z_mat = lower_z_mat[:, np.newaxis]
-
-    # Thickness at each upper-leaflet P: |z_upper - mean(z_lower_neighbours)|
-    thickness = np.abs(upper_pos[:, ax] - lower_z_mat.mean(axis=1))
-
-    # --- NEW: also compute "thickness" viewed from the lower leaflet --------
-    # For each lower P-atom, find nearest upper neighbours and record distance.
-    tree_upper = cKDTree(upper_xy, boxsize=box_lat)
-    k2         = min(n_neighbors, len(upper_pos))
-    _, idx2    = tree_upper.query(lower_xy, k=k2)
-    upper_z_mat2 = upper_pos[idx2, ax]
-    if k2 == 1:
-        upper_z_mat2 = upper_z_mat2[:, np.newaxis]
-    thickness_lower = np.abs(lower_pos[:, ax] - upper_z_mat2.mean(axis=1))
-    lower_xy_out    = lower_pos[:, axes] % box_lat[np.newaxis, :]
-
-    mean_thick       = float(thickness.mean())
-    mean_thick_upper = float(thickness.mean())        # same as upper-viewed
-    mean_thick_lower = float(thickness_lower.mean())
-
-    # Backward-compatible positional return; extended info available as attrs
-    result = (upper_xy, thickness, mean_thick)
-    # Attach leaflet-specific data as extra attributes on the tuple via a
-    # small wrapper dict returned alongside; callers that only care about the
-    # tuple get the old interface for free.
-    result._leaflet = {        # type: ignore[attr-defined]  (not used)
-        'upper_xy'        : upper_xy,
-        'thickness_upper' : thickness,
-        'mean_thick_upper': mean_thick_upper,
-        'lower_xy'        : lower_xy_out,
-        'thickness_lower' : thickness_lower,
-        'mean_thick_lower': mean_thick_lower,
-    }
-    return result
-
-
-def _local_thickness_dict(universe, lipid_resnames, phosphorus_name, axis):
-    """
-    Internal helper: call local_membrane_thickness and return a clean dict
-    with per-leaflet arrays, so the frame loop can accumulate upper/lower
-    separately without repeating the heavy P–P calculation.
+    `p_atoms` lets the caller pass a selection made once per trajectory
+    instead of paying for a selection-string parse on every frame of every
+    species; it must be the same selection this would have made.
     """
     ax   = axis
     axes = [i for i in range(3) if i != ax]
 
-    lipid_sel = " or ".join(f"resname {r}" for r in lipid_resnames)
-    p_atoms   = universe.select_atoms(
-        f"({lipid_sel}) and name {phosphorus_name}"
-    )
+    if p_atoms is None:
+        lipid_sel = " or ".join(f"resname {r}" for r in lipid_resnames)
+        p_atoms   = universe.select_atoms(
+            f"({lipid_sel}) and name {phosphorus_name}"
+        )
     empty = {
         'upper_xy': np.empty((0, 2)), 'thickness_upper': np.array([]),
         'mean_thick_upper': np.nan,
@@ -490,7 +532,8 @@ def radial_deformation_profile(
     if len(permeant) == 0:
         nan_arr = np.full(n_bins, np.nan)
         return np.linspace(0, r_max, n_bins), nan_arr, nan_arr
-    perm_lateral = permeant.center_of_geometry()[axes]
+    perm_lateral = _whole_centroid(permeant.positions,
+                                   universe.dimensions[:3])[axes]
 
     lipid_sel = " or ".join(f"resname {r}" for r in lipid_resnames)
     p_atoms   = universe.select_atoms(
@@ -633,7 +676,8 @@ def water_defect_profile(
 
     permeant   = universe.select_atoms(f"resname {permeant_resname}")
     if len(permeant) > 0:
-        perm_lateral = permeant.center_of_geometry()[axes]
+        perm_lateral = _whole_centroid(permeant.positions,
+                                       universe.dimensions[:3])[axes]
     else:
         perm_lateral = np.array([universe.dimensions[axes[0]],
                                   universe.dimensions[axes[1]]]) / 2.0
@@ -694,14 +738,19 @@ def local_membrane_curvature(
     r_max_curvature     = 40.0,
     n_radial_bins       = 20,
     ghost_margin        = 20.0,
+    p_atoms             = None,
 ):
     ax   = bilayer_normal_axis
     lat  = [i for i in range(3) if i != ax]
 
-    lipid_sel = " or ".join(f"resname {r}" for r in lipid_resnames)
-    p_atoms   = universe.select_atoms(
-        f"({lipid_sel}) and name {phosphorus_name}"
-    )
+    # `p_atoms` may be supplied by a caller that selected once per trajectory;
+    # the RBF fit below is the most expensive thing done per frame, so the
+    # selection parse on top of it is worth avoiding.
+    if p_atoms is None:
+        lipid_sel = " or ".join(f"resname {r}" for r in lipid_resnames)
+        p_atoms   = universe.select_atoms(
+            f"({lipid_sel}) and name {phosphorus_name}"
+        )
 
     empty = {
         'upper_H': np.array([]), 'upper_K': np.array([]),
@@ -814,7 +863,8 @@ def local_membrane_curvature(
     if permeant_resname is not None:
         permeant = universe.select_atoms(f"resname {permeant_resname}")
         if len(permeant) > 0 and len(H_upper) > 0:
-            perm_lat = permeant.center_of_geometry()[lat]
+            perm_lat = _whole_centroid(permeant.positions,
+                                       universe.dimensions[:3])[lat]
             r_vec    = upper_pos[:, lat] - perm_lat[np.newaxis, :]
             Lats     = np.array([Lx, Ly])
             r_vec   -= np.round(r_vec / Lats[np.newaxis, :]) * Lats[np.newaxis, :]
@@ -841,22 +891,17 @@ def local_membrane_curvature(
 SPATIAL_MAP_META = {
     'p2_sn1_chain' : ('RdBu_r',  'P₂ sn-1 chain'),
     'p2_sn2_chain' : ('RdBu_r',  'P₂ sn-2 chain'),
-    'theta_sn1'    : ('plasma',  'Tilt θ sn-1 (°)'),
-    'theta_sn2'    : ('plasma',  'Tilt θ sn-2 (°)'),
+    # These maps are stamped from PER-LIPID angles, so they are the
+    # individual tilt (mean_tilt_angle's theta_individual), not the collective
+    # one the 1-D profile's `theta` column carries. A collective average has
+    # no per-lipid value to stamp anywhere.
+    'theta_sn1'    : ('plasma',  'Chain tilt θ sn-1 (°)'),
+    'theta_sn2'    : ('plasma',  'Chain tilt θ sn-2 (°)'),
     'phi_sn1'      : ('twilight','Azimuthal φ sn-1 (°)'),
     'phi_sn2'      : ('twilight','Azimuthal φ sn-2 (°)'),
     'thickness'    : ('coolwarm','Thickness (Å)'),
     'curvature_H'  : ('PiYG',   'Mean curvature |H| (Å⁻¹)'),
 }
-
-
-def build_lateral_grid(box_xy, grid_spacing):
-    Lx, Ly   = float(box_xy[0]), float(box_xy[1])
-    x_coords = np.arange(0.0, Lx, grid_spacing)
-    y_coords = np.arange(0.0, Ly, grid_spacing)
-    xx, yy   = np.meshgrid(x_coords, y_coords, indexing='ij')
-    grid_xy  = np.column_stack([xx.ravel(), yy.ravel()])
-    return grid_xy, (len(x_coords), len(y_coords)), x_coords, y_coords
 
 
 def build_lateral_grid_centered(extent, grid_spacing):
@@ -905,6 +950,16 @@ def build_depth_bins(slab_edges, n_depth_bins):
 def _stamp_frame(lipid_xy, lipid_values, grid_tree, stamp_radius,
                  wsum_accum, wcount_accum, path_weight,
                  box_xy=None):
+    """Spread each lipid's value onto the grid cells within `stamp_radius`.
+
+    `box_xy` adds the periodic images of a lipid near a box edge, and is for
+    a grid laid out in ABSOLUTE box coordinates. The frame loop does not use
+    it and must not: its grid is permeant-centred (build_lateral_grid_centered)
+    and the offsets handed in here are already minimum-imaged, so each lipid
+    has exactly one correct position relative to the permeant and adding
+    images would double-count it. The parameter is kept for callers building
+    a box-frame map.
+    """
     lipid_values = np.asarray(lipid_values, dtype=float)
     lipid_xy     = np.asarray(lipid_xy,     dtype=float)
     valid        = np.isfinite(lipid_values)
@@ -940,14 +995,6 @@ def _stamp_frame(lipid_xy, lipid_values, grid_tree, stamp_radius,
                 idx = np.array(neighbours, dtype=np.intp)
                 wsum_accum[idx]   += path_weight * val
                 wcount_accum[idx] += path_weight
-
-
-def finalise_stamp_map(wsum_accum, wcount_accum, grid_shape):
-    with np.errstate(invalid='ignore', divide='ignore'):
-        F_flat = np.where(wcount_accum > 0,
-                          wsum_accum / wcount_accum,
-                          np.nan)
-    return F_flat.reshape(grid_shape)
 
 
 def _make_spatial_accumulators(M, chain_bonds, lipid_resnames=('DOPC', 'POPC'),
@@ -1004,10 +1051,27 @@ def _depth_edges_of(data):
     """
     Depth-bin edges stored alongside a spatial .npz. Files written before
     the depth axis existed carry a single implicit bin spanning everything.
+
+    That bin is given finite edges rather than (-inf, +inf): the centre of an
+    infinite bin is NaN, which silently disables every depth selection built
+    on `depth_centers`. A single bin wide enough to hold any permeant depth
+    behaves the same way for selection and keeps the centre finite.
     """
     if 'depth_edges' in data.files:
         return np.asarray(data['depth_edges'], dtype=float)
-    return np.array([-np.inf, np.inf])
+    return np.array([-1e30, 1e30])
+
+
+def _as_depth_stack(arr):
+    """A stored map as (n_depth, nx, ny).
+
+    NOT np.atleast_3d: that appends the new axis at the END, so a legacy
+    2-D (nx, ny) map becomes (nx, ny, 1) and every `sum(axis=0)` below
+    collapses the x axis instead of the depth axis — silently returning a
+    transposed, wrongly-shaped map rather than failing.
+    """
+    a = np.asarray(arr)
+    return a if a.ndim == 3 else a[np.newaxis, ...]
 
 
 def aggregate_spatial_maps(path_start, path_end, weights):
@@ -1197,8 +1261,8 @@ class SpatialMaps:
         return np.where((c >= z_lo) & (c <= z_hi))[0]
 
     def _select(self, key, depth):
-        wsum = np.atleast_3d(self._data[f'{key}_wsum'])
-        wcnt = np.atleast_3d(self._data[f'{key}_wcount'])
+        wsum = _as_depth_stack(self._data[f'{key}_wsum'])
+        wcnt = _as_depth_stack(self._data[f'{key}_wcount'])
         if depth is None:
             return wsum, wcnt
         if isinstance(depth, tuple):
@@ -1258,7 +1322,7 @@ class SpatialMaps:
 
     def occupancy(self, key):
         """Total accumulated weight per depth bin, i.e. the depth profile."""
-        wcnt = np.atleast_3d(self._data[f'{key}_wcount'])
+        wcnt = _as_depth_stack(self._data[f'{key}_wcount'])
         return wcnt.sum(axis=(1, 2))
 
 
@@ -1285,12 +1349,47 @@ def load_spatial_maps(npz_path, depth=None, depth_weights=None):
 # region and 66% in a slow one, flattening a true 6:1 contrast between them to
 # 2:1. The start-binned windows below recover both to 100% on the same test.
 #
-# `lag` is in frames. One frame is the right default: the estimator wants the
-# shortest lag that is already diffusive, and a longer one only smears D over
-# the +/- sqrt(2 D tau) the permeant wanders in the meantime. The lag-2 value
-# is accumulated alongside as a diagnostic - in the diffusive regime the two
-# agree, and they part company where the motion is not yet diffusive at the
-# frame spacing.
+# `lag` is in frames, and one lag alone is not enough to answer the question.
+# D_app(tau) = MSD(tau) / 2 tau is only equal to D inside the *diffusive
+# window*, and that window is bounded from both sides:
+#
+#   * too short - the permeant is still rattling inside a transient cage of
+#     lipid tails (and, below ~0.1 ps, still flying ballistically). MSD then
+#     grows slower than linearly, so D_app DECAYS toward the plateau and a
+#     shorter lag reads HIGH. Taking tau -> 0 makes this worse, not better.
+#   * too long - the window wanders sqrt(2 D tau) while the value is charged
+#     to the slab it STARTED in, so D is smeared over neighbouring slabs.
+#     Staying local needs sqrt(2 D tau) <~ slab width, which at 1 A slabs and
+#     bulk-water D is already only a couple of ps.
+#
+# Neither bound is knowable in advance, so instead of picking one lag this
+# accumulates a short scan, k = 1 .. n_lags times the base lag, and fits
+#
+#     MSD(tau) = c + 2 n_dim D tau
+#
+# per slab. The intercept c absorbs the fast *bounded* component (vibration,
+# ballistic flight, intra-cage rattling); the slope is the diffusive D. In the
+# D_app domain that fit is a straight line against 1/tau,
+#
+#     D_app(tau) = D + c / (2 n_dim tau),
+#
+# whose intercept as 1/tau -> 0 is D. That form is what `fit_diffusion_intercept`
+# uses, because it needs only the per-lag D_app values the aggregate already
+# holds: the abscissa is 1/k up to a constant factor dt, and a constant factor
+# on the abscissa rescales the slope while leaving the intercept alone. So the
+# fitted D needs no knowledge of dt at all (only `c`, reported for diagnosis,
+# does).
+#
+# The path-ensemble conditioning enters this picture only weakly. Conditioning
+# a diffusion on its future is a Doob h-transform: it changes the drift, not
+# the diffusion coefficient, and a drift contributes v^2 tau^2 to the MSD,
+# i.e. O(tau) in D_app, against the O(1) error from being off the plateau. The
+# dominant bias at a single short lag is the non-diffusive one, and it is not
+# specific to path sampling.
+#
+# Column convention: k = 1 stays `D_z` and k = 2 stays `D_z_lag2`, so every
+# existing consumer keeps working; k >= 3 are `D_z_lag3` and up, and the fitted
+# intercept is `D_z_fit`.
 
 
 def slab_binned_msd(series, slab_idx, n_slabs, lag):
@@ -1314,6 +1413,88 @@ def slab_binned_msd(series, slab_idx, n_slabs, lag):
     np.add.at(total, start, squared)
     np.add.at(count, start, 1.0)
     return total, count
+
+
+def lag_column(prefix, k):
+    """Name of the per-lag D_app column for lag k*lag_frames.
+
+    k = 1 keeps the bare prefix and k = 2 keeps the historical `_lag2`, so the
+    column names that existed before the lag scan still mean exactly what they
+    meant (see the section comment above).
+    """
+    return prefix if k == 1 else f'{prefix}_lag{k}'
+
+
+def fit_diffusion_intercept(d_app, weights=None, ks=None):
+    """Extrapolate D_app(tau) to 1/tau -> 0, per slab.
+
+    Parameters
+    ----------
+    d_app : (..., n_lags) array
+        D_app at lags k = 1..n_lags times the base lag, trailing axis last.
+    weights : (..., n_lags) array or None
+        Per-lag weights, normally the window counts. Equal weights if None.
+    ks : (n_lags,) array or None
+        The lag multipliers, defaulting to 1..n_lags. Only their ratios
+        matter.
+
+    Returns
+    -------
+    d_fit : (...,) intercept, i.e. D with the bounded fast component removed
+    slope : (...,) the fitted slope against 1/k, = c / (2 n_dim lag dt).
+        Multiply by 2 n_dim lag dt to read c in A^2.
+    resid : (...,) weighted RMS residual of the fit, in the units of d_app.
+        Large values mean MSD is not affine in tau over the scanned range, so
+        the slab has no diffusive window at this frame spacing.
+
+    Slabs with fewer than two usable lags come back NaN: an intercept through
+    one point is not an extrapolation. With exactly two it reduces to the
+    two-point extrapolation 2*D_app(2 tau) - D_app(tau) — note the order: the
+    line is straight in 1/tau, not in tau, so it is the LONGER lag that gets
+    the positive weight. The tau-space form 2*D_app(tau) - D_app(2 tau) that
+    a Richardson reflex suggests extrapolates the wrong way entirely.
+    """
+    y = np.asarray(d_app, dtype=float)
+    n_lags = y.shape[-1]
+    ks = (np.arange(1, n_lags + 1, dtype=float) if ks is None
+          else np.asarray(ks, dtype=float))
+    x = 1.0 / ks                                    # abscissa, up to 1/(lag*dt)
+    x = np.broadcast_to(x, y.shape)
+
+    w = (np.ones_like(y) if weights is None
+         else np.asarray(weights, dtype=float).astype(float))
+    w = np.where(np.isfinite(y) & np.isfinite(w) & (w > 0), w, 0.0)
+    y = np.where(w > 0, y, 0.0)
+
+    # Weighted least squares for y = a + b x, done in closed form so the whole
+    # profile is fitted in one vectorised pass (this runs inside every
+    # jackknife replicate).
+    sw   = w.sum(axis=-1)
+    swx  = (w * x).sum(axis=-1)
+    swy  = (w * y).sum(axis=-1)
+    swxx = (w * x * x).sum(axis=-1)
+    swxy = (w * x * y).sum(axis=-1)
+
+    det = sw * swxx - swx ** 2
+    n_used = (w > 0).sum(axis=-1)
+    # det <= 0 also catches every lag sharing one x, which no real scan does
+    # but a degenerate `ks` would.
+    ok = (n_used >= 2) & (det > 0)
+
+    with np.errstate(invalid='ignore', divide='ignore'):
+        safe_det = np.where(ok, det, 1.0)
+        slope     = np.where(ok, (sw * swxy - swx * swy) / safe_det, np.nan)
+        intercept = np.where(ok, (swxx * swy - swx * swxy) / safe_det, np.nan)
+
+        pred = intercept[..., np.newaxis] + slope[..., np.newaxis] * x
+        ss   = (w * (y - pred) ** 2).sum(axis=-1)
+        # n_used - 2 degrees of freedom; exactly two lags fit perfectly, so
+        # report 0 rather than 0/0.
+        resid = np.where(ok & (n_used > 2),
+                         np.sqrt(ss / np.where(sw > 0, sw, 1.0)),
+                         np.where(ok, 0.0, np.nan))
+
+    return intercept, slope, resid
 
 
 def diffusion_from_msd(total, count, lag, dt, n_dim=1):
@@ -1417,6 +1598,18 @@ def read_toml(toml_file):
     lambda_B         = interfaces[-1]
     lambda_minus_one = (config["simulation"].get("tis_set") or {}) \
                        .get("lambda_minus_one")
+    # Every path is classified plus/minus by comparing against this, so a
+    # missing key is not an optional setting here: left as None it reaches a
+    # `None < float` comparison inside the per-path worker, where the
+    # resulting TypeError is caught per path and reported as a traceback that
+    # says nothing about the .toml. Fail once, at the top, naming the key.
+    if lambda_minus_one is None:
+        raise ValueError(
+            f"{toml_file}: [simulation.tis_set] lambda_minus_one is not set. "
+            "It is needed to tell a minus-ensemble path from a plus-ensemble "
+            "one, which decides whether the first and last phase points "
+            "belong to the path."
+        )
     return lambda_A, lambda_B, lambda_minus_one
 
 
@@ -1433,6 +1626,44 @@ def get_reactive_paths(path_number, infretis_data_file, lambda_B):
     third_cols = np.array(third_cols)
     idx = np.where(first_cols == path_number)[0]
     return bool(third_cols[idx[0]] > lambda_B) if idx.size > 0 else None
+
+
+def align_order_with_plan(order, plan, g96_index):
+    """Drop order.txt's .g96 row so it lines up with the frame plan.
+
+    Returns (order, problem); `problem` is None when they line up, otherwise a
+    message for the caller to skip the path with.
+
+    A .g96 phase point has no .xtc frame, so `read_traj_plan` leaves it out of
+    the plan and returns its step instead — precisely so a caller can drop the
+    matching order-parameter row. Skipping that step leaves the two one apart,
+    and the consequence is not a shifted lookup somewhere harmless: `first`
+    and `last` are read off order.txt to decide which END of the plan is
+    trimmed, so an off-by-one there removes a frame that belongs to the path
+    and keeps one that does not.
+
+    The row is matched on its step (column 0) rather than by position, because
+    the .g96 point is not always at an end. If that match does not remove
+    exactly one row the order file is not what it is assumed to be, and the
+    caller is told rather than left to line the two up by luck.
+    """
+    order = np.atleast_2d(order)
+    if g96_index is not None and len(order):
+        keep = ~np.isclose(order[:, 0], float(g96_index))
+        if keep.sum() == len(order) - 1:
+            order = order[keep]
+
+    if len(order) == 0:
+        return order, 'order.txt has no usable rows.'
+    if len(order) != len(plan):
+        return order, (
+            f'order.txt has {len(order)} phase point(s) but traj.txt lists '
+            f'{len(plan)} with a trajectory frame'
+            + (f' (after dropping the .g96 point at step {g96_index})'
+               if g96_index is not None else '')
+            + '; they must line up for the order parameter to index the frames.'
+        )
+    return order, None
 
 
 def remove_first_last_frames(ensemble, lambda_minus_one, lambda_A, first, last):
@@ -1498,9 +1729,25 @@ OBSERVABLE_GROUPS = {
 # accumulator is linear in the weight (+= w*x, += w), so applying it afterwards
 # is exact.
 
-#: 2: unweighted sums. 1: weighted at accumulation - not interchangeable, so a
-#: version-1 file is treated as absent and recomputed.
-PATH_FILE_VERSION = 2
+#: 6: the tilt tables carry both angles - `theta` (collective, the leaflet's
+#:    net lean) and `theta_ind` (the mean individual chain tilt).
+#: 5: intramolecular vectors (P2 bonds, chain tilt) minimum-imaged, and
+#:    leaflet membership taken from the lipid's own P atom instead of from
+#:    each observable's own atoms' z, in BOTH the 1-D and the spatial block.
+#:    Both change the order-parameter and tilt tables; tilt changes a lot.
+#: 4: the diffusion tables carry a lag scan (D_z, D_z_lag2, D_z_lag3 ...)
+#:    instead of a single lag plus one check, so the aggregate can fit
+#:    D_app(tau) -> D. A version-3 file holds only two lags; it still pools,
+#:    and its fit degenerates to the two-point extrapolation.
+#: 3: permeant centroid made whole across the PBC before it is used as the
+#:    origin of anything (lateral MSD, stamped maps, radial profiles, the
+#:    near-N ranking), and the lateral unwrap state carried across segment
+#:    junctions instead of being reset per .xtc.
+#: 2: unweighted sums. 1: weighted at accumulation.
+#: None of these are interchangeable, so an older file is treated as absent
+#: and recomputed. A version-2 file is not merely less accurate - pooling it
+#: with a version-3 one mixes two different map origins in the same average.
+PATH_FILE_VERSION = 6
 
 _TABLE_KEYS = ('p2', 'tilt', 'thick', 'deform', 'water_z', 'diff', 'diff_xy')
 
@@ -1754,6 +2001,7 @@ def calculate_selected_slab_profiles(
     curvature_smoothing = 0.0,
     dt                  = None,
     lag_frames          = 1,
+    n_lags              = 6,
     grid_spacing        = 5.0,
     stamp_radius        = None,
     near_n              = (),
@@ -1826,6 +2074,17 @@ def calculate_selected_slab_profiles(
                       for sp in _ORDER_SPECIES
                       for lf in _LEAFLETS
                       for ch in tilt_endpoints}
+        # theta_ind: the mean of the INDIVIDUAL chain angles, beside the
+        # collective theta above. See mean_tilt_angle - they answer different
+        # questions and their difference measures leaflet splay.
+        theta_ind_wsum = {(sp, lf, ch): np.zeros(n_slabs)
+                          for sp in _ORDER_SPECIES
+                          for lf in _LEAFLETS
+                          for ch in tilt_endpoints}
+        theta_ind_wtot = {(sp, lf, ch): np.zeros(n_slabs)
+                          for sp in _ORDER_SPECIES
+                          for lf in _LEAFLETS
+                          for ch in tilt_endpoints}
         phi_wsum   = {(sp, lf, ch): np.zeros(n_slabs)
                       for sp in _ORDER_SPECIES
                       for lf in _LEAFLETS
@@ -1859,6 +2118,14 @@ def calculate_selected_slab_profiles(
                            for N in near_n
                            for sp in _ORDER_SPECIES
                            for ch in tilt_endpoints}
+        near_theta_ind_wsum = {(N, sp, ch): np.zeros(n_slabs)
+                               for N in near_n
+                               for sp in _ORDER_SPECIES
+                               for ch in tilt_endpoints}
+        near_theta_ind_wtot = {(N, sp, ch): np.zeros(n_slabs)
+                               for N in near_n
+                               for sp in _ORDER_SPECIES
+                               for ch in tilt_endpoints}
         near_phi_wsum   = {(N, sp, ch): np.zeros(n_slabs)
                            for N in near_n
                            for sp in _ORDER_SPECIES
@@ -1930,21 +2197,22 @@ def calculate_selected_slab_profiles(
     # ── Diffusion accumulators ────────────────────────────────────────────────
     # wsum holds summed squared displacement over 2*n_dim*tau and wtot the
     # window count, so the aggregate's ratio is the pooled MSD estimate.
+    # One (wsum, wtot) pair per lag multiplier k = 1..n_lags, so the aggregate
+    # can fit D_app against 1/tau instead of trusting a single lag. See the
+    # section comment above fit_diffusion_intercept.
+    _lag_ks = list(range(1, max(int(n_lags), 2) + 1))
+
     if run_diffusion:
-        D_z_wsum      = np.zeros(n_slabs)
-        D_z_wtot      = np.zeros(n_slabs)
-        D_z_lag2_wsum = np.zeros(n_slabs)
-        D_z_lag2_wtot = np.zeros(n_slabs)
+        D_z_wsum      = {k: np.zeros(n_slabs) for k in _lag_ks}
+        D_z_wtot      = {k: np.zeros(n_slabs) for k in _lag_ks}
         nwin_wsum     = np.zeros(n_slabs)
         nwin_wtot     = np.zeros(n_slabs)
         z_full        = []
         slab_idx_full = []
 
     if run_diffusion_xy:
-        D_xy_wsum      = np.zeros(n_slabs)
-        D_xy_wtot      = np.zeros(n_slabs)
-        D_xy_lag2_wsum = np.zeros(n_slabs)
-        D_xy_lag2_wtot = np.zeros(n_slabs)
+        D_xy_wsum      = {k: np.zeros(n_slabs) for k in _lag_ks}
+        D_xy_wtot      = {k: np.zeros(n_slabs) for k in _lag_ks}
         nwin_xy_wsum   = np.zeros(n_slabs)
         nwin_xy_wtot   = np.zeros(n_slabs)
         xy_full           = []
@@ -1973,6 +2241,22 @@ def calculate_selected_slab_profiles(
 
     lipid_sel  = " or ".join(f"resname {r}" for r in lipid_resnames)
     _dt        = dt
+    n_frames_seen   = 0
+    n_out_of_range  = 0
+    _dt_warned      = False
+
+    # Lateral unwrapping state for the permeant. It belongs to the *path*, not
+    # to the .xtc file: frame_plan's segments are consecutive phase points, so
+    # the last frame of one segment and the first of the next are one dt apart
+    # and the accumulated jump has to carry across the junction. Resetting it
+    # per file discarded that jump, so a permeant that had crossed a lateral
+    # boundary earlier in the path produced one spurious ~L displacement at
+    # every junction, i.e. a ~L^2 window binned into whatever slab it landed
+    # in.
+    if run_diffusion_xy:
+        _pbc_jump   = np.zeros(2)
+        _pbc_prev   = None
+        _pbc_cutoff = 0.5
 
     # ═════════════════════════════════════════════════════════════════════════
     # Frame loop
@@ -1985,13 +2269,32 @@ def calculate_selected_slab_profiles(
             perm_heavy = permeant
         membrane   = u.select_atoms("resname DOPC POPC")
 
-        if _dt is None:
+        # A single-frame .xtc reports dt = 0 — there is no frame pair to take
+        # the difference of — and dt is a divisor of every D, so latching onto
+        # that zero turns a whole path's diffusion columns into inf and poisons
+        # every slab it touches once they are pooled. Keep asking later
+        # segments instead, and if none of them can say, skip the group rather
+        # than emit a number (see the guard on the post-processing below).
+        # Passing -dt explicitly avoids the question entirely and is worth
+        # doing: the value is a property of the run, not of whichever segment
+        # happened to be read first.
+        if (run_diffusion or run_diffusion_xy) and dt is None:
             u.trajectory[0]
-            _dt = float(u.trajectory.dt)
-        if run_diffusion_xy:
-            _pbc_jump   = np.zeros(2)
-            _pbc_prev   = None
-            _pbc_cutoff = 0.5
+            _candidate = float(u.trajectory.dt)
+            if _candidate > 0.0:
+                if _dt is None:
+                    _dt = _candidate
+                elif not np.isclose(_candidate, _dt, rtol=1e-3):
+                    # Segments written at different output frequencies cannot
+                    # share one tau: the series is treated as evenly spaced,
+                    # and it is not. Say so rather than scale part of it
+                    # wrongly.
+                    if not _dt_warned:
+                        print(f"  [worker] WARNING: frame spacing changes "
+                              f"between this path's segments ({_dt} vs "
+                              f"{_candidate} ps). The MSD assumes one spacing; "
+                              f"pass -dt to fix it explicitly.")
+                        _dt_warned = True
 
         # ── Pre-build atom-index arrays (once per XTC) ────────────────────────
         if run_order or run_spatial:
@@ -2047,6 +2350,17 @@ def calculate_selected_slab_profiles(
                         sp: (rn_arr == sp) for sp in lipid_resnames
                     }
 
+        # P atoms, selected once per .xtc rather than per frame per species.
+        # They serve two purposes below: the leaflet identity of every lipid
+        # (see _leaflet_by_resindex) and the thickness/curvature surfaces.
+        _p_atoms = {}
+        if run_order or run_structural or run_spatial:
+            for sp in (['mixed'] + list(lipid_resnames)):
+                sel = lipid_sel if sp == 'mixed' else f"resname {sp}"
+                _p_atoms[sp] = u.select_atoms(
+                    f"({sel}) and name {phosphorus_name}"
+                )
+
         # Frames come from traj.txt via frame_plan: exactly this path's phase
         # points, in path order, already trimmed of the first/last one where
         # the ensemble requires it. This matters more here than elsewhere -
@@ -2057,6 +2371,57 @@ def calculate_selected_slab_profiles(
 
         for fi in frame_indices:
             u.trajectory[fi]
+            n_frames_seen += 1
+            box_3 = u.dimensions[:3]
+
+            # Leaflet membership by lipid IDENTITY, from the P atom, resolved
+            # once per frame. Every leaflet-resolved observable below keys off
+            # this rather than off its own atoms' z. Splitting a *bond* on the
+            # mean z of its own base atoms works for bond 0, whose base (C21)
+            # sits at the glycerol and is well separated between leaflets, but
+            # degrades to noise for deep-tail bonds, whose base atoms cluster
+            # around the midplane with heavily overlapping distributions. That
+            # made the leaflet contrast appear to vanish toward the chain end
+            # as an artifact of the assignment rather than as physics.
+            _upper_resix = (_leaflet_by_resindex(_p_atoms.get('mixed'), axis)
+                            if (run_order or run_spatial)
+                            else np.array([], dtype=np.intp))
+            _upper_resix_sp = _upper_resix
+
+            # Thickness and curvature are the two expensive per-frame
+            # computations (a cKDTree pair and an RBF fit with ghost images,
+            # each per species), and the structural and spatial blocks both
+            # want them. Memoise per frame so they are computed once, not
+            # twice - when both groups run this halves the frame cost.
+            _frame_cache = {}
+
+            def _thickness_of(sp, _cache=_frame_cache):
+                if ('thick', sp) not in _cache:
+                    _cache[('thick', sp)] = _local_thickness_dict(
+                        u, tuple(lipid_resnames) if sp == 'mixed' else (sp,),
+                        phosphorus_name, axis, p_atoms=_p_atoms.get(sp),
+                    )
+                return _cache[('thick', sp)]
+
+            def _curvature_of(sp, _cache=_frame_cache):
+                # The radial add-on is always computed: it is a distance array
+                # and a binning against an RBF fit that has already been paid
+                # for, so making it optional would only split the cache in two
+                # and fit twice.
+                if ('curv', sp) not in _cache:
+                    _cache[('curv', sp)] = local_membrane_curvature(
+                        u,
+                        lipid_resnames      = (tuple(lipid_resnames)
+                                               if sp == 'mixed' else (sp,)),
+                        phosphorus_name     = phosphorus_name,
+                        bilayer_normal_axis = axis,
+                        rbf_smoothing       = curvature_smoothing,
+                        permeant_resname    = permeant_resname,
+                        r_max_curvature     = r_max,
+                        n_radial_bins       = n_radial_bins,
+                        p_atoms             = _p_atoms.get(sp),
+                    )
+                return _cache[('curv', sp)]
 
             membrane_z = membrane.positions[:, axis].mean()
             perm_z     = membrane_z - perm_heavy.positions[:, axis].mean()
@@ -2064,6 +2429,15 @@ def calculate_selected_slab_profiles(
                 np.searchsorted(edges, perm_z, side='right') - 1,
                 0, n_slabs - 1
             ))
+            # The clip folds an out-of-range depth into the first or last slab
+            # rather than dropping it. With --slab-range set wider than the box
+            # (the usual case) nothing can land outside, so this never fires;
+            # count it rather than test it per observable, because if the range
+            # is ever set too narrow the contamination lands silently in the
+            # edge bins — and those are the bulk-water bins that set the
+            # reference scale for D. See the summary printed after the loop.
+            if not edges[0] <= perm_z < edges[-1]:
+                n_out_of_range += 1
 
             # ── Near-permeant proximity ranking ─────────────────────────────────
             # Resindices of the N lipids (by P-atom, 3-D PBC-aware distance)
@@ -2074,7 +2448,8 @@ def calculate_selected_slab_profiles(
                     f"({lipid_sel}) and name {phosphorus_name}"
                 )
                 if len(p_all_near) > 0:
-                    perm_com_near = permeant.center_of_geometry()
+                    perm_com_near = _whole_centroid(permeant.positions,
+                                                    u.dimensions[:3])
                     d_near = distances.distance_array(
                         perm_com_near[np.newaxis, :], p_all_near.positions,
                         box=u.dimensions,
@@ -2097,7 +2472,11 @@ def calculate_selected_slab_profiles(
                         if key not in bond_idx:
                             continue
                         ia1, ia2 = bond_idx[key]
-                        vecs  = all_pos[ia2] - all_pos[ia1]
+                        # Minimum image: the trajectories are not -pbc mol, so
+                        # a bond whose two atoms wrapped to opposite sides is
+                        # otherwise a box-length vector in the membrane plane,
+                        # i.e. a spurious P2 of -0.5 (see _min_image).
+                        vecs  = _min_image(all_pos[ia2] - all_pos[ia1], box_3)
                         norms = np.linalg.norm(vecs, axis=1, keepdims=True)
                         ok    = norms[:, 0] > 1e-6
                         p2_per_lip = np.full(len(ia1), np.nan)
@@ -2107,13 +2486,13 @@ def calculate_selected_slab_profiles(
                             p2_per_lip[ok] = 0.5 * (3.0 * cos2 - 1.0)
                         bond_p2_per_lip_all[bi] = p2_per_lip
 
-                        # Leaflet assignment from base-atom (ia1) z-position
-                        base_z  = all_pos[ia1, axis]
-                        mid_z   = base_z.mean()
+                        # Leaflet by lipid identity (its P atom), not by
+                        # this bond's own base-atom z — see _leaflet_by_resindex.
+                        up_b = _upper_mask_for(bond_residx[key], _upper_resix)
                         lf_masks = {
                             'both' : np.ones(len(ia1), dtype=bool),
-                            'upper': base_z > mid_z,
-                            'lower': base_z <= mid_z,
+                            'upper': up_b,
+                            'lower': ~up_b,
                         }
 
                         for sp in _ORDER_SPECIES:
@@ -2147,15 +2526,14 @@ def calculate_selected_slab_profiles(
                     # Chain averages per species × leaflet
                     if bond_p2_per_lip_all:
                         mat = np.column_stack(list(bond_p2_per_lip_all.values()))
-                        # Leaflet masks from the base atom of bond 0
+                        # Leaflet by lipid identity, as for the per-bond masks.
                         first_bi = next(iter(bond_p2_per_lip_all))
-                        ia1_0    = bond_idx[(chain, first_bi)][0]
-                        base_z0  = all_pos[ia1_0, axis]
-                        mid_z0   = base_z0.mean()
+                        up_ch = _upper_mask_for(
+                            bond_residx[(chain, first_bi)], _upper_resix)
                         lf_masks_ch = {
                             'both' : np.ones(mat.shape[0], dtype=bool),
-                            'upper': base_z0 > mid_z0,
-                            'lower': base_z0 <= mid_z0,
+                            'upper': up_ch,
+                            'lower': ~up_ch,
                         }
                         for sp in _ORDER_SPECIES:
                             sp_mask = (np.ones(mat.shape[0], dtype=bool)
@@ -2192,12 +2570,11 @@ def calculate_selected_slab_profiles(
                     if chain not in tilt_idx:
                         continue
                     ib, it   = tilt_idx[chain]
-                    base_z   = all_pos[ib, axis]
-                    mid_z    = base_z.mean()
+                    up_t = _upper_mask_for(tilt_residx[chain], _upper_resix)
                     lf_masks_tilt = {
                         'both' : np.ones(len(ib), dtype=bool),
-                        'upper': base_z > mid_z,
-                        'lower': base_z <= mid_z,
+                        'upper': up_t,
+                        'lower': ~up_t,
                     }
                     for sp in _ORDER_SPECIES:
                         sp_mask = (np.ones(len(ib), dtype=bool)
@@ -2212,16 +2589,20 @@ def calculate_selected_slab_profiles(
                             # split for exactly this subset — mean_tilt_angle
                             # must not re-derive it from `combined`'s own
                             # mean z, which mis-splits filtered subsets.
-                            theta, phi, _ = mean_tilt_angle(
+                            theta, phi, _, theta_ind = mean_tilt_angle(
                                 all_pos[it[combined]],
                                 all_pos[ib[combined]],
                                 normal,
                                 leaflet=lf,
                                 upper_mask=lf_masks_tilt['upper'][combined],
+                                box=box_3,
                             )
                             if np.isfinite(theta):
                                 theta_wsum[(sp, lf, chain)][slab_idx] += weight * theta
                                 theta_wtot[(sp, lf, chain)][slab_idx] += weight
+                            if np.isfinite(theta_ind):
+                                theta_ind_wsum[(sp, lf, chain)][slab_idx] += weight * theta_ind
+                                theta_ind_wtot[(sp, lf, chain)][slab_idx] += weight
                             if np.isfinite(phi):
                                 phi_wsum[(sp, lf, chain)][slab_idx]   += weight * phi
                                 phi_wtot[(sp, lf, chain)][slab_idx]   += weight
@@ -2239,16 +2620,20 @@ def calculate_selected_slab_profiles(
                                 # (the default) mis-assigns members to the
                                 # wrong pseudo-leaflet. Use the real,
                                 # full-population split instead.
-                                theta_n, phi_n, _ = mean_tilt_angle(
+                                theta_n, phi_n, _, theta_ind_n = mean_tilt_angle(
                                     all_pos[it[near_combined]],
                                     all_pos[ib[near_combined]],
                                     normal,
                                     leaflet='both',
                                     upper_mask=lf_masks_tilt['upper'][near_combined],
+                                    box=box_3,
                                 )
                                 if np.isfinite(theta_n):
                                     near_theta_wsum[(N, sp, chain)][slab_idx] += weight * theta_n
                                     near_theta_wtot[(N, sp, chain)][slab_idx] += weight
+                                if np.isfinite(theta_ind_n):
+                                    near_theta_ind_wsum[(N, sp, chain)][slab_idx] += weight * theta_ind_n
+                                    near_theta_ind_wtot[(N, sp, chain)][slab_idx] += weight
                                 if np.isfinite(phi_n):
                                     near_phi_wsum[(N, sp, chain)][slab_idx]   += weight * phi_n
                                     near_phi_wtot[(N, sp, chain)][slab_idx]   += weight
@@ -2256,8 +2641,7 @@ def calculate_selected_slab_profiles(
             # ── STRUCTURAL group ──────────────────────────────────────────────
             if run_structural:
                 for sp in _STRUCT_SPECIES:
-                    rn_tup = tuple(lipid_resnames) if sp == 'mixed' else (sp,)
-                    td = _local_thickness_dict(u, rn_tup, phosphorus_name, axis)
+                    td = _thickness_of(sp)
 
                     # 'both' = combined mean (backward-compatible)
                     if np.isfinite(td['mean_thick_both']):
@@ -2348,17 +2732,7 @@ def calculate_selected_slab_profiles(
                 # there is no additional leaflet dimension to loop over here
                 # (see the accumulator-init comment above).
                 for sp in _STRUCT_SPECIES:
-                    rn_tup = tuple(lipid_resnames) if sp == 'mixed' else (sp,)
-                    curv = local_membrane_curvature(
-                        u,
-                        lipid_resnames      = rn_tup,
-                        phosphorus_name     = phosphorus_name,
-                        bilayer_normal_axis = axis,
-                        rbf_smoothing       = curvature_smoothing,
-                        permeant_resname    = permeant_resname,
-                        r_max_curvature     = r_max,
-                        n_radial_bins       = n_radial_bins,
-                    )
+                    curv = _curvature_of(sp)
                     if np.isfinite(curv['mean_H_upper']):
                         H_upper_wsum[sp][slab_idx] += weight * curv['mean_H_upper']
                         H_upper_wtot[sp][slab_idx] += weight
@@ -2401,8 +2775,10 @@ def calculate_selected_slab_profiles(
                 slab_idx_full.append(slab_idx)
 
             if run_diffusion_xy:
-                raw_xy  = perm_heavy.positions[:, _lat_axes].mean(axis=0)
                 box_xy  = u.dimensions[_lat_axes]
+                raw_xy  = _whole_centroid(
+                    perm_heavy.positions, u.dimensions[:3]
+                )[_lat_axes]
                 if _pbc_prev is None:
                     _pbc_prev = raw_xy.copy()
                     _pbc_jump = np.zeros(2)
@@ -2432,7 +2808,11 @@ def calculate_selected_slab_profiles(
                     _stamp_r_initialised = True
 
                 all_pos_sp  = u.atoms.positions
-                perm_lat_sp = permeant.center_of_geometry()[_lat_axes]
+                # Every map is stamped in the frame centred on this point, so
+                # a permeant split across a lateral boundary would shift the
+                # whole map, not one lipid's contribution — see _whole_centroid.
+                perm_lat_sp = _whole_centroid(permeant.positions,
+                                              u.dimensions[:3])[_lat_axes]
 
                 # Which depth bin this frame's stamps belong to. Uses the
                 # same perm_z as the 1-D slab assignment, so map bin d
@@ -2458,13 +2838,14 @@ def calculate_selected_slab_profiles(
                         box_xy_frame,
                     )
 
-                    # Leaflet masks from base-atom z
-                    base_z_sp = all_pos_sp[base_idx_sp, axis]
-                    mid_z_sp  = base_z_sp.mean()
+                    # Leaflet by lipid identity, exactly as the 1-D order
+                    # block does it — not by this chain's own base-atom z.
+                    up_sp = _upper_mask_for(
+                        u.atoms.resindices[base_idx_sp], _upper_resix_sp)
                     lf_masks_sp = {
                         'both' : np.ones(len(base_idx_sp), dtype=bool),
-                        'upper': base_z_sp > mid_z_sp,
-                        'lower': base_z_sp <= mid_z_sp,
+                        'upper': up_sp,
+                        'lower': ~up_sp,
                     }
 
                     bond_p2_per_lip = []
@@ -2473,7 +2854,8 @@ def calculate_selected_slab_profiles(
                         if key not in bond_idx:
                             continue
                         ia1, ia2 = bond_idx[key]
-                        vecs  = all_pos_sp[ia2] - all_pos_sp[ia1]
+                        vecs  = _min_image(
+                            all_pos_sp[ia2] - all_pos_sp[ia1], box_3)
                         norms = np.linalg.norm(vecs, axis=1, keepdims=True)
                         ok    = norms[:, 0] > 1e-6
                         p2_per_lip = np.full(len(ia1), np.nan)
@@ -2528,18 +2910,18 @@ def calculate_selected_slab_profiles(
                     if chain in tilt_idx:
                         ib, it  = tilt_idx[chain]
 
-                        # Leaflet masks for tilt (based on base-atom z).
-                        # Computed up front because θ needs a per-lipid
-                        # sign correction (see below).
-                        base_z_tilt = all_pos_sp[ib, axis]
-                        mid_z_tilt  = base_z_tilt.mean()
+                        # Leaflet by lipid identity; θ needs a per-lipid
+                        # sign correction from it (see below).
+                        up_tl = _upper_mask_for(tilt_residx[chain],
+                                                _upper_resix_sp)
                         lf_masks_tilt = {
                             'both' : np.ones(len(ib), dtype=bool),
-                            'upper': base_z_tilt > mid_z_tilt,
-                            'lower': base_z_tilt <= mid_z_tilt,
+                            'upper': up_tl,
+                            'lower': ~up_tl,
                         }
 
-                        vt      = all_pos_sp[it] - all_pos_sp[ib]
+                        vt      = _min_image(
+                            all_pos_sp[it] - all_pos_sp[ib], box_3)
                         vt_norm = np.linalg.norm(vt, axis=1, keepdims=True)
                         ok_t    = vt_norm[:, 0] > 1e-6
                         theta_lip = np.full(len(ib), np.nan)
@@ -2594,8 +2976,7 @@ def calculate_selected_slab_profiles(
                 # Thickness maps per species × leaflet
                 for sp in ['mixed'] + list(lipid_resnames):
                     sp_sfx = '' if sp == 'mixed' else f'_{sp}'
-                    rn_tup = tuple(lipid_resnames) if sp == 'mixed' else (sp,)
-                    td = _local_thickness_dict(u, rn_tup, phosphorus_name, axis)
+                    td = _thickness_of(sp)
 
                     # 'both' must pool BOTH leaflets' P atoms into the same
                     # map (two stamp calls into the same acc_key), not just
@@ -2623,14 +3004,7 @@ def calculate_selected_slab_profiles(
                 # Curvature maps per species × leaflet
                 for sp in ['mixed'] + list(lipid_resnames):
                     sp_sfx  = '' if sp == 'mixed' else f'_{sp}'
-                    rn_tup  = tuple(lipid_resnames) if sp == 'mixed' else (sp,)
-                    curv_sp = local_membrane_curvature(
-                        u,
-                        lipid_resnames      = rn_tup,
-                        phosphorus_name     = phosphorus_name,
-                        bilayer_normal_axis = axis,
-                        rbf_smoothing       = curvature_smoothing,
-                    )
+                    curv_sp = _curvature_of(sp)
                     # 'both' must pool BOTH leaflets' curvature into the
                     # same map (two stamp calls into the same acc_key), not
                     # just reuse the upper-leaflet data — otherwise the
@@ -2656,6 +3030,13 @@ def calculate_selected_slab_profiles(
                             )
                             _stamp_depth(acc_key, lip_xy_c, np.abs(hc))
 
+    if n_out_of_range:
+        print(f"  [worker] WARNING: {n_out_of_range} of {n_frames_seen} frames "
+              f"had a permeant depth outside --slab-range "
+              f"[{edges[0]:.1f}, {edges[-1]:.1f}] Å and were folded into the "
+              f"edge slabs. Widen --slab-range: those frames contaminate the "
+              f"first/last bin of every profile, D included.")
+
     # ── Diffusion post-processing ─────────────────────────────────────────────
     # Squared displacements are pooled here, not per-slab diffusion constants:
     # the sums and the window counts go into the weighted accumulators
@@ -2663,41 +3044,40 @@ def calculate_selected_slab_profiles(
     # <dz^2>/(2 n_dim tau) over every window of every path rather than a mean
     # of per-path means, and a path that visited a slab twice no longer speaks
     # as loudly as one that visited it a thousand times.
-    if run_diffusion and len(z_full) > lag_frames and _dt is not None:
+    # A short path supports the first few lags and not the rest; every k is
+    # tried on its own, and one that does not fit simply contributes nothing
+    # to its own columns. The fit then runs on whichever lags a slab has.
+    if (run_diffusion or run_diffusion_xy) and not (_dt is not None and _dt > 0.0):
+        print("  [worker] WARNING: no usable frame spacing could be read from "
+              "this path's trajectories (a single-frame .xtc reports dt = 0), "
+              "so its diffusion columns are left empty. Pass -dt to set it "
+              "explicitly.")
+
+    if run_diffusion and len(z_full) > lag_frames and _dt:
         z_arr  = np.asarray(z_full, dtype=float)
         si_arr = np.asarray(slab_idx_full, dtype=int)
 
-        windows = None
-        for lag, (wsum, wtot) in (
-            (lag_frames,       (D_z_wsum, D_z_wtot)),
-            (2 * lag_frames,   (D_z_lag2_wsum, D_z_lag2_wtot)),
-        ):
+        for k in _lag_ks:
+            lag = k * lag_frames
             total, count = slab_binned_msd(z_arr, si_arr, n_slabs, lag)
-            wsum += weight * total / (2.0 * lag * _dt)
-            wtot += weight * count
-            if windows is None:
-                windows = count
+            D_z_wsum[k] += weight * total / (2.0 * lag * _dt)
+            D_z_wtot[k] += weight * count
+            if k == 1:
+                nwin_wsum += weight * count
+                nwin_wtot += weight * (count > 0)
 
-        nwin_wsum += weight * windows
-        nwin_wtot += weight * (windows > 0)
-
-    if run_diffusion_xy and len(xy_full) > lag_frames and _dt is not None:
+    if run_diffusion_xy and len(xy_full) > lag_frames and _dt:
         xy_arr = np.asarray(xy_full, dtype=float)
         si_arr = np.asarray(slab_idx_xy_full, dtype=int)
 
-        windows = None
-        for lag, (wsum, wtot) in (
-            (lag_frames,     (D_xy_wsum, D_xy_wtot)),
-            (2 * lag_frames, (D_xy_lag2_wsum, D_xy_lag2_wtot)),
-        ):
+        for k in _lag_ks:
+            lag = k * lag_frames
             total, count = slab_binned_msd(xy_arr, si_arr, n_slabs, lag)
-            wsum += weight * total / (4.0 * lag * _dt)
-            wtot += weight * count
-            if windows is None:
-                windows = count
-
-        nwin_xy_wsum += weight * windows
-        nwin_xy_wtot += weight * (windows > 0)
+            D_xy_wsum[k] += weight * total / (4.0 * lag * _dt)
+            D_xy_wtot[k] += weight * count
+            if k == 1:
+                nwin_xy_wsum += weight * count
+                nwin_xy_wtot += weight * (count > 0)
 
     # ── Assemble DataFrames ───────────────────────────────────────────────────
     output = {}
@@ -2721,6 +3101,8 @@ def calculate_selected_slab_profiles(
                 for chain in tilt_endpoints:
                     tilt_data[f'{pfx}{chain}_theta_wsum'] = theta_wsum[(sp, lf, chain)]
                     tilt_data[f'{pfx}{chain}_theta_wtot'] = theta_wtot[(sp, lf, chain)]
+                    tilt_data[f'{pfx}{chain}_theta_ind_wsum'] = theta_ind_wsum[(sp, lf, chain)]
+                    tilt_data[f'{pfx}{chain}_theta_ind_wtot'] = theta_ind_wtot[(sp, lf, chain)]
                     tilt_data[f'{pfx}{chain}_phi_wsum']   = phi_wsum[(sp, lf, chain)]
                     tilt_data[f'{pfx}{chain}_phi_wtot']   = phi_wtot[(sp, lf, chain)]
 
@@ -2739,6 +3121,8 @@ def calculate_selected_slab_profiles(
                 for chain in tilt_endpoints:
                     tilt_data[f'{pfx}{chain}_theta_wsum'] = near_theta_wsum[(N, sp, chain)]
                     tilt_data[f'{pfx}{chain}_theta_wtot'] = near_theta_wtot[(N, sp, chain)]
+                    tilt_data[f'{pfx}{chain}_theta_ind_wsum'] = near_theta_ind_wsum[(N, sp, chain)]
+                    tilt_data[f'{pfx}{chain}_theta_ind_wtot'] = near_theta_ind_wtot[(N, sp, chain)]
                     tilt_data[f'{pfx}{chain}_phi_wsum']   = near_phi_wsum[(N, sp, chain)]
                     tilt_data[f'{pfx}{chain}_phi_wtot']   = near_phi_wtot[(N, sp, chain)]
 
@@ -2798,30 +3182,24 @@ def calculate_selected_slab_profiles(
         )
 
     if run_diffusion:
-        output['diffusion'] = (
-            pd.DataFrame({
-                'slab_center'   : centers,
-                'D_z_wsum'      : D_z_wsum,
-                'D_z_wtot'      : D_z_wtot,
-                'D_z_lag2_wsum' : D_z_lag2_wsum,
-                'D_z_lag2_wtot' : D_z_lag2_wtot,
-                'n_windows_wsum': nwin_wsum,
-                'n_windows_wtot': nwin_wtot,
-            }),
-        )
+        diff_data = {'slab_center': centers}
+        for k in _lag_ks:
+            col = lag_column('D_z', k)
+            diff_data[f'{col}_wsum'] = D_z_wsum[k]
+            diff_data[f'{col}_wtot'] = D_z_wtot[k]
+        diff_data['n_windows_wsum'] = nwin_wsum
+        diff_data['n_windows_wtot'] = nwin_wtot
+        output['diffusion'] = (pd.DataFrame(diff_data),)
 
     if run_diffusion_xy:
-        output['diffusion_xy'] = (
-            pd.DataFrame({
-                'slab_center'    : centers,
-                'D_xy_wsum'      : D_xy_wsum,
-                'D_xy_wtot'      : D_xy_wtot,
-                'D_xy_lag2_wsum' : D_xy_lag2_wsum,
-                'D_xy_lag2_wtot' : D_xy_lag2_wtot,
-                'n_windows_wsum' : nwin_xy_wsum,
-                'n_windows_wtot' : nwin_xy_wtot,
-            }),
-        )
+        diff_xy_data = {'slab_center': centers}
+        for k in _lag_ks:
+            col = lag_column('D_xy', k)
+            diff_xy_data[f'{col}_wsum'] = D_xy_wsum[k]
+            diff_xy_data[f'{col}_wtot'] = D_xy_wtot[k]
+        diff_xy_data['n_windows_wsum'] = nwin_xy_wsum
+        diff_xy_data['n_windows_wtot'] = nwin_xy_wtot
+        output['diffusion_xy'] = (pd.DataFrame(diff_xy_data),)
 
     if run_spatial:
         output['spatial'] = (_spatial_acc, _grid_shape, _x_coords, _y_coords,
@@ -2864,6 +3242,7 @@ def process_single_path(
     curvature_smoothing = 0.0,
     dt                  = None,
     lag_frames          = 1,
+    n_lags              = 6,
     grid_spacing        = 5.0,
     stamp_radius        = None,
     near_n              = (),
@@ -2882,12 +3261,18 @@ def process_single_path(
                 f'Path folder does not exist: {path_folder}')
 
     try:
+        # align_order_with_plan applies atleast_2d: a one-row order.txt
+        # otherwise loads as 1-D, and order[0, 1] would then silently mean the
+        # second *column* of the only row.
         order = np.loadtxt(f"../load/{path_number}/order.txt",
-                           comments=('#', '@'))
-        traj  = np.loadtxt(f"../load/{path_number}/traj.txt",
-                           comments=('#', '@'), usecols=(2,))
-        op    = np.column_stack((order, traj))
-        first, last = op[0, 1], op[-1, 1]
+                           comments=("#", "@"))
+
+        plan, g96_index = read_traj_plan(f"../load/{path_number}/traj.txt")
+        order, problem = align_order_with_plan(order, plan, g96_index)
+        if problem:
+            return (path_number, 'skipped', problem)
+
+        first, last = order[0, 1], order[-1, 1]
 
         ensemble = "plus" \
             if (lambda_minus_one < first < lambda_A) or \
@@ -2902,7 +3287,6 @@ def process_single_path(
             ensemble, lambda_minus_one, lambda_A, first, last
         )
 
-        plan, _ = read_traj_plan(f"../load/{path_number}/traj.txt")
         if first_frame:
             plan = plan[1:]
         if last_frame:
@@ -2948,6 +3332,7 @@ def process_single_path(
             curvature_smoothing = curvature_smoothing,
             dt                  = dt,
             lag_frames          = lag_frames,
+            n_lags              = n_lags,
             grid_spacing        = grid_spacing,
             stamp_radius        = stamp_radius,
             near_n              = near_n,
@@ -3019,6 +3404,7 @@ def loop_over_paths_parallel(
     curvature_smoothing = 0.0,
     dt                  = None,
     lag_frames          = 1,
+    n_lags              = 6,
     grid_spacing        = 5.0,
     stamp_radius        = None,
     near_n              = (),
@@ -3063,6 +3449,7 @@ def loop_over_paths_parallel(
                 curvature_smoothing = curvature_smoothing,
                 dt                  = dt,
                 lag_frames          = lag_frames,
+                n_lags              = n_lags,
                 grid_spacing        = grid_spacing,
                 stamp_radius        = stamp_radius,
                 near_n              = near_n,
@@ -3132,10 +3519,22 @@ def _assign_blocks(path_numbers, n_blocks):
 
 
 def _pool_weighted_means(all_dfs, wsum_cols, wtot_cols,
-                         path_numbers=None, n_blocks=20):
+                         path_numbers=None, n_blocks=20, derived=None):
     """
     Pool per-path (wsum, wtot) accumulators into weighted means, and keep
     the information needed to judge whether those means mean anything.
+
+    `derived` adds quantities that are *functions of several pooled means*
+    rather than means themselves — the diffusion intercept fit is the case
+    this exists for. Each entry is (name, fn), where fn takes
+    (means, weights, index) with `means` and `weights` shaped
+    (..., n_bins, n_obs) and `index` mapping a column name to its position,
+    and returns either one (..., n_bins) array or a dict of them. It is
+    applied to the full estimate and, identically, inside every
+    leave-one-block-out replicate, so the jackknife error it produces is the
+    error *of the derived quantity* — which is what is wanted, and what
+    propagating the per-lag error bars afterwards could not give, since the
+    lags share windows and are strongly correlated.
 
     In addition to the mean, each observable now gets three companion
     columns:
@@ -3223,6 +3622,34 @@ def _pool_weighted_means(all_dfs, wsum_cols, wtot_cols,
         result[f'{col_name}_neff']   = neff[:, ci]
         result[f'{col_name}_err']    = err[:, ci]
 
+    # Derived quantities: computed from the pooled means, then jackknifed by
+    # recomputing them on every replicate. B_k is passed as the per-replicate
+    # weight so a fit weighted by window count stays consistent with the
+    # means it is fitted to.
+    index = {ws.replace('_wsum', ''): ci for ci, ws in enumerate(wsum_cols)}
+    for name, fn in (derived or []):
+        full = fn(mean, B, index)
+        reps = fn(mu_k, B_k, index)
+        if not isinstance(full, dict):
+            full, reps = {name: full}, {name: reps}
+        for sub_name, full_vals in full.items():
+            rep_vals = reps[sub_name]
+            with np.errstate(invalid='ignore', divide='ignore'):
+                ok      = np.isfinite(rep_vals)
+                n_ok    = ok.sum(axis=0)
+                rep_bar = np.where(n_ok > 0,
+                                   np.nansum(rep_vals, axis=0)
+                                   / np.maximum(n_ok, 1),
+                                   np.nan)
+                ss_d    = np.nansum((rep_vals - rep_bar[None, :]) ** 2, axis=0)
+                err_d   = np.where(
+                    n_ok > 1,
+                    np.sqrt((n_ok - 1) / np.maximum(n_ok, 1) * ss_d),
+                    np.nan,
+                )
+            result[sub_name]           = full_vals
+            result[f'{sub_name}_err']  = err_d
+
     return pd.DataFrame(result)
 
 
@@ -3298,16 +3725,146 @@ def _collect_tables(path_start, path_end, weights, kinds=_TABLE_KEYS):
     return pns, dfs
 
 
-def aggregate_all_results(path_start, path_end, weights, n_blocks=20):
+def _lag_columns_present(columns, prefix):
+    """The lag multipliers k whose D_app column is in `columns`, ascending."""
+    ks = []
+    for k in range(1, 1000):
+        name = lag_column(prefix, k)
+        if f'{name}_wsum' in columns or name in columns:
+            ks.append(k)
+        elif k > 2:
+            break
+    return ks
+
+
+def parse_lag_selection(text, available):
+    """Which lag multipliers enter the fit, from a "2-6" / "3-" / "1,3,5" spec.
+
+    Choosing the fitting range is a separate decision from choosing what to
+    accumulate, and it is made here rather than at compute time because every
+    per-lag column is stored: scanning generously costs almost nothing, and
+    the range that is actually affine only becomes visible afterwards, from
+    the ladder and from `<prefix>_fit_resid`. Re-fitting is a re-aggregation,
+    not a recompute.
+
+    `available` is the lags the table holds; the selection is intersected with
+    it, so asking for lags that were never accumulated is not an error.
+    """
+    avail = sorted(available)
+    if text is None or not str(text).strip():
+        return avail
+
+    spec = str(text).strip()
+    lo_hi = spec.split('-')
+    try:
+        if len(lo_hi) == 2 and ',' not in spec:
+            lo_s, hi_s = (part.strip() for part in lo_hi)
+            lo = int(lo_s) if lo_s else (min(avail) if avail else 1)
+            hi = int(hi_s) if hi_s else (max(avail) if avail else 1)
+            chosen = [k for k in avail if lo <= k <= hi]
+        else:
+            wanted = {int(p) for p in spec.replace(',', ' ').split()}
+            chosen = [k for k in avail if k in wanted]
+    except ValueError:
+        raise ValueError(
+            f"-fit-lags: cannot read {text!r}; expected a range like '2-6', "
+            "an open range like '3-', or a list like '1,3,5'."
+        ) from None
+
+    if len(chosen) < 2:
+        raise ValueError(
+            f"-fit-lags {text!r} leaves {len(chosen)} of the available lags "
+            f"{avail}, and an intercept needs at least two. The fit is an "
+            "extrapolation to 1/tau -> 0, not a reading at one lag."
+        )
+    return chosen
+
+
+def _diffusion_fit_spec(columns, prefix, fit_lags=None):
+    """The `derived` entry that fits D_app(tau) -> D for one diffusion table.
+
+    Returns [] when the table carries fewer than two lags, i.e. was written
+    before the lag scan existed — those files still aggregate, just without
+    the fitted column.
+    """
+    ks = _lag_columns_present(columns, prefix)
+    if len(ks) < 2:
+        return []
+    ks = parse_lag_selection(fit_lags, ks)
+    names = [lag_column(prefix, k) for k in ks]
+
+    def _fit(means, wts, index, _ks=ks, _names=names, _prefix=prefix):
+        cols   = [index[n] for n in _names if n in index]
+        used_k = [k for k, n in zip(_ks, _names) if n in index]
+        if len(cols) < 2:
+            nan = np.full(means.shape[:-1], np.nan)
+            return {f'{_prefix}_fit': nan, f'{_prefix}_fit_c': nan.copy(),
+                    f'{_prefix}_fit_resid': nan.copy()}
+        d_app = means[..., cols]
+        # Window counts as the per-lag weight: the long lags have fewer
+        # windows and deserve less pull on the extrapolation.
+        w     = wts[..., cols]
+        d_fit, slope, resid = fit_diffusion_intercept(
+            d_app, weights=w, ks=np.asarray(used_k, dtype=float)
+        )
+        # `slope` is c / (2 n_dim * lag * dt); reported as-is because dt is
+        # not available here. It is a diagnostic, not an input to anything.
+        return {f'{_prefix}_fit': d_fit,
+                f'{_prefix}_fit_c': slope,
+                f'{_prefix}_fit_resid': resid}
+
+    return [(f'{prefix}_fit', _fit)]
+
+
+def _attach_fit_support(df, prefix, fit_lags=None):
+    """Give the fitted column the wtot/neff companions the maskers expect.
+
+    The fit is no better supported than its worst-supported lag, so n_eff is
+    the minimum over the lags that entered it; wtot is taken from k = 1, the
+    lag with the most windows, purely so the column exists.
+    """
+    ks = _lag_columns_present(df.columns, prefix)
+    fit = f'{prefix}_fit'
+    if fit not in df.columns or len(ks) < 2:
+        return df
+    ks = parse_lag_selection(fit_lags, ks)
+    neff_cols = [f'{lag_column(prefix, k)}_neff' for k in ks]
+    neff_cols = [c for c in neff_cols if c in df.columns]
+    if neff_cols:
+        df[f'{fit}_neff'] = df[neff_cols].min(axis=1)
+    if f'{prefix}_wtot' in df.columns:
+        df[f'{fit}_wtot'] = df[f'{prefix}_wtot']
+    return df
+
+
+def aggregate_all_results(path_start, path_end, weights, n_blocks=20,
+                          fit_lags=None):
     pns, dfs = _collect_tables(path_start, path_end, weights)
+    _FIT_PREFIX = {'diff': 'D_z', 'diff_xy': 'D_xy'}
     results = {}
+    reported = False
     for kind in _TABLE_KEYS:
         if not dfs[kind]:
             raise RuntimeError(f"No '{kind}' tables found to aggregate.")
         ws, wt = _wsum_wtot_cols(dfs[kind])
+        derived = (_diffusion_fit_spec(set(ws), _FIT_PREFIX[kind], fit_lags)
+                   if kind in _FIT_PREFIX else [])
+        if derived and not reported:
+            used = parse_lag_selection(
+                fit_lags, _lag_columns_present(set(ws), _FIT_PREFIX[kind]))
+            avail = _lag_columns_present(set(ws), _FIT_PREFIX[kind])
+            note = '' if len(used) == len(avail) else f" of {len(avail)} scanned"
+            print(f"  [aggregate] D fitted over lags k = "
+                  f"{', '.join(str(k) for k in used)}{note}"
+                  f" (times -lag-frames)")
+            reported = True
         results[kind] = _pool_weighted_means(dfs[kind], ws, wt,
                                              path_numbers=pns[kind],
-                                             n_blocks=n_blocks)
+                                             n_blocks=n_blocks,
+                                             derived=derived)
+        if kind in _FIT_PREFIX:
+            results[kind] = _attach_fit_support(results[kind],
+                                                _FIT_PREFIX[kind], fit_lags)
     return (results['p2'], results['tilt'], results['thick'],
             results['deform'], results['water_z'], results['diff'],
             results['diff_xy'])
@@ -3487,10 +4044,15 @@ def plot_tilt_profile(tilt_agg,
                      and not any(c.startswith(f'{sp}_') for sp in ('DOPC', 'POPC'))
                      and not c.startswith('near')})
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5), sharey=False)
+    # Three panels, because the two tilt angles are different quantities and
+    # overlaying them on one axis invites reading the gap as noise: the
+    # collective angle is the leaflet's net lean, the individual one is the
+    # typical chain's tilt, and the difference between them is the splay.
+    fig, axes = plt.subplots(1, 3, figsize=(19, 5), sharey=False)
 
     for ax, angle, ylabel in zip(
-        axes, ['theta', 'phi'], ['Mean tilt θ (°)', 'Azimuthal φ (°)']
+        axes, ['theta', 'theta_ind', 'phi'],
+        ['Collective tilt θ (°)', 'Mean chain tilt θ (°)', 'Azimuthal φ (°)']
     ):
         for chain in chains:
             for sp in lipid_species:
@@ -3716,8 +4278,8 @@ def plot_near_vs_bulk_tilt(tilt_agg, chain='sn2', near_n=(5, 10),
     return _plot_near_vs_bulk(
         tilt_agg, f'{chain}_theta', near_n,
         lambda N: f'near{N}_{chain}_theta',
-        'z-displacement (Å)', 'Mean tilt θ (°)',
-        f'Near-permeant vs. bulk tilt angle — chain {chain}',
+        'z-displacement (Å)', 'Collective tilt θ (°)',
+        f'Near-permeant vs. bulk collective tilt — chain {chain}',
         min_neff=min_neff, output_path=output_path,
     )
 
@@ -3749,29 +4311,45 @@ def plot_near_vs_bulk_curvature(thick_agg, near_n=(5, 10),
     )
 
 
-def plot_diffusion_profile(diff_agg, min_neff=MIN_NEFF, output_path=None):
+def _plot_diffusion(agg, prefix, msd_label, title, ylabel,
+                    min_neff=MIN_NEFF, output_path=None):
+    """Shared body of the two diffusion-profile plots.
+
+    The lag ladder is drawn as thin lines shading from light to dark, and the
+    fitted intercept over it in black. Reading it: the ladder collapsing onto
+    the fit is a slab whose motion is diffusive at this frame spacing; a
+    ladder that keeps descending with lag is one that is not, and there the
+    single-lag D is an overestimate and only the fit is meaningful.
+    """
     fig, (ax1, ax2) = plt.subplots(
         2, 1, figsize=(8, 7), sharex=True,
         gridspec_kw={'height_ratios': [3, 1]}
     )
-    # D_z is the local estimate; D_z_lag2, at twice the lag, is drawn beside
-    # it as the diffusive-regime check rather than as a rival estimator - the
-    # two agreeing is the evidence that the frame spacing is long enough.
-    colors = {'D_z': '#1f77b4', 'D_z_lag2': '#d62728'}
-    labels = {'D_z'     : 'D from ⟨Δz²⟩/2τ',
-              'D_z_lag2': 'same at 2τ (diffusive check)'}
-    for col, color in colors.items():
-        _plot_series(ax1, diff_agg['slab_center'], diff_agg, col,
-                     min_neff=min_neff, lw=2, color=color, label=labels[col])
-    ax1.set_ylabel('D(z)  (Å² ps⁻¹)', fontsize=13)
+    x  = agg['slab_center']
+    ks = _lag_columns_present(agg.columns, prefix)
+
+    shades = plt.cm.Blues(np.linspace(0.35, 0.9, max(len(ks), 1)))
+    for k, color in zip(ks, shades):
+        col = lag_column(prefix, k)
+        label = (f'{msd_label} at τ' if k == 1 else f'at {k}τ')
+        _plot_series(ax1, x, agg, col, min_neff=min_neff,
+                     band=False, lw=1.2, color=color, label=label)
+
+    fit = f'{prefix}_fit'
+    if fit in agg.columns:
+        _plot_series(ax1, x, agg, fit, min_neff=min_neff, lw=2.4,
+                     color='black',
+                     label='fit: MSD = c + 2nDτ, extrapolated to 1/τ → 0')
+
+    ax1.set_ylabel(ylabel, fontsize=13)
     ax1.set_yscale('log')
-    ax1.legend(frameon=False, fontsize=11)
-    ax1.set_title('Local diffusion coefficient along bilayer normal', fontsize=13)
-    if 'n_windows' in diff_agg.columns:
-        width = (diff_agg['slab_center'].iloc[1]
-                 - diff_agg['slab_center'].iloc[0]) * 0.85
-        ax2.bar(diff_agg['slab_center'], diff_agg['n_windows'],
-                width=width, color='steelblue', alpha=0.7)
+    ax1.legend(frameon=False, fontsize=9)
+    ax1.set_title(title, fontsize=13)
+
+    if 'n_windows' in agg.columns:
+        width = (x.iloc[1] - x.iloc[0]) * 0.85
+        ax2.bar(x, agg['n_windows'], width=width,
+                color='steelblue', alpha=0.7)
     ax2.set_xlabel('z-displacement (Å)', fontsize=13)
     ax2.set_ylabel('# windows / path', fontsize=12)
     plt.tight_layout()
@@ -3780,37 +4358,24 @@ def plot_diffusion_profile(diff_agg, min_neff=MIN_NEFF, output_path=None):
     else:
         plt.show()
     return fig
+
+
+def plot_diffusion_profile(diff_agg, min_neff=MIN_NEFF, output_path=None):
+    return _plot_diffusion(
+        diff_agg, 'D_z', '⟨Δz²⟩/2τ',
+        'Local diffusion coefficient along bilayer normal',
+        'D(z)  (Å² ps⁻¹)',
+        min_neff=min_neff, output_path=output_path,
+    )
 
 
 def plot_diffusion_xy_profile(diff_xy_agg, min_neff=MIN_NEFF, output_path=None):
-    fig, (ax1, ax2) = plt.subplots(
-        2, 1, figsize=(8, 7), sharex=True,
-        gridspec_kw={'height_ratios': [3, 1]}
+    return _plot_diffusion(
+        diff_xy_agg, 'D_xy', '⟨Δr²⟩/4τ',
+        'Lateral diffusion coefficient along bilayer normal',
+        'D_xy(z)  (Å² ps⁻¹)',
+        min_neff=min_neff, output_path=output_path,
     )
-    series = {
-        'D_xy'      : ('#1f77b4', 'D from ⟨Δr²⟩/4τ'),
-        'D_xy_lag2' : ('#d62728', 'same at 2τ (diffusive check)'),
-    }
-    for col, (color, label) in series.items():
-        _plot_series(ax1, diff_xy_agg['slab_center'], diff_xy_agg, col,
-                     min_neff=min_neff, lw=2, color=color, label=label)
-    ax1.set_ylabel('D_xy(z)  (Å² ps⁻¹)', fontsize=13)
-    ax1.set_yscale('log')
-    ax1.legend(frameon=False, fontsize=11)
-    ax1.set_title('Lateral diffusion coefficient along bilayer normal', fontsize=13)
-    if 'n_windows' in diff_xy_agg.columns:
-        width = (diff_xy_agg['slab_center'].iloc[1]
-                 - diff_xy_agg['slab_center'].iloc[0]) * 0.85
-        ax2.bar(diff_xy_agg['slab_center'], diff_xy_agg['n_windows'],
-                width=width, color='steelblue', alpha=0.7)
-    ax2.set_xlabel('z-displacement (Å)', fontsize=13)
-    ax2.set_ylabel('# windows / path', fontsize=12)
-    plt.tight_layout()
-    if output_path:
-        plt.savefig(output_path, dpi=300)
-    else:
-        plt.show()
-    return fig
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -4061,7 +4626,7 @@ def plot_spatial_overview(
         (f'p2_{chain}_chain',  SPATIAL_MAP_META.get(f'p2_{chain}_chain',
          ('RdBu_r',  f'P₂ {chain} chain'))),
         (f'theta_{chain}',     SPATIAL_MAP_META.get(f'theta_{chain}',
-         ('plasma',  f'Tilt θ {chain} (°)'))),
+         ('plasma',  f'Chain tilt θ {chain} (°)'))),
         (f'phi_{chain}',       SPATIAL_MAP_META.get(f'phi_{chain}',
          ('twilight', f'Azimuthal φ {chain} (°)'))),
         ('thickness',          SPATIAL_MAP_META.get('thickness',
@@ -4157,8 +4722,10 @@ def membrane_spatial(
     # ── Dataset construction ──────────────────────────────────
     start: Annotated[int, typer.Option("-start", "--start", help="", rich_help_panel=panels.DATASET)] = ...,
     end: Annotated[Optional[int], typer.Option("-end", "--end", help="", rich_help_panel=panels.DATASET)] = None,
-    lag_frames: Annotated[int, typer.Option("-lag-frames", "--lag-frames", help="Lag in frames used for the local diffusion estimate, D = <dz^2>/(2 tau) over the windows starting in each slab. 1 is right unless the frame spacing is short enough that the motion is not yet diffusive; the D_z_lag2 column, taken at twice this lag, is the check.", rich_help_panel=panels.DATASET)] = 1,
-    dt: Annotated[Optional[float], typer.Option("-dt", "--dt", help="", rich_help_panel=panels.DATASET)] = None,
+    lag_frames: Annotated[int, typer.Option("-lag-frames", "--lag-frames", help="Base lag in frames for the local diffusion estimate, D = <dz^2>/(2 tau) over the windows starting in each slab. The scan runs at 1..N times this, so 1 is almost always right; raise it only if consecutive frames are so close together that even the longest lag in the scan is still pre-diffusive.", rich_help_panel=panels.DATASET)] = 1,
+    fit_lags: Annotated[Optional[str], typer.Option("-fit-lags", "--fit-lags", help="Which of the scanned lags the D_z_fit / D_xy_fit extrapolation uses: a range '2-6', an open range '3-', or a list '1,3,5'. Default is all of them. This is an aggregation-time choice, so changing it re-aggregates but does not recompute. Narrow the top end where <obs>_fit_resid is large at steep D gradients (long windows straddling them smear the contrast); raise the bottom end where the residual is large even in flat regions (the shortest lags are not yet diffusive).", rich_help_panel=panels.DATASET)] = None,
+    n_lags: Annotated[int, typer.Option("-n-lags", "--n-lags", help="How many lags to scan, k = 1..N times -lag-frames. D_app(tau) equals D only inside the diffusive window, so instead of trusting one lag the aggregate fits MSD = c + 2nD*tau across the scan and reports the slope as D_z_fit / D_xy_fit; the intercept c absorbs cage rattling. Per-lag values stay available as D_z, D_z_lag2, D_z_lag3 ... The upper lag must still keep sqrt(2 D tau) below the slab width, so more is not always better. 2 reduces the fit to the old two-point check.", rich_help_panel=panels.DATASET)] = 6,
+    dt: Annotated[Optional[float], typer.Option("-dt", "--dt", help="Time between consecutive frames, in ps. Only the diffusion uses it, as the divisor in D = <dz^2>/(2 n tau), so it scales D and hence P linearly. Left unset it is read from the trajectory, which is right when the segments are long but reports 0 for a single-frame .xtc; setting it explicitly is recommended.", rich_help_panel=panels.DATASET)] = None,
 
     # ── CV corrections: representation ────────────────────────
     slab_width: Annotated[float, typer.Option("-slab-width", "--slab-width", help="", rich_help_panel=panels.REPR)] = 1.0,
@@ -4197,7 +4764,7 @@ def membrane_spatial(
     # These were module-level assignments in the original __main__ block, so
     # helper functions below still read them as globals. Declaring them here
     # keeps that working now that the block lives inside a function.
-    global N_WORKERS, leaflets, near_n, slab_range, water_z_range
+    global N_WORKERS, leaflets, near_n, slab_range
 
     args = SimpleNamespace(
         start=start,
@@ -4217,6 +4784,8 @@ def membrane_spatial(
         curvature_smoothing=curvature_smoothing,
         plot=plot,
         lag_frames=lag_frames,
+        n_lags=n_lags,
+        fit_lags=fit_lags,
         dt=dt,
         grid_spacing=grid_spacing,
         stamp_radius=stamp_radius,
@@ -4260,6 +4829,9 @@ def membrane_spatial(
         curvature_smoothing = args.curvature_smoothing,
         dt                  = args.dt,
         lag_frames          = args.lag_frames,
+        n_lags              = args.n_lags,
+        # fit_lags is not passed to the workers: it selects among columns that
+        # are already in the per-path files, so it is consumed at aggregation.
         grid_spacing        = args.grid_spacing,
         stamp_radius        = args.stamp_radius,
         near_n              = tuple(args.near_n),
@@ -4274,7 +4846,8 @@ def membrane_spatial(
 
         p2_agg, tilt_agg, thick_agg, deform_agg, water_z_agg, diff_agg, \
             diff_xy_agg = aggregate_all_results(args.start, end, weights,
-                                                n_blocks=args.n_blocks)
+                                                n_blocks=args.n_blocks,
+                                                fit_lags=args.fit_lags)
 
         for agg, name in (
             (p2_agg,       "p2_aggregate.csv"),
