@@ -403,3 +403,124 @@ class TestOlderFormat:
         pns, _ = ms._collect_tables(1, 2, {1: 1.0, 2: 1.0})
         assert pns["diff"] == [1]
         assert "1 path file(s) in an older format" in capsys.readouterr().out
+
+
+class TestAggregationStreams:
+    """Aggregation must not hold every path's tables at once.
+
+    The estimator only ever adds each path's contribution into a block
+    accumulator, so the list-of-DataFrames shape was pure overhead: at the
+    real column counts it cost ~2.4 GB per 1000 paths, which is what put the
+    analysis out of reach on an ordinary machine. Streaming makes the peak
+    independent of the path count.
+    """
+
+    @staticmethod
+    def _make(tmp_path, n_paths, n_cols=6, rng=None):
+        rng = rng or np.random.default_rng(0)
+
+        def tab(axis, nrow, ncols, off=0.0):
+            cols = {}
+            for i in range(ncols):
+                cols[f"c{i}_wsum"] = rng.random(nrow)
+                cols[f"c{i}_wtot"] = rng.random(nrow) + 0.1
+            df = pd.DataFrame(cols)
+            df.insert(0, axis, np.arange(nrow, dtype=float) + off)
+            return df
+
+        for pn in range(1, n_paths + 1):
+            # ragged on purpose: a differing column count and a shifted axis
+            extra = n_cols + (1 if pn % 3 == 0 else 0)
+            off = 1.0 if pn % 5 == 0 else 0.0
+            write_path_output(tmp_path / f"{pn}.npz", tables={
+                "p2": tab("slab_center", 8, extra, off),
+                "tilt": tab("slab_center", 8, 2),
+                "thick": tab("slab_center", 8, 2),
+                "deform": tab("r_center", 5, 2),
+                "water_z": tab("z_center", 6, 2),
+                "diff": tab("slab_center", 8, 4),
+                "diff_xy": tab("slab_center", 8, 4),
+            })
+        return {pn: 0.3 + 0.1 * pn for pn in range(1, n_paths + 1)}
+
+    def test_it_gives_exactly_what_the_list_version_gave(self, out_dir):
+        """Bit-for-bit, including the derived diffusion-fit columns."""
+        weights = self._make(out_dir, 40)
+        streamed = aggregate_all_results(1, 40, weights)
+
+        pns, dfs = ms._collect_tables(1, 40, weights)
+        fit_prefix = {"diff": "D_z", "diff_xy": "D_xy"}
+        for key, got in zip(ms._TABLE_KEYS, streamed):
+            ws, wt = ms._wsum_wtot_cols(dfs[key])
+            derived = (ms._diffusion_fit_spec(set(ws), fit_prefix[key], None)
+                       if key in fit_prefix else [])
+            want = ms._pool_weighted_means(dfs[key], ws, wt,
+                                           path_numbers=pns[key],
+                                           derived=derived)
+            if key in fit_prefix:
+                want = ms._attach_fit_support(want, fit_prefix[key], None)
+            assert sorted(got.columns) == sorted(want.columns), key
+            np.testing.assert_allclose(
+                got[sorted(got.columns)].to_numpy(),
+                want[sorted(want.columns)].to_numpy(),
+                rtol=1e-12, atol=1e-15, equal_nan=True, err_msg=key,
+            )
+
+    def test_only_one_path_is_held_in_memory_at_a_time(self, out_dir,
+                                                       monkeypatch):
+        """The property that makes the peak independent of the path count.
+
+        Asserted structurally rather than by measuring peak memory: a
+        process-wide tracemalloc peak is not isolated from the rest of the
+        suite, so that version passed alone and failed when run with
+        everything else. Counting live frames tests the same thing and is
+        deterministic.
+        """
+        import weakref
+
+        n_paths = 30
+        weights = self._make(out_dir, n_paths)
+        # Probe _weighted, not read_path_tables: the weighted copy is what an
+        # eager implementation keeps in its list, so that is where retention
+        # across paths shows up. Tracking the frames read_path_tables returns
+        # would only see those alive within one read.
+        refs = []          # DataFrames are unhashable, so no WeakSet
+        high_water = []
+        real = ms._weighted
+
+        def tracked(df, weight):
+            out = real(df, weight)
+            refs.append(weakref.ref(out))
+            high_water.append(sum(1 for r in refs if r() is not None))
+            return out
+
+        monkeypatch.setattr(ms, "_weighted", tracked)
+        aggregate_all_results(1, n_paths, weights)
+
+        assert len(high_water) >= n_paths, "tables were not weighted per path"
+        # Eager retention would climb to n_paths * n_kinds (210 here).
+        assert max(high_water) <= 3, (
+            f"up to {max(high_water)} weighted path tables alive at once; "
+            f"the aggregation is materialising them instead of streaming"
+        )
+
+    def test_the_metadata_pass_does_not_read_any_table_data(self, out_dir):
+        """It is only worth a second open if it stays cheap."""
+        self._make(out_dir, 6)
+        monkey = {"n": 0}
+        real = ms.read_path_tables
+
+        def counted(*a, **k):
+            monkey["n"] += 1
+            return real(*a, **k)
+
+        ms.read_path_tables = counted
+        try:
+            scan = ms._scan_tables(1, 6, {pn: 1.0 for pn in range(1, 7)})
+        finally:
+            ms.read_path_tables = real
+        assert monkey["n"] == 0
+        pn_list, centers, axis_name, ws, wt = scan["diff"]
+        assert pn_list == list(range(1, 7))
+        assert axis_name == "slab_center"
+        assert len(ws) == len(wt) > 0

@@ -726,6 +726,123 @@ def water_defect_profile(
 # Local membrane curvature
 # ═════════════════════════════════════════════════════════════════════════════
 
+CURVATURE_METHODS  = ('rbf', 'fourier')
+CURVATURE_SURFACES = ('species', 'all')
+
+
+def check_curvature_options(method, surface, wavelength):
+    """Reject a bad curvature setting before any path is processed."""
+    if method not in CURVATURE_METHODS:
+        raise ValueError(f"-curvature-method must be one of {CURVATURE_METHODS}, "
+                         f"not '{method}'.")
+    if surface not in CURVATURE_SURFACES:
+        raise ValueError(f"-curvature-surface must be one of "
+                         f"{CURVATURE_SURFACES}, not '{surface}'.")
+    if not (np.isfinite(wavelength) and wavelength > 0):
+        raise ValueError(f"-curvature-wavelength must be > 0, got {wavelength}.")
+
+
+def _monge_curvature(hx, hy, hxx, hyy, hxy):
+    """H and K of a height field z = h(x, y) from its derivatives."""
+    E = 1.0 + hx**2
+    F = hx * hy
+    G = 1.0 + hy**2
+    denom = np.sqrt(E * G - F**2)
+    H = (E * hyy - 2*F*hxy + G*hxx) / (2 * denom**3)
+    K = (hxx * hyy - hxy**2) / denom**4
+    return H, K
+
+
+def _fourier_modes(Lx, Ly, wavelength):
+    """Wave vectors (M, 2) of the kept modes, one per +/-q pair.
+
+    A mode is kept when its wavelength is at least `wavelength`, i.e.
+    |q| <= 2 pi / wavelength. Only one of q and -q is listed: with a cosine
+    and a sine per mode that already spans the real series.
+    """
+    m_max = int(np.floor(Lx / wavelength))
+    n_max = int(np.floor(Ly / wavelength))
+    modes = [(m, n)
+             for n in range(0, n_max + 1)
+             for m in range(-m_max, m_max + 1)
+             if (n > 0 or m > 0)
+             and (m / Lx) ** 2 + (n / Ly) ** 2 <= 1.0 / wavelength ** 2]
+    if not modes:
+        return np.empty((0, 2))
+    mn = np.asarray(modes, dtype=float)
+    return 2 * np.pi * mn / np.array([Lx, Ly])
+
+
+def _fourier_surface_curvature(xy, z, Lx, Ly, wavelength):
+    """H, K at each point of a low-pass periodic Fourier fit of z(x, y).
+
+    Least squares, not interpolation: the fitted surface does not pass through
+    each phosphate, so single-lipid protrusions shorter than `wavelength` are
+    filtered out instead of turning into curvature, and two phosphates at the
+    same (x, y) are just two samples of the surface there. The series is
+    periodic in the box, so no ghost images are needed and positions need not
+    be wrapped. Derivatives are analytic.
+
+    Returns NaNs (with a warning) when the leaflet has fewer phosphates than
+    the series has coefficients: the fit would be underdetermined and the
+    minimum-norm answer is as noise-dominated as exact interpolation.
+    """
+    n = len(z)
+    q = _fourier_modes(Lx, Ly, wavelength)
+    n_coef = 1 + 2 * len(q)
+    if n < n_coef:
+        warnings.warn(
+            f"Fourier curvature: {n} phosphates cannot determine {n_coef} "
+            f"coefficients (box {Lx:.1f} x {Ly:.1f} A, cutoff {wavelength} A). "
+            "Raise -curvature-wavelength, or fit on all lipids with "
+            "-curvature-surface all. Curvature for this leaflet is NaN.",
+            stacklevel=3,
+        )
+        return np.full(n, np.nan), np.full(n, np.nan)
+
+    xy    = np.asarray(xy, dtype=np.float64)
+    phase = xy @ q.T                       # (n, M)
+    cos, sin = np.cos(phase), np.sin(phase)
+    A = np.hstack([np.ones((n, 1)), cos, sin])
+    coef, *_ = np.linalg.lstsq(A, np.asarray(z, dtype=np.float64), rcond=None)
+    a, b = coef[1:1 + len(q)], coef[1 + len(q):]
+
+    qx, qy = q[:, 0], q[:, 1]
+    d1 = -sin * a + cos * b                # d/d(phase)
+    d2 = -cos * a - sin * b                # d^2/d(phase)^2
+    hx,  hy  = d1 @ qx, d1 @ qy
+    hxx, hyy = d2 @ qx**2, d2 @ qy**2
+    hxy      = d2 @ (qx * qy)
+    return _monge_curvature(hx, hy, hxx, hyy, hxy)
+
+
+def _curvature_on_species(curv_all, species_resindices):
+    """One species' curvature, read off the surface fitted to ALL lipids.
+
+    The membrane has one surface per leaflet; a species does not have its
+    own. Fitting a surface through only the POPC phosphates (11 per leaflet
+    at 5:1) interpolates across gaps of ~20 A between them, so its curvature
+    describes the sparse sampling rather than the membrane. Here H and K come
+    from the all-lipid fit and are evaluated at this species' phosphates, so
+    the species-resolved numbers differ only in WHERE the surface is sampled.
+    Leaflet membership comes along from the all-lipid split as well.
+
+    Returns a dict with the same keys as local_membrane_curvature. The radial
+    profile is left out (None): it is only ever taken from the mixed result.
+    """
+    out = {'radial_r': None, 'radial_H_upper': None}
+    for leaf in ('upper', 'lower'):
+        keep = np.isin(curv_all[f'{leaf}_resindices'], species_resindices)
+        for field in ('H', 'K', 'xy', 'resindices'):
+            out[f'{leaf}_{field}'] = curv_all[f'{leaf}_{field}'][keep]
+        H, K = out[f'{leaf}_H'], out[f'{leaf}_K']
+        out[f'mean_H_{leaf}'] = (float(np.nanmean(np.abs(H)))
+                                 if np.isfinite(H).any() else np.nan)
+        out[f'mean_K_{leaf}'] = (float(np.nanmean(K))
+                                 if np.isfinite(K).any() else np.nan)
+    return out
+
+
 def local_membrane_curvature(
     universe,
     lipid_resnames      = ('DOPC', 'POPC'),
@@ -739,7 +856,26 @@ def local_membrane_curvature(
     n_radial_bins       = 20,
     ghost_margin        = 20.0,
     p_atoms             = None,
+    method              = 'rbf',
+    wavelength          = 20.0,
 ):
+    """Mean (H) and Gaussian (K) curvature of each leaflet's phosphate surface.
+
+    `method` picks how the surface z(x, y) is built from the phosphates:
+
+    'rbf'      an RBF through every phosphate (exactly, at rbf_smoothing=0),
+               with ghost images for the periodic boundary. With exact
+               interpolation each phosphate's thermal protrusion becomes
+               curvature, so the values are dominated by lipid-scale noise.
+    'fourier'  a least-squares fit of a periodic Fourier series holding only
+               the modes of wavelength >= `wavelength` (Angstrom), with the
+               derivatives taken analytically. Periodic by construction, and
+               the cutoff is an explicit length scale for what counts as
+               membrane shape rather than single-lipid motion.
+    """
+    if method not in CURVATURE_METHODS:
+        raise ValueError(f"Unknown curvature method '{method}'; "
+                         f"expected one of {CURVATURE_METHODS}.")
     ax   = bilayer_normal_axis
     lat  = [i for i in range(3) if i != ax]
 
@@ -786,6 +922,25 @@ def local_membrane_curvature(
 
         xy_real[:, 0] %= Lx
         xy_real[:, 1] %= Ly
+        # float32 `%` can round a tiny negative coordinate up to exactly L;
+        # that point and its -L ghost would then sit on both edges of the
+        # cell, and its ghost could land exactly on a real point at 0.
+        xy_real[xy_real[:, 0] >= Lx, 0] -= Lx
+        xy_real[xy_real[:, 1] >= Ly, 1] -= Ly
+
+        # An interpolating RBF cannot pass through two different heights at
+        # the same (x, y): the system gets two identical rows and is singular.
+        # It happens for real - two phosphates of one leaflet stacked
+        # vertically (one lipid pushed out of the plane) that also land on the
+        # same 0.01 A xtc grid point. The leaflet genuinely has two heights
+        # there, so fit one point at their mean z and still evaluate H and K
+        # at every real phosphate below.
+        fit_xy, inverse = np.unique(xy_real, axis=0, return_inverse=True)
+        inverse = inverse.ravel()
+        fit_z   = (np.bincount(inverse, weights=z_real)
+                   / np.bincount(inverse))
+        if len(fit_xy) < 4:
+            return np.full(n_real, np.nan), np.full(n_real, np.nan)
 
         offsets = [(-Lx, -Ly), (-Lx, 0), (-Lx, Ly),
                    (0,   -Ly),            (0,   Ly),
@@ -794,21 +949,21 @@ def local_membrane_curvature(
         ghost_xy_list = []
         ghost_z_list  = []
         for dx, dy in offsets:
-            gx = xy_real[:, 0] + dx
-            gy = xy_real[:, 1] + dy
+            gx = fit_xy[:, 0] + dx
+            gy = fit_xy[:, 1] + dy
             in_x = (gx > -ghost_margin) & (gx < Lx + ghost_margin)
             in_y = (gy > -ghost_margin) & (gy < Ly + ghost_margin)
             keep = in_x & in_y
             if keep.any():
                 ghost_xy_list.append(np.column_stack([gx[keep], gy[keep]]))
-                ghost_z_list.append(z_real[keep])
+                ghost_z_list.append(fit_z[keep])
 
         if ghost_xy_list:
-            all_xy = np.vstack([xy_real] + ghost_xy_list)
-            all_z  = np.concatenate([z_real] + ghost_z_list)
+            all_xy = np.vstack([fit_xy] + ghost_xy_list)
+            all_z  = np.concatenate([fit_z] + ghost_z_list)
         else:
-            all_xy = xy_real
-            all_z  = z_real
+            all_xy = fit_xy
+            all_z  = fit_z
 
         rbf = RBFInterpolator(all_xy, all_z,
                               kernel=rbf_kernel, smoothing=rbf_smoothing)
@@ -825,23 +980,24 @@ def local_membrane_curvature(
         d2zdxdy  = (rbf(xy + [eps, eps]) - rbf(xy + [eps, -eps])
                     - rbf(xy - [eps, -eps]) + rbf(xy - [eps,  eps])) / (4*eps**2)
 
-        E = 1.0 + dzdx**2
-        F = dzdx * dzdy
-        G = 1.0 + dzdy**2
-        denom = np.sqrt(E * G - F**2)
+        return _monge_curvature(dzdx, dzdy, d2zdx2, d2zdy2, d2zdxdy)
 
-        H = (E * d2zdy2 - 2*F*d2zdxdy + G*d2zdx2) / (2 * denom**3)
-        K = (d2zdx2 * d2zdy2 - d2zdxdy**2) / denom**4
-
-        return H, K
+    def _fit_and_evaluate(pos_3d):
+        if method == 'fourier':
+            if len(pos_3d) < 4:
+                return (np.full(len(pos_3d), np.nan),
+                        np.full(len(pos_3d), np.nan))
+            return _fourier_surface_curvature(pos_3d[:, lat], pos_3d[:, ax],
+                                              Lx, Ly, wavelength)
+        return _fit_and_evaluate_pbc(pos_3d)
 
     upper_pos = p_pos[upper_mask].copy()
     lower_pos = p_pos[lower_mask].copy()
     upper_resindices = p_resindices[upper_mask]
     lower_resindices = p_resindices[lower_mask]
 
-    H_upper, K_upper = _fit_and_evaluate_pbc(upper_pos)
-    H_lower, K_lower = _fit_and_evaluate_pbc(lower_pos)
+    H_upper, K_upper = _fit_and_evaluate(upper_pos)
+    H_lower, K_lower = _fit_and_evaluate(lower_pos)
 
     result = {
         'upper_H'     : H_upper,
@@ -1999,6 +2155,9 @@ def calculate_selected_slab_profiles(
     n_z_bins            = 50,
     water_z_range       = WATER_Z_RANGE,
     curvature_smoothing = 0.0,
+    curvature_method    = 'rbf',
+    curvature_wavelength = 20.0,
+    curvature_surface   = 'species',
     dt                  = None,
     lag_frames          = 1,
     n_lags              = 6,
@@ -2030,6 +2189,8 @@ def calculate_selected_slab_profiles(
           'sn2_p2_bond_0_wsum'   (both leaflets, mixed species — backward compat)
     """
     run_order         = 'order'        in needed_groups
+    check_curvature_options(curvature_method, curvature_surface,
+                            curvature_wavelength)
     run_structural    = 'structural'   in needed_groups
     run_diffusion     = 'diffusion'    in needed_groups
     run_diffusion_xy  = 'diffusion_xy' in needed_groups
@@ -2407,8 +2568,15 @@ def calculate_selected_slab_profiles(
                 # The radial add-on is always computed: it is a distance array
                 # and a binning against an RBF fit that has already been paid
                 # for, so making it optional would only split the cache in two
-                # and fit twice.
-                if ('curv', sp) not in _cache:
+                # and fit twice. With curvature_surface='all' a species is
+                # sampled from the mixed fit instead of getting its own.
+                if ('curv', sp) in _cache:
+                    return _cache[('curv', sp)]
+                if curvature_surface == 'all' and sp != 'mixed':
+                    _cache[('curv', sp)] = _curvature_on_species(
+                        _curvature_of('mixed'), _p_atoms[sp].resindices,
+                    )
+                else:
                     _cache[('curv', sp)] = local_membrane_curvature(
                         u,
                         lipid_resnames      = (tuple(lipid_resnames)
@@ -2420,6 +2588,8 @@ def calculate_selected_slab_profiles(
                         r_max_curvature     = r_max,
                         n_radial_bins       = n_radial_bins,
                         p_atoms             = _p_atoms.get(sp),
+                        method              = curvature_method,
+                        wavelength          = curvature_wavelength,
                     )
                 return _cache[('curv', sp)]
 
@@ -3240,6 +3410,9 @@ def process_single_path(
     n_z_bins            = 50,
     water_z_range       = WATER_Z_RANGE,
     curvature_smoothing = 0.0,
+    curvature_method    = 'rbf',
+    curvature_wavelength = 20.0,
+    curvature_surface   = 'species',
     dt                  = None,
     lag_frames          = 1,
     n_lags              = 6,
@@ -3330,6 +3503,9 @@ def process_single_path(
             n_z_bins            = n_z_bins,
             water_z_range       = water_z_range,
             curvature_smoothing = curvature_smoothing,
+            curvature_method    = curvature_method,
+            curvature_wavelength = curvature_wavelength,
+            curvature_surface   = curvature_surface,
             dt                  = dt,
             lag_frames          = lag_frames,
             n_lags              = n_lags,
@@ -3402,6 +3578,9 @@ def loop_over_paths_parallel(
     n_z_bins            = 50,
     water_z_range       = WATER_Z_RANGE,
     curvature_smoothing = 0.0,
+    curvature_method    = 'rbf',
+    curvature_wavelength = 20.0,
+    curvature_surface   = 'species',
     dt                  = None,
     lag_frames          = 1,
     n_lags              = 6,
@@ -3411,6 +3590,8 @@ def loop_over_paths_parallel(
     spatial_extent      = None,
     n_depth_bins        = 10,
 ):
+    check_curvature_options(curvature_method, curvature_surface,
+                            curvature_wavelength)
     Path(ORDER_OUT).mkdir(parents=True, exist_ok=True)
     _note_legacy_outputs(ORDER_OUT)
 
@@ -3447,6 +3628,9 @@ def loop_over_paths_parallel(
                 n_z_bins            = n_z_bins,
                 water_z_range       = water_z_range,
                 curvature_smoothing = curvature_smoothing,
+                curvature_method    = curvature_method,
+                curvature_wavelength = curvature_wavelength,
+                curvature_surface   = curvature_surface,
                 dt                  = dt,
                 lag_frames          = lag_frames,
                 n_lags              = n_lags,
@@ -3558,11 +3742,37 @@ def _pool_weighted_means(all_dfs, wsum_cols, wtot_cols,
     all_centers = np.unique(np.round(
         np.concatenate([df.iloc[:, 0].values for df in all_dfs]), 6
     ))
+    axis_name = all_dfs[0].columns[0]
+    return _pool_streamed(
+        lambda: iter(all_dfs), len(all_dfs), all_centers, axis_name,
+        wsum_cols, wtot_cols, path_numbers=path_numbers,
+        n_blocks=n_blocks, derived=derived,
+    )
+
+
+def _pool_streamed(open_tables, n_tables, all_centers, axis_name,
+                   wsum_cols, wtot_cols, path_numbers=None,
+                   n_blocks=20, derived=None):
+    """The pooling above, over an iterator instead of a list of DataFrames.
+
+    Memory is what forces this shape. The estimator only ever needs each
+    path's contribution *added into* a block accumulator, so holding every
+    path's tables at once - which is what building the list costs - is pure
+    overhead: at ~0.75 MB of float64 tables per path, 5000 paths is nearly
+    4 GB before any arithmetic happens. Streaming holds one path at a time
+    and the (K, n_bins, n_obs) blocks, which is tens of MB regardless of how
+    many paths there are.
+
+    `open_tables` is called to produce a fresh iterator of DataFrames in the
+    same order as `path_numbers`; the axis grid and column list have to be
+    known up front, which is what the cheap metadata pass in _scan_tables is
+    for.
+    """
     n = len(all_centers)
     C = len(wsum_cols)
 
     if path_numbers is None:
-        path_numbers = np.arange(len(all_dfs))
+        path_numbers = np.arange(n_tables)
     block_of, K = _assign_blocks(path_numbers, n_blocks)
 
     # (K, n_bins, n_obs) block-wise accumulators, plus Σw² per bin for n_eff.
@@ -3570,7 +3780,7 @@ def _pool_weighted_means(all_dfs, wsum_cols, wtot_cols,
     block_wtot = np.zeros((K, n, C))
     wtot_sq    = np.zeros((n, C))
 
-    for df, k in zip(all_dfs, block_of):
+    for df, k in zip(open_tables(), block_of):
         idx_map = np.searchsorted(
             all_centers, np.round(df.iloc[:, 0].values, 6)
         )
@@ -3614,7 +3824,7 @@ def _pool_weighted_means(all_dfs, wsum_cols, wtot_cols,
             np.nan,
         )
 
-    result = {all_dfs[0].columns[0]: all_centers}
+    result = {axis_name: all_centers}
     for ci, ws in enumerate(wsum_cols):
         col_name = ws.replace('_wsum', '')
         result[col_name]             = mean[:, ci]
@@ -3673,6 +3883,92 @@ def _weighted(df, weight):
     columns = [c for c in df.columns[1:] if c.endswith(('_wsum', '_wtot'))]
     df[columns] = df[columns] * weight
     return df
+
+
+def read_path_axis(path, key):
+    """The axis column of one table, without decompressing its data block.
+
+    np.load on an .npz is lazy, so naming one member reads only that member.
+    That is what makes the metadata pass in _scan_tables cheap enough to be
+    worth doing separately from the accumulation pass.
+    """
+    data = _open_current(path)
+    if data is None:
+        return None
+    with data:
+        name = f'{key}__axis'
+        return np.asarray(data[name]) if name in data.files else None
+
+
+def _scan_tables(path_start, path_end, weights, kinds=_TABLE_KEYS):
+    """Metadata pass: which paths contribute, on what axis, with what columns.
+
+    Reads only each file's column names and axis, never its data, so the
+    accumulation pass that follows can stream one path at a time instead of
+    holding them all. Returns {kind: (path_numbers, centers, wsum, wtot)},
+    with the same skip accounting _collect_tables printed.
+    """
+    pns = {kind: [] for kind in kinds}
+    cols = {kind: set() for kind in kinds}
+    centers = {kind: set() for kind in kinds}
+    axis_name = {kind: None for kind in kinds}
+    no_weight = no_file = stale = 0
+    missing = {kind: 0 for kind in kinds}
+
+    for pn in range(path_start, path_end + 1):
+        weight = weights.get(pn, 0.0)
+        if not weight > 0.0:
+            no_weight += 1
+            continue
+        path = path_output_file(pn)
+        present = path_output_contents(path)
+        if not present:
+            version = path_output_version(path)
+            if version is not None and version != PATH_FILE_VERSION:
+                stale += 1
+            else:
+                no_file += 1
+            continue
+        for kind in kinds:
+            if kind not in present:
+                missing[kind] += 1
+                continue
+            names = read_path_columns(path, kind)
+            axis = read_path_axis(path, kind)
+            if not names or axis is None:
+                missing[kind] += 1
+                continue
+            pns[kind].append(pn)
+            cols[kind].update(names)
+            centers[kind].update(np.round(axis, 6).tolist())
+            axis_name[kind] = names[0]
+
+    if no_weight or no_file:
+        print(f"  [aggregate] skipped {no_weight} path(s) without a positive "
+              f"weight and {no_file} without an output file.")
+    if stale:
+        print(f"  [aggregate] skipped {stale} path file(s) in an older format "
+              "(their sums carry the weights they were computed with). A run "
+              "recomputes them automatically, provided the path's trajectories "
+              "are still in ../load.")
+    partial = {kind: n for kind, n in missing.items() if n}
+    if partial:
+        print(f"  [aggregate] paths missing individual tables: {partial}")
+
+    out = {}
+    for kind in kinds:
+        wsum = sorted(c for c in cols[kind] if c.endswith('_wsum'))
+        wtot = [c.replace('_wsum', '_wtot') for c in wsum]
+        out[kind] = (pns[kind], np.array(sorted(centers[kind])),
+                     axis_name[kind], wsum, wtot)
+    return out
+
+
+def _stream_tables(path_numbers, kind, weights):
+    """Yield one weighted table at a time, in `path_numbers` order."""
+    for pn in path_numbers:
+        tables = read_path_tables(path_output_file(pn), (kind,))
+        yield _weighted(tables[kind], weights.get(pn, 0.0))
 
 
 def _collect_tables(path_start, path_end, weights, kinds=_TABLE_KEYS):
@@ -3839,14 +4135,16 @@ def _attach_fit_support(df, prefix, fit_lags=None):
 
 def aggregate_all_results(path_start, path_end, weights, n_blocks=20,
                           fit_lags=None):
-    pns, dfs = _collect_tables(path_start, path_end, weights)
+    # Metadata first, then one streaming pass per table kind: the tables are
+    # never all in memory at once. See _pool_streamed.
+    scan = _scan_tables(path_start, path_end, weights)
     _FIT_PREFIX = {'diff': 'D_z', 'diff_xy': 'D_xy'}
     results = {}
     reported = False
     for kind in _TABLE_KEYS:
-        if not dfs[kind]:
+        pn_list, centers, axis_name, ws, wt = scan[kind]
+        if not pn_list:
             raise RuntimeError(f"No '{kind}' tables found to aggregate.")
-        ws, wt = _wsum_wtot_cols(dfs[kind])
         derived = (_diffusion_fit_spec(set(ws), _FIT_PREFIX[kind], fit_lags)
                    if kind in _FIT_PREFIX else [])
         if derived and not reported:
@@ -3858,10 +4156,11 @@ def aggregate_all_results(path_start, path_end, weights, n_blocks=20,
                   f"{', '.join(str(k) for k in used)}{note}"
                   f" (times -lag-frames)")
             reported = True
-        results[kind] = _pool_weighted_means(dfs[kind], ws, wt,
-                                             path_numbers=pns[kind],
-                                             n_blocks=n_blocks,
-                                             derived=derived)
+        results[kind] = _pool_streamed(
+            lambda pl=pn_list, k=kind: _stream_tables(pl, k, weights),
+            len(pn_list), centers, axis_name, ws, wt,
+            path_numbers=pn_list, n_blocks=n_blocks, derived=derived,
+        )
         if kind in _FIT_PREFIX:
             results[kind] = _attach_fit_support(results[kind],
                                                 _FIT_PREFIX[kind], fit_lags)
@@ -4735,7 +5034,10 @@ def membrane_spatial(
     n_radial_bins: Annotated[int, typer.Option("-n-radial-bins", "--n-radial-bins", help="", rich_help_panel=panels.REPR)] = 15,
     n_z_bins: Annotated[int, typer.Option("-n-z-bins", "--n-z-bins", help="Number of bins for the water z-density profile, spanning --water-z-range.", rich_help_panel=panels.REPR)] = 60,
     water_z_range_opt: Annotated[str, typer.Option("-water-z-range", "--water-z-range", help="Window in Angstrom as 'min,max' for the water z-density profile, measured relative to the bilayer midplane. Fixed rather than box-derived so the profile is poolable across paths and comparable between simulations. Must not exceed the box height; ±40 Å suits a ~100 Å box.", rich_help_panel=panels.REPR)] = '-40,40',
-    curvature_smoothing: Annotated[float, typer.Option("-curvature-smoothing", "--curvature-smoothing", help="", rich_help_panel=panels.REPR)] = 0.0,
+    curvature_smoothing: Annotated[float, typer.Option("-curvature-smoothing", "--curvature-smoothing", help="RBF smoothing for -curvature-method rbf. At 0 the surface passes exactly through every phosphate, so single-lipid protrusions dominate H and K. Ignored by the fourier method.", rich_help_panel=panels.REPR)] = 0.0,
+    curvature_method: Annotated[str, typer.Option("-curvature-method", "--curvature-method", help="How each leaflet's phosphate surface is built for H and K. 'rbf': an interpolating RBF through every phosphate (the original; noise-dominated at -curvature-smoothing 0). 'fourier': a least-squares periodic Fourier fit keeping only wavelengths >= -curvature-wavelength, with analytic derivatives. Changing it changes the stored curvature, so rerun the structural and spatial groups with -overwrite rather than mixing methods across paths.", rich_help_panel=panels.REPR)] = 'rbf',
+    curvature_wavelength: Annotated[float, typer.Option("-curvature-wavelength", "--curvature-wavelength", help="Shortest wavelength (A) the fourier curvature keeps; shorter undulations count as single-lipid motion and are filtered out. Needs at least 1 + 2M phosphates per leaflet for M kept modes (~37 coefficients at 20 A in a 68 A box). Ignored by the rbf method.", rich_help_panel=panels.REPR)] = 20.0,
+    curvature_surface: Annotated[str, typer.Option("-curvature-surface", "--curvature-surface", help="Which surface the per-species (DOPC, POPC) curvature is read from. 'species': a separate fit through only that species' phosphates (the original; sparse for the minority lipid). 'all': the one surface fitted to all lipids, evaluated at that species' phosphates. The mixed result is the same either way.", rich_help_panel=panels.REPR)] = 'species',
     grid_spacing: Annotated[float, typer.Option("-grid-spacing", "--grid-spacing", help="", rich_help_panel=panels.REPR)] = 5.0,
     stamp_radius: Annotated[Optional[float], typer.Option("-stamp-radius", "--stamp-radius", help="", rich_help_panel=panels.REPR)] = None,
     near_n_opt: Annotated[str, typer.Option("-near-n", "--near-n", help="Comma-separated N values for near-permeant local membrane metrics (nearest-N-lipid average vs bulk), e.g. '5,10'. Pass an empty string to disable.", rich_help_panel=panels.REPR)] = "5,10",
@@ -4782,6 +5084,9 @@ def membrane_spatial(
         n_z_bins=n_z_bins,
         water_z_range=water_z_range_opt,
         curvature_smoothing=curvature_smoothing,
+        curvature_method=curvature_method,
+        curvature_wavelength=curvature_wavelength,
+        curvature_surface=curvature_surface,
         plot=plot,
         lag_frames=lag_frames,
         n_lags=n_lags,
@@ -4827,6 +5132,9 @@ def membrane_spatial(
         n_z_bins            = args.n_z_bins,
         water_z_range       = tuple(args.water_z_range),
         curvature_smoothing = args.curvature_smoothing,
+        curvature_method    = args.curvature_method,
+        curvature_wavelength = args.curvature_wavelength,
+        curvature_surface   = args.curvature_surface,
         dt                  = args.dt,
         lag_frames          = args.lag_frames,
         n_lags              = args.n_lags,

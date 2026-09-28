@@ -476,3 +476,214 @@ class TestTheTwoTiltAngles:
         assert _mean_tilt(out, "sn2_theta") == pytest.approx(TRUE_TILT, abs=0.05)
         assert _mean_tilt(out, "sn2_theta_ind") == pytest.approx(TRUE_TILT,
                                                                  abs=0.05)
+
+
+class TestStackedPhosphatesInTheCurvatureFit:
+    """Two phosphates of one leaflet can share (x, y) exactly.
+
+    Path 1065 of D_PRO_neutral hit it: two POPC phosphates of the lower
+    leaflet stacked 6.8 A apart in z on the same 0.01 A xtc grid point. An
+    interpolating RBF cannot pass through two heights at one (x, y), so the
+    fit raised `Singular matrix` and the whole path was lost. (Whether LAPACK
+    flags the duplicate rows as singular or silently returns a garbage fit
+    depends on rounding in the solve, so the premise itself is not asserted.)
+    """
+
+    BOX = 68.0
+
+    def _membrane(self, stacked):
+        g = np.arange(0.0, self.BOX, 8.5)
+        x, y = [a.ravel() for a in np.meshgrid(g, g)]
+        n = len(x)
+        bump = lambda z0: z0 + 1.5 * np.sin(2 * np.pi * x / self.BOX)
+        pos = np.concatenate([
+            np.column_stack([x, y, bump(20.0)]),
+            np.column_stack([x, y, bump(60.0)]),
+        ])
+        if stacked:
+            # A second lower-leaflet phosphate right above the fourth one.
+            pos = np.vstack([pos, pos[3] + [0.0, 0.0, 6.8]])
+        pos = pos.astype(np.float32)
+        p_atoms = type("P", (), {
+            "positions": pos,
+            "resindices": np.arange(len(pos)),
+            "__len__": lambda self: len(pos),
+        })()
+        universe = type("U", (), {})()
+        universe.dimensions = np.array([self.BOX, self.BOX, 100.0, 90, 90, 90],
+                                       dtype=np.float32)
+        return universe, p_atoms, n
+
+    def test_the_fit_survives_and_covers_every_phosphate(self):
+        universe, p_atoms, n = self._membrane(stacked=True)
+        out = ms.local_membrane_curvature(universe, p_atoms=p_atoms)
+        assert len(out["lower_H"]) == n + 1
+        assert np.isfinite(out["lower_H"]).all()
+        assert np.isfinite(out["lower_K"]).all()
+        assert np.isfinite(out["upper_H"]).all()
+
+    def test_the_stacked_pair_shares_one_surface_point(self):
+        universe, p_atoms, n = self._membrane(stacked=True)
+        out = ms.local_membrane_curvature(universe, p_atoms=p_atoms)
+        H = out["lower_H"]
+        pair = np.flatnonzero(np.all(out["lower_xy"] == out["lower_xy"][3],
+                                     axis=1))
+        assert len(pair) == 2
+        assert H[pair[0]] == pytest.approx(H[pair[1]], rel=1e-9)
+
+    def test_the_other_leaflet_is_untouched(self):
+        universe, p_atoms, _ = self._membrane(stacked=False)
+        clean = ms.local_membrane_curvature(universe, p_atoms=p_atoms)
+        universe, p_atoms, _ = self._membrane(stacked=True)
+        stacked = ms.local_membrane_curvature(universe, p_atoms=p_atoms)
+        np.testing.assert_allclose(stacked["upper_H"], clean["upper_H"])
+
+
+class TestFourierCurvature:
+    """A low-pass periodic fit, so H and K describe membrane shape, not lipids.
+
+    An undulation h = A cos(k x) has H = -A k^2 cos(k x) / (2 (1 + h_x^2)^1.5)
+    and K = 0 exactly, which pins the analytic derivatives. On a uniform grid
+    the Fourier modes are orthogonal, so a ripple shorter than the cutoff is
+    removed exactly rather than approximately.
+    """
+
+    BOX, AMP, N_GRID = 68.0, 2.0, 12
+
+    def _grid(self):
+        g = np.arange(self.N_GRID) * self.BOX / self.N_GRID
+        x, y = [a.ravel() for a in np.meshgrid(g, g)]
+        return np.column_stack([x, y])
+
+    def _exact_H(self, x):
+        k = 2 * np.pi / self.BOX
+        hx = -self.AMP * k * np.sin(k * x)
+        hxx = -self.AMP * k**2 * np.cos(k * x)
+        return hxx / (2 * (1 + hx**2) ** 1.5)
+
+    def _fit(self, xy, z, wavelength=20.0):
+        return ms._fourier_surface_curvature(xy, z, self.BOX, self.BOX,
+                                             wavelength)
+
+    def test_it_recovers_an_undulation_exactly(self):
+        xy = self._grid()
+        z = 20.0 + self.AMP * np.cos(2 * np.pi * xy[:, 0] / self.BOX)
+        H, K = self._fit(xy, z)
+        np.testing.assert_allclose(H, self._exact_H(xy[:, 0]), atol=1e-10)
+        np.testing.assert_allclose(K, 0.0, atol=1e-10)
+
+    def test_a_ripple_shorter_than_the_cutoff_is_filtered_out(self):
+        xy = self._grid()
+        z = (20.0 + self.AMP * np.cos(2 * np.pi * xy[:, 0] / self.BOX)
+             + 1.0 * np.cos(2 * np.pi * 4 * xy[:, 1] / self.BOX))  # 17 A
+        H, _ = self._fit(xy, z, wavelength=20.0)
+        np.testing.assert_allclose(H, self._exact_H(xy[:, 0]), atol=1e-10)
+
+    def test_positions_need_no_wrapping(self):
+        xy = self._grid()
+        z = 20.0 + self.AMP * np.cos(2 * np.pi * xy[:, 0] / self.BOX)
+        H, _ = self._fit(xy, z)
+        shifted = xy + [self.BOX, -2 * self.BOX]
+        H_shifted, _ = self._fit(shifted, z)
+        np.testing.assert_allclose(H_shifted, H, atol=1e-10)
+
+    def test_stacked_phosphates_are_just_two_samples(self):
+        xy = self._grid()
+        z = 20.0 + self.AMP * np.cos(2 * np.pi * xy[:, 0] / self.BOX)
+        xy2 = np.vstack([xy, xy[3]])
+        z2 = np.append(z, z[3] + 6.8)
+        H, K = self._fit(xy2, z2)
+        assert np.isfinite(H).all() and np.isfinite(K).all()
+        assert H[3] == pytest.approx(H[-1], rel=1e-9)
+
+    def test_too_few_phosphates_give_nan_and_say_why(self):
+        xy = self._grid()[:10]
+        with pytest.warns(UserWarning, match="cannot determine"):
+            H, K = self._fit(xy, np.full(10, 20.0))
+        assert np.isnan(H).all() and np.isnan(K).all()
+
+    def test_the_mode_count_matches_the_cutoff(self):
+        # |(m, n)| <= 68/20 = 3.4, half-plane: 3 + 7 + 5 + 3 = 18 modes.
+        assert len(ms._fourier_modes(68.0, 68.0, 20.0)) == 18
+        assert len(ms._fourier_modes(68.0, 68.0, 100.0)) == 0
+
+    def test_it_is_selected_through_local_membrane_curvature(self):
+        xy = self._grid()
+        z_lo = 20.0 + self.AMP * np.cos(2 * np.pi * xy[:, 0] / self.BOX)
+        pos = np.vstack([np.column_stack([xy, z_lo]),
+                         np.column_stack([xy, z_lo + 40.0])])
+        p_atoms = type("P", (), {
+            "positions": pos, "resindices": np.arange(len(pos)),
+            "__len__": lambda self: len(pos)})()
+        universe = type("U", (), {})()
+        universe.dimensions = np.array([self.BOX, self.BOX, 100.0, 90, 90, 90])
+        out = ms.local_membrane_curvature(universe, p_atoms=p_atoms,
+                                          method="fourier")
+        np.testing.assert_allclose(out["lower_H"], self._exact_H(xy[:, 0]),
+                                   atol=1e-10)
+        with pytest.raises(ValueError, match="curvature method"):
+            ms.local_membrane_curvature(universe, p_atoms=p_atoms,
+                                        method="spline")
+
+
+class TestSpeciesReadOffTheAllLipidSurface:
+    """-curvature-surface all: one surface per leaflet, sampled per species."""
+
+    def _mixed(self):
+        rng = np.random.default_rng(1)
+        n = 10
+        return {
+            "upper_H": rng.normal(size=n), "upper_K": rng.normal(size=n),
+            "upper_xy": rng.uniform(0, 60, (n, 2)),
+            "upper_resindices": np.arange(n),
+            "lower_H": rng.normal(size=n), "lower_K": rng.normal(size=n),
+            "lower_xy": rng.uniform(0, 60, (n, 2)),
+            "lower_resindices": np.arange(n, 2 * n),
+        }
+
+    def test_it_is_the_mixed_result_at_that_species_phosphates(self):
+        mixed = self._mixed()
+        popc = np.array([1, 4, 12, 17])
+        out = ms._curvature_on_species(mixed, popc)
+        np.testing.assert_array_equal(out["upper_resindices"], [1, 4])
+        np.testing.assert_array_equal(out["lower_resindices"], [12, 17])
+        np.testing.assert_array_equal(out["upper_H"], mixed["upper_H"][[1, 4]])
+        np.testing.assert_array_equal(out["lower_xy"],
+                                      mixed["lower_xy"][[2, 7]])
+        assert out["mean_H_upper"] == pytest.approx(
+            np.mean(np.abs(mixed["upper_H"][[1, 4]])))
+        assert out["mean_K_lower"] == pytest.approx(
+            np.mean(mixed["lower_K"][[2, 7]]))
+        assert out["radial_H_upper"] is None
+
+    def test_a_species_absent_from_a_leaflet_gives_nan_quietly(self):
+        mixed = self._mixed()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            out = ms._curvature_on_species(mixed, np.array([3]))
+        assert len(out["lower_H"]) == 0
+        assert np.isnan(out["mean_H_lower"]) and np.isnan(out["mean_K_lower"])
+
+    def test_the_frame_loop_fits_once_and_species_match_the_mixed_fit(
+            self, monkeypatch, synthetic_membrane):
+        pdb, xtc = synthetic_membrane
+        calls = []
+        real = ms.local_membrane_curvature
+        monkeypatch.setattr(ms, "local_membrane_curvature",
+                            lambda *a, **k: (calls.append(k["lipid_resnames"])
+                                             or real(*a, **k)))
+        out = _run(pdb, xtc, {"structural"}, curvature_method="fourier",
+                   curvature_wavelength=60.0, curvature_surface="all")
+        assert calls and all(len(c) == 2 for c in calls)   # mixed fits only
+        thick = out["structural"][0]
+        popc_w = thick["POPC_H_upper_wtot"].to_numpy()
+        assert popc_w.sum() > 0
+        assert np.isfinite(thick["POPC_H_upper_wsum"].to_numpy()).all()
+
+    def test_bad_settings_are_rejected_up_front(self, synthetic_membrane):
+        pdb, xtc = synthetic_membrane
+        for bad in ({"curvature_method": "spline"},
+                    {"curvature_surface": "popc"},
+                    {"curvature_wavelength": 0.0}):
+            with pytest.raises(ValueError, match="-curvature-"):
+                _run(pdb, xtc, {"structural"}, **bad)
