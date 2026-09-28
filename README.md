@@ -96,6 +96,18 @@ chiroflux pca -toml L/infretis.toml -cv-dir L/ML \
               -toml2 D/infretis.toml -cv-dir2 D/ML -label1 L -label2 D
 ```
 
+### Unweighted runs: the `-no-reweight` flag
+
+`shap-ml`, `shap-enantiomer`, `statistics`, `pca`, `prepare-deeptda-data(-ld)`
+and `train-deeptda` weight every path by its WHAM weight by default. Pass
+`-no-reweight` to give every path weight 1 instead, e.g. to check how much a
+ranking depends on the reweighting. In the DeepTDA commands the proximity ramp
+(`-lambda-low`/`-lambda-high`) still applies. `train-deeptda -no-reweight`
+drops the path weights from a dataset that was built weighted, and gives the
+same result as building it with `-no-reweight`. It reads the `w_prox` column
+for this, which datasets built before this flag existed don't have; for those
+it falls back to uniform weights and drops the ramp too.
+
 ### GPU SHAP: the `-shap-device` flag
 
 Explaining, not fitting, dominates `shap-ml` and `shap-enantiomer`. On a

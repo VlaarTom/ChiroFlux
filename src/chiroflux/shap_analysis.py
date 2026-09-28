@@ -7,7 +7,7 @@ For each TIS interface lambda_i (read from the infretis .toml file):
   3. For each model to compare (random forest / logistic regression /
      gradient boosting), fit a WHAM-weighted classifier CV -> label on all
      the paths that reach lambda_i, and explain it with SHAP on that same
-     data.
+     data. With -no-reweight every path gets weight 1 instead.
   4. Rank CVs by mean |SHAP| per model, and plot a per-interface comparison
      of the top CVs across models.
 
@@ -501,7 +501,8 @@ def _model_shap_kfold(
     y             : (N_samples,) binary labels (1 = reactive, 0 = non-reactive).
     feature_names : length N_features CV names.
     model_type    : one of MODEL_CHOICES ("rf", "gbm", "lgbm", "logreg").
-    sample_weight : optional (N_samples,) WHAM path weights.
+    sample_weight : optional (N_samples,) WHAM path weights, at any overall
+                    scale; rescaled internally to mean 1 over the finite rows.
     n_splits      : number of stratified CV folds.
     n_estimators  : trees for RF / GBM / LGBM (ignored for logreg).
     n_jobs        : CPU cores for RF / LGBM / logreg solver; -1 = all cores.
@@ -540,6 +541,17 @@ def _model_shap_kfold(
 
     X_f, y_f = X[finite], y[finite]
     sw = sample_weight[finite] if sample_weight is not None else np.ones(len(y_f))
+    # Rescale to mean 1. Only the relative weights carry information (WHAM
+    # weights sum to 1 over the whole path table, and to far less over the
+    # paths reaching a late interface), but several models read the absolute
+    # scale as an amount of data: LogisticRegression and SVC multiply their
+    # data term by it (C * sum(w_i * loss_i)), and LightGBM's
+    # min_child_weight=1e-3 is a sum of hessians. At weights ~1e-5 per path
+    # that over-regularises logreg/SVM and leaves LightGBM unable to split at
+    # all (a constant model, AUC 0.5). RF, GBM, AUC and permutation importance
+    # are scale-invariant, so they are unaffected.
+    if sw.mean() > 0:
+        sw = sw / sw.mean()
     groups_f = groups[finite] if groups is not None else None
 
     shap_values_f = np.full((len(y_f), X_f.shape[1]), np.nan)
@@ -828,6 +840,7 @@ def shap_ml(
 
     # ── Dataset construction ──────────────────────────────────────────────
     nskip: Annotated[int, typer.Option("-nskip", help="Skip the first nskip rows of infretis_data.txt", rich_help_panel=panels.DATASET)] = 1000,
+    reweight: Annotated[bool, typer.Option("-reweight/-no-reweight", help="Weight paths by their WHAM weight (training, AUC and permutation importance), unbiasing across the TIS ensembles; disable to give every path weight 1.", rich_help_panel=panels.DATASET)] = True,
 
     # ── CV selection ──────────────────────────────────────────────────────
     cv_cols: Annotated[Optional[str], typer.Option("-cv-cols", help="Comma-separated CV columns to use; default = all except -op-col", rich_help_panel=panels.SELECT)] = None,
@@ -913,6 +926,8 @@ def shap_ml(
 
     pnr, maxop, path_f, path_w = _load_path_table(data, nskip, M)
     path_weights = _compute_path_weights(maxop, path_f, path_w, interfaces)
+    if not reweight:
+        path_weights = np.ones_like(path_weights)
 
     # Split once: both the column discovery and the z-correction need the
     # substrings as a list, not as the raw comma-separated string.
@@ -943,7 +958,10 @@ def shap_ml(
         cv_array[is_plus], labels[is_plus], path_weights[is_plus]
     )
     N_cvs = len(cv_names)
-    print(f"{int(np.sum(is_plus))} plus-ensemble paths  |  {N_cvs} CVs  |  {M} interfaces.")
+    print(
+        f"{int(np.sum(is_plus))} plus-ensemble paths  |  {N_cvs} CVs  |  {M} interfaces  |  "
+        f"{'WHAM-weighted' if reweight else 'unweighted (all paths weight 1)'}."
+    )
 
     Path(plot_dir).mkdir(parents=True, exist_ok=True)
     min_per_class = max(n_splits, 2)

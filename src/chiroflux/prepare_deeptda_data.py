@@ -12,7 +12,8 @@ Two dataset flavours are supported:
 
     ``path_weight`` is the WHAM-derived statistical weight of the path (see
     ``_compute_path_weights`` in ``pathdata.py``), unbiasing across the
-    TIS ensembles.
+    TIS ensembles. With -no-reweight it is 1 for every path, leaving only
+    the proximity ramp.
 
     ``proximity_weight`` ramps from 0 (deep in stable state A, op <=
     lambda_low) to 1 (op >= lambda_high) via a smoothstep. Frames deep in A
@@ -139,6 +140,7 @@ def _load_sim_frames(
     force_proximity=False,
     encoding="utf-8",
     exclude=None,
+    reweight=True,
 ):
     """Load one TIS/RETIS simulation's plus-ensemble frames into flat arrays.
 
@@ -151,11 +153,15 @@ def _load_sim_frames(
 
     paths_filter : "all", "reactive", or "nonreactive" - which plus-ensemble
         paths to keep, by their reactive/non-reactive outcome.
+    reweight : if False, ``path_weight`` is 1 for every path instead of its
+        WHAM weight; the proximity ramp still applies.
 
     Returns
     -------
     X             : (N_frames, N_cvs) float32 CV matrix.
     w             : (N_frames,) float64 frame weight (path_weight * proximity).
+    prox_frame    : (N_frames,) float64 proximity factor alone, i.e. what
+                    ``w`` would be with every path weight set to 1.
     pnr_frame     : (N_frames,) int path number each frame belongs to.
     op_frame      : (N_frames,) float64 order-parameter value of each frame.
     reactive_frame: (N_frames,) float32, 1.0 = reactive path, 0.0 = non-reactive.
@@ -188,6 +194,8 @@ def _load_sim_frames(
     # contribute to the cross-ensemble normalisation) - compute before
     # dropping minus-ensemble paths below.
     path_weights = _compute_path_weights(maxop, path_f, path_w, interfaces)
+    if not reweight:
+        path_weights = np.ones_like(path_weights)
 
     labels_all, is_plus = _extract_path_metadata(cv_dir, pnr, encoding=encoding)
 
@@ -243,6 +251,7 @@ def _load_sim_frames(
     # precision for ML training and halves its memory footprint.
     X = np.empty((total_frames, len(cv_idxs)), dtype=np.float32)
     w = np.empty(total_frames, dtype=np.float64)
+    prox_frame = np.empty(total_frames, dtype=np.float64)
     pnr_frame = np.empty(total_frames, dtype=pnr.dtype)
     op_frame = np.empty(total_frames, dtype=np.float32)
     reactive_frame = np.empty(total_frames, dtype=np.float32)
@@ -266,12 +275,13 @@ def _load_sim_frames(
         sl = slice(offset, offset + n_kept)
         X[sl] = cvs
         w[sl] = frame_w
+        prox_frame[sl] = prox
         pnr_frame[sl] = p
         op_frame[sl] = op_vals
         reactive_frame[sl] = labels[row]
         offset += n_kept
 
-    return X, w, pnr_frame, op_frame, reactive_frame, cv_names
+    return X, w, prox_frame, pnr_frame, op_frame, reactive_frame, cv_names
 
 
 def prepare_deeptda_data(
@@ -287,6 +297,7 @@ def prepare_deeptda_data(
     lambda_high: Annotated[Optional[float], typer.Option("-lambda-high", help="Op value at/above which proximity weight is 1 (default: interfaces[1]).", rich_help_panel=panels.DATASET)] = None,
     stride: Annotated[int, typer.Option("-stride", help="Keep every Nth frame of each path.", rich_help_panel=panels.DATASET)] = 1,
     max_frames_per_path: Annotated[Optional[int], typer.Option("-max-frames-per-path", help="Cap frames kept per path (evenly subsampled); unset = no cap.", rich_help_panel=panels.DATASET)] = None,
+    reweight: Annotated[bool, typer.Option("-reweight/-no-reweight", help="Multiply each frame's proximity weight by its path's WHAM weight, unbiasing across the TIS ensembles; disable to give every path weight 1 (the proximity ramp still applies).", rich_help_panel=panels.DATASET)] = True,
 
     # ── CV selection ──────────────────────────────────────────────────────
     exclude: Annotated[str, typer.Option("-ex-cv", help="Comma-separated CV name(s) or substring(s) to exclude (e.g. a full column name or a shared prefix).", rich_help_panel=panels.SELECT)] = "",
@@ -301,7 +312,7 @@ def prepare_deeptda_data(
 
     exclude_list = [p.strip() for p in exclude.split(",") if p.strip()] or None
 
-    X, w, pnr_frame, op_frame, reactive_frame, cv_names = _load_sim_frames(
+    X, w, w_prox, pnr_frame, op_frame, reactive_frame, cv_names = _load_sim_frames(
         toml=toml,
         data=data,
         cv_dir=cv_dir,
@@ -315,6 +326,7 @@ def prepare_deeptda_data(
         lambda_high=lambda_high,
         force_proximity=True,
         exclude=exclude_list,
+        reweight=reweight,
     )
     y = reactive_frame
 
@@ -322,7 +334,8 @@ def prepare_deeptda_data(
     n_non = int(np.sum(y == 0.0))
     print(
         f"{len(np.unique(pnr_frame))} paths -> {len(y)} frames "
-        f"({n_react} reactive / {n_non} non-reactive), {len(cv_names)} CVs."
+        f"({n_react} reactive / {n_non} non-reactive), {len(cv_names)} CVs, "
+        f"{'WHAM-weighted' if reweight else 'unweighted (all paths weight 1)'}."
     )
 
     np.savez_compressed(
@@ -330,6 +343,8 @@ def prepare_deeptda_data(
         X=X,
         y=y,
         w=w,
+        w_prox=w_prox,
+        reweight=reweight,
         pnr=pnr_frame,
         op=op_frame,
         cv_names=np.array(cv_names),
@@ -355,6 +370,7 @@ def prepare_deeptda_data_ld(
     lambda_high: Annotated[Optional[float], typer.Option("-lambda-high", help="Op value at/above which proximity weight is 1; must be set together with -lambda-low.", rich_help_panel=panels.DATASET)] = None,
     stride: Annotated[int, typer.Option("-stride", help="Keep every Nth frame of each path.", rich_help_panel=panels.DATASET)] = 1,
     max_frames_per_path: Annotated[Optional[int], typer.Option("-max-frames-per-path", help="Cap frames kept per path (evenly subsampled); unset = no cap.", rich_help_panel=panels.DATASET)] = None,
+    reweight: Annotated[bool, typer.Option("-reweight/-no-reweight", help="Weight each frame by its path's WHAM weight (times any proximity ramp), unbiasing across the TIS ensembles; disable to give every path weight 1.", rich_help_panel=panels.DATASET)] = True,
 
     # ── CV selection ──────────────────────────────────────────────────────
     cv_cols: Annotated[Optional[str], typer.Option("-cv-cols", help="Comma-separated CV columns to use; default = all except -op-col", rich_help_panel=panels.SELECT)] = None,
@@ -380,7 +396,8 @@ def prepare_deeptda_data_ld(
     labeled 0 (L) / 1 (D) instead of by reactive/non-reactive outcome.
 
     Every frame of every kept plus-ensemble path from both simulations is
-    pooled, weighted by its (normalised) WHAM path weight. Feed the resulting
+    pooled, weighted by its (normalised) WHAM path weight, or by 1 with
+    -no-reweight. Feed the resulting
     .npz to ``train-deeptda`` to learn a 2-state DeepTDA CV that separates L
     from D; the printed/plotted correlations between that CV and each input
     CV (see ``train_deeptda``'s ``-class-names`` option) then show which
@@ -455,18 +472,20 @@ def prepare_deeptda_data_ld(
         )
 
     print("Loading L simulation …")
-    X_l, w_l, pnr_l, op_l, _, cv_names_l = _load_sim_frames(
+    X_l, w_l, prox_l, pnr_l, op_l, _, cv_names_l = _load_sim_frames(
         toml=toml_l_path, data=data_l_path, cv_dir=cv_dir_l_path, nskip=nskip,
         op_col=op_col, cv_cols=cv_cols_list, stride=stride,
         max_frames_per_path=max_frames_per_path, paths_filter=paths,
         lambda_low=lambda_low, lambda_high=lambda_high, exclude=exclude_list_l,
+        reweight=reweight,
     )
     print("Loading D simulation …")
-    X_d, w_d, pnr_d, op_d, _, cv_names_d = _load_sim_frames(
+    X_d, w_d, prox_d, pnr_d, op_d, _, cv_names_d = _load_sim_frames(
         toml=toml_d_path, data=data_d_path, cv_dir=cv_dir_d_path, nskip=nskip,
         op_col=op_col, cv_cols=cv_cols_list, stride=stride,
         max_frames_per_path=max_frames_per_path, paths_filter=paths,
         lambda_low=lambda_low, lambda_high=lambda_high, exclude=exclude_list_d,
+        reweight=reweight,
     )
 
     # ── Sign correction (e.g. chirality-odd dihedrals), before angle/z
@@ -493,14 +512,20 @@ def prepare_deeptda_data_ld(
     cv_names = cv_names_l
 
     # ── Normalise frame weights to mean 1 within each simulation ────────────
+    # The proximity-only weights get the same treatment, so that dropping the
+    # path weights later (train-deeptda -no-reweight) matches building the
+    # dataset with -no-reweight in the first place.
     w_l = _normalize_weights_mean1(w_l)
     w_d = _normalize_weights_mean1(w_d)
+    prox_l = _normalize_weights_mean1(prox_l)
+    prox_d = _normalize_weights_mean1(prox_d)
 
     X = np.vstack([X_l, X_d])
     y = np.concatenate(
         [np.zeros(len(X_l), dtype=np.float32), np.ones(len(X_d), dtype=np.float32)]
     )
     w = np.concatenate([w_l, w_d])
+    w_prox = np.concatenate([prox_l, prox_d])
     op_frame = np.concatenate([op_l, op_d])
     pnr_frame = np.concatenate([pnr_l, pnr_d])
     sim = np.concatenate(
@@ -509,7 +534,8 @@ def prepare_deeptda_data_ld(
 
     print(
         f"L: {len(X_l)} frames  |  D: {len(X_d)} frames  |  "
-        f"{len(cv_names)} CVs  |  paths='{paths}'"
+        f"{len(cv_names)} CVs  |  paths='{paths}'  |  "
+        f"{'WHAM-weighted' if reweight else 'unweighted (all paths weight 1)'}"
     )
 
     np.savez_compressed(
@@ -517,6 +543,8 @@ def prepare_deeptda_data_ld(
         X=X,
         y=y,
         w=w,
+        w_prox=w_prox,
+        reweight=reweight,
         pnr=pnr_frame,
         op=op_frame,
         sim=sim,

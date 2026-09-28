@@ -11,6 +11,11 @@ proportional to its own weights) into a balanced, effectively-unweighted set
 of ``n_per_class`` frames per class before building the DictDataset. This
 also fixes the class imbalance (e.g. reactive/non-reactive) that's typical of
 TIS path ensembles.
+
+With ``-no-reweight`` the WHAM path weights are dropped: the dataset's
+``w_prox`` column (the proximity ramp alone) is used instead of ``w``, so
+every path counts equally, exactly as if the dataset had been built with
+``prepare-deeptda-data(-ld) -no-reweight``.
 """
 
 import shutil
@@ -92,6 +97,7 @@ def train_deeptda(
     n_per_class: Annotated[int, typer.Option("-n-per-class", help="Importance-resampled frames per class.", rich_help_panel=panels.DATASET)] = 500000,
     val_frac: Annotated[float, typer.Option("-val-frac", help="Fraction of the resampled set held out for validation.", rich_help_panel=panels.DATASET)] = 0.2,
     class_names: Annotated[str, typer.Option("-class-names", help="Comma-separated names for class 0,1 used in prints and plot legends, e.g. 'non-reactive,reactive' (prepare-deeptda-data) or 'L,D' (prepare-deeptda-data-ld).", rich_help_panel=panels.DATASET)] = "non-reactive,reactive",
+    reweight: Annotated[bool, typer.Option("-reweight/-no-reweight", help="Use the dataset's WHAM-weighted frame weights for resampling and diagnostics; disable to give every path weight 1 (only the proximity ramp, if any, is kept). A dataset built with -no-reweight is unweighted either way.", rich_help_panel=panels.DATASET)] = True,
 
     # ── Model and training ────────────────────────────────────────────────
     n_cvs: Annotated[int, typer.Option("-n-cvs", help="Number of CVs to learn.", rich_help_panel=panels.MODEL)] = 1,
@@ -133,6 +139,25 @@ def train_deeptda(
     cv_names = list(raw["cv_names"])
     n_1, n_0 = int(np.sum(y == 1.0)), int(np.sum(y == 0.0))
     print(f"Loaded {len(y)} frames ({n_1} {name1} / {n_0} {name0}), {len(cv_names)} CVs.")
+
+    built_weighted = bool(raw["reweight"]) if "reweight" in raw.files else True
+    if not reweight:
+        if "w_prox" in raw.files:
+            w = raw["w_prox"]
+        else:
+            # Datasets from before w_prox was saved: the path and proximity
+            # factors can't be separated, so both have to go.
+            print(
+                "WARNING: dataset has no 'w_prox' column (built by an older "
+                "version); using uniform frame weights, which also drops any "
+                "proximity ramp. Rebuild it with -no-reweight to keep the ramp."
+            )
+            w = np.ones_like(w)
+    weighted = reweight and built_weighted
+    print(
+        "Frame weights: "
+        + ("WHAM-weighted." if weighted else "unweighted (all paths weight 1).")
+    )
 
     X_res, y_res = _weighted_resample(X, y, w, n_per_class, rng)
     print(f"Resampled to {len(y_res)} frames ({n_per_class} per class).")
@@ -220,7 +245,10 @@ def train_deeptda(
     plt.tight_layout()
     plt.savefig(hist_plot_path, dpi=150)
     plt.close("all")
-    print(f"Saved CV histogram (full, path-weighted dataset) to {hist_plot_path}")
+    print(
+        f"Saved CV histogram (full, {'path-weighted' if weighted else 'unweighted'} "
+        f"dataset) to {hist_plot_path}"
+    )
 
     # Quick sanity check: does the learned CV track the original order
     # parameter, on the true (path-weighted) ensemble rather than the

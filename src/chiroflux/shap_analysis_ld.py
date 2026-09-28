@@ -16,8 +16,11 @@ The classification label is 0 (L) or 1 (D).  This means:
 - StratifiedGroupKFold keeps all rows belonging to one path in the same fold,
   preventing leakage between train and test splits.
 
-WHAM weights are normalised to mean 1 within each simulation before pooling,
-so neither simulation dominates by its absolute weight scale.
+WHAM weights sum to 1 within each simulation, so both simulations carry the
+same total weight regardless of how many paths each has; they are pooled
+as-is (the model fit then rescales the pooled weights by one global factor,
+which keeps that balance). With -no-reweight every path gets weight 1
+instead, so each simulation counts in proportion to its number of paths.
 
 Filtering (-paths):
   all         — all plus-ensemble paths (default)
@@ -72,7 +75,7 @@ from .shap_analysis import (
 
 def _load_sim_data(
     toml_path, data_path, cv_dir, op_col, cv_cols_list, exclude_list, nskip,
-    subgrid=None,
+    subgrid=None, reweight=True,
 ):
     """Load one TIS simulation into the arrays needed for L/D analysis.
 
@@ -84,12 +87,14 @@ def _load_sim_data(
         between L and D so that the lambda feature has identical values for
         both simulations and cannot confound the classifier.
         WHAM weights are always computed with the simulation's own interfaces.
+    reweight : bool
+        If False, every path gets weight 1 instead of its WHAM weight.
 
     Returns
     -------
     interfaces   : (M,) float — simulation's own TIS interface values.
     pnr          : (N,) int  — path numbers.
-    path_weights : (N,) float — WHAM path weights.
+    path_weights : (N,) float — WHAM path weights (all 1 if not reweight).
     cv_array     : (N, N_cvs, M_grid) float — CV values at first crossing.
     cv_names     : list[str] — CV column names, length N_cvs.
     labels       : (N,) float — 1 = reactive, 0 = non-reactive, NaN = missing.
@@ -102,6 +107,8 @@ def _load_sim_data(
 
     pnr, maxop, path_f, path_w = _load_path_table(data_path, nskip, M)
     path_weights = _compute_path_weights(maxop, path_f, path_w, interfaces)
+    if not reweight:
+        path_weights = np.ones_like(path_weights)
 
     crossing_grid = subgrid if subgrid is not None else interfaces
     cv_array, cv_names, _ = _extract_cv_crossings(
@@ -127,15 +134,14 @@ def _pool_ld_dataset(
 
     Each (path, interface) pair that exists becomes one row.  λᵢ is appended
     as the last feature column so the model can capture interface-specific
-    L/D differences.  WHAM weights are normalised to mean 1 within each
-    simulation before concatenation.  Group IDs are unique per path so that
+    L/D differences. Group IDs are unique per path so that
     StratifiedGroupKFold keeps all rows from one path in the same fold.
 
     Returns
     -------
     X      : (N_rows, N_cvs + 1) — CV values at crossing + lambda.
     y      : (N_rows,) float     — 0 = L, 1 = D.
-    w      : (N_rows,) float     — normalised WHAM weights.
+    w      : (N_rows,) float     — WHAM path weight of each row's path.
     groups : (N_rows,) int       — unique per path for GroupKFold.
     """
     M = len(interfaces)
@@ -260,6 +266,7 @@ def shap_enantiomer(
     paths: Annotated[str, typer.Option("-paths", help="Which paths to include: 'all', 'reactive', 'nonreactive'", rich_help_panel=panels.DATASET)] = "all",
     nskip: Annotated[int, typer.Option("-nskip", help="Skip first nskip rows of each infretis_data.txt", rich_help_panel=panels.DATASET)] = 1000,
     force_interfaces: Annotated[bool, typer.Option("-force-interfaces", help="Allow different interface counts between L and D; both grids are resampled to the shorter length via linear interpolation before averaging into a common grid", rich_help_panel=panels.DATASET)] = False,
+    reweight: Annotated[bool, typer.Option("-reweight/-no-reweight", help="Weight each crossing by its path's WHAM weight (training, AUC and permutation importance), unbiasing across the TIS ensembles; disable to give every path weight 1.", rich_help_panel=panels.DATASET)] = True,
 
     # ── CV selection ──────────────────────────────────────────────────────
     cv_cols: Annotated[Optional[str], typer.Option("-cv-cols", help="Comma-separated CV columns to use; default = all except -op-col", rich_help_panel=panels.SELECT)] = None,
@@ -309,8 +316,8 @@ def shap_enantiomer(
     Cross-validation uses StratifiedGroupKFold: all crossing points of one path
     stay in the same fold, preventing data leakage between train and test.
 
-    WHAM weights are normalised to mean 1 within each simulation so neither
-    dominates the training by virtue of its absolute weight scale.
+    WHAM weights sum to 1 within each simulation, so neither dominates the
+    training by having more paths.
 
     High SHAP for a CV at a given λ means that CV value at that interface
     crossing is the clearest signal that the path belongs to L or D.
@@ -418,12 +425,12 @@ def shap_enantiomer(
     print("Loading L simulation …")
     _, pnr_l, pw_l, cv_arr_l, cv_names_l, labels_l, is_plus_l = _load_sim_data(
         toml_l_path, data_l_path, cv_dir_l_path, op_col, cv_cols_list, exclude_list_l, nskip,
-        subgrid=common_grid,
+        subgrid=common_grid, reweight=reweight,
     )
     print("Loading D simulation …")
     _, pnr_d, pw_d, cv_arr_d, cv_names_d, labels_d, is_plus_d = _load_sim_data(
         toml_d_path, data_d_path, cv_dir_d_path, op_col, cv_cols_list, exclude_list_d, nskip,
-        subgrid=common_grid,
+        subgrid=common_grid, reweight=reweight,
     )
 
     interfaces = common_grid
@@ -487,7 +494,8 @@ def shap_enantiomer(
     print(
         f"L: {int(np.sum(is_plus_l))} plus-ensemble paths  |  "
         f"D: {int(np.sum(is_plus_d))} plus-ensemble paths  |  "
-        f"{len(cv_names)} CVs + lambda  |  {M} interfaces  |  paths='{paths}'"
+        f"{len(cv_names)} CVs + lambda  |  {M} interfaces  |  paths='{paths}'  |  "
+        f"{'WHAM-weighted' if reweight else 'unweighted (all paths weight 1)'}"
     )
 
     # ── Build pooled dataset ───────────────────────────────────────────────

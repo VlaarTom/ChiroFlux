@@ -249,6 +249,7 @@ def statistics(
 
     # ── Dataset construction ──────────────────────────────────────────────
     nskip: Annotated[int, typer.Option("-nskip", help="Skip the first nskip rows of infretis_data.txt", rich_help_panel=panels.DATASET)] = 1000,
+    reweight: Annotated[bool, typer.Option("-reweight/-no-reweight", help="Weight paths by their WHAM weight in the effect sizes and histograms, unbiasing across the TIS ensembles; disable to give every path weight 1.", rich_help_panel=panels.DATASET)] = True,
 
     # ── CV selection ──────────────────────────────────────────────────────
     cv_cols: Annotated[Optional[str], typer.Option("-cv-cols", help="Comma-separated CV columns to use; default = all except -op-col", rich_help_panel=panels.SELECT)] = None,
@@ -265,6 +266,8 @@ def statistics(
     overw: Annotated[bool, typer.Option("-O", help="Force overwriting of existing files", rich_help_panel=panels.OUTPUT)] = False,
 ):
     """Per-interface CV importance from raw WHAM-weighted data (no ML model).
+
+    With -no-reweight every path gets weight 1 instead of its WHAM weight.
 
     Three weighted effect-size metrics separate reactive from non-reactive paths
     at each TIS interface without fitting any classifier:
@@ -288,6 +291,8 @@ def statistics(
 
     pnr, maxop, path_f, path_w = _load_path_table(data, nskip, M)
     path_weights = _compute_path_weights(maxop, path_f, path_w, interfaces)
+    if not reweight:
+        path_weights = np.ones_like(path_weights)
 
     cv_array, cv_names, _ = _extract_cv_crossings(
         cv_dir=cv_dir,
@@ -311,7 +316,8 @@ def statistics(
     N_cvs = len(cv_names)
     print(
         f"{int(np.sum(is_plus))} plus-ensemble paths  |  "
-        f"{N_cvs} CVs  |  {M} interfaces."
+        f"{N_cvs} CVs  |  {M} interfaces  |  "
+        f"{'WHAM-weighted' if reweight else 'unweighted (all paths weight 1)'}."
     )
 
     _check_overwrite(out, overw)
