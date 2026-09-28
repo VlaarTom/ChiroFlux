@@ -62,6 +62,7 @@ A partial profile yields a partial resistance, which *underestimates* 1/P and
 so overestimates P - the report says so rather than quietly returning a number.
 """
 
+import glob
 import os
 import re
 from dataclasses import dataclass
@@ -70,6 +71,7 @@ from typing import Annotated, Optional
 
 import matplotlib
 import numpy as np
+import tomli
 import typer
 
 matplotlib.use("Agg")
@@ -80,6 +82,39 @@ from .pathdata import _check_overwrite
 
 #: 1 A/ps in cm/s. P comes out in A/ps because z is in A and D in A^2/ps.
 ANGSTROM_PER_PS_TO_CM_PER_S = 1.0e4
+
+#: Molar gas constant in kJ/(mol K), so R*T is k_B T per mole in kJ/mol.
+GAS_CONSTANT_KJ = 8.314462618e-3
+
+
+def temperature_from_runs(run_dirs):
+    """The simulation temperature, from the runs' own infretis .toml files.
+
+    Every ``infretis*.toml`` in every run directory is read for its
+    ``[engine] temperature``. They must agree: stages at different
+    temperatures cannot be stitched into one profile, so a disagreement is an
+    error rather than something to average away. Returns None when no file
+    records one.
+    """
+    found = {}
+    for run_dir in run_dirs:
+        for path in sorted(glob.glob(os.path.join(run_dir, "infretis*.toml"))):
+            with open(path, "rb") as handle:
+                config = tomli.load(handle)
+            value = (config.get("engine") or {}).get("temperature")
+            if value is not None:
+                found.setdefault(float(value), []).append(path)
+    if not found:
+        return None
+    if len(found) > 1:
+        detail = "; ".join(f"{t} K in {len(p)} file(s), e.g. {p[0]}"
+                           for t, p in found.items())
+        raise ValueError(
+            f"The runs disagree on the temperature ({detail}). Stages at "
+            "different temperatures cannot be stitched into one profile; "
+            "pass -temperature to override if this is deliberate."
+        )
+    return next(iter(found))
 
 #: Interfaces are written to a couple of decimals, so exact equality is too
 #: strict when looking a mirrored stage up by its lA/lB.
@@ -647,6 +682,139 @@ def load_diffusion(path, column="D_z_fit", min_neff=0.0,
     return op[order], d[order], err[order]
 
 
+def _usable_err(err):
+    """True where a jackknife error can be used as an inverse-variance weight.
+
+    A slab fed by a single path comes back with err = 0 - one block, so no
+    spread to measure - and as a weight 1/0 would hand that one path the whole
+    answer. Those are exactly the slabs least worth trusting.
+    """
+    err = np.asarray(err, dtype=float)
+    return np.isfinite(err) & (err > 0)
+
+
+def combine_stage_diffusion(profiles, lam_as, symmetrize=False):
+    """One D(z) profile from the staged runs' own diffusion aggregates.
+
+    Unlike the free energy, D needs no referencing between stages: it is a
+    local property, and the start-binned MSD estimator is not biased by the
+    path-ensemble conditioning in the small-lag limit (conditioning changes a
+    diffusion's drift, not its diffusion coefficient). Where two stages
+    overlap and are both well sampled they do agree within error, so the
+    combination is a question of *which* stage to take a slab from, never of
+    rescaling one against another.
+
+    Each slab is taken from the stage whose [lA, next lA) contains it - the
+    first stage keeps everything below the second's lA (the bulk the profile
+    starts in), the last keeps everything from its own lA on. This is the
+    same split `combine_stage_histograms` uses for the free energy, and it is
+    chosen over averaging the overlaps for two reasons that both show up in
+    the data:
+
+    * a stage's D is biased upward in the slabs at its own lB. Paths end by
+      crossing lB, so windows starting there are enriched in outward steps;
+      averaging the overlap would blend that in. Ownership by lA only ever
+      uses a stage from its start, where its paths begin, never its end.
+    * outside its own window a stage sees only the few paths that dip past
+      an interface. Those slabs can have n_eff ~ 1 and a jackknife error of
+      exactly zero, which an inverse-variance average would treat as
+      infinitely precise.
+
+    With `symmetrize` - the same assumption the free energy already makes -
+    each slab is then pooled with its mirror image, inverse-variance weighted
+    where both errors are usable and otherwise from whichever side has one.
+    That also supplies D beyond the last stage's reach on the far side, which
+    would otherwise truncate the resistance integral there.
+
+    `profiles` is a list of (z, D, err) per stage in stage order, on the
+    order-parameter axis; `lam_as` their state-A interfaces in the same order.
+    Returns (z, D, err) sorted by z.
+    """
+    if len(profiles) != len(lam_as):
+        raise ValueError(f"{len(profiles)} diffusion profiles for "
+                         f"{len(lam_as)} stages.")
+
+    owned = {}
+    for k, (z, d, e) in enumerate(profiles):
+        lo = -np.inf if k == 0 else lam_as[k]
+        hi = np.inf if k == len(profiles) - 1 else lam_as[k + 1]
+        for zi, di, ei in zip(z, d, e):
+            if lo <= zi < hi:
+                owned[round(float(zi), 6)] = (float(di), float(ei))
+
+    if not symmetrize:
+        keys = sorted(owned)
+        return (np.array(keys), np.array([owned[k][0] for k in keys]),
+                np.array([owned[k][1] for k in keys]))
+
+    pooled = {}
+    for key in set(owned) | {round(-k, 6) for k in owned}:
+        sides = [owned[k] for k in (key, round(-key, 6)) if k in owned]
+        if key == round(-key, 6) and len(sides) == 2:
+            sides = sides[:1]          # z = 0 is its own mirror; count once
+        vals = np.array([s[0] for s in sides])
+        errs = np.array([s[1] for s in sides])
+        good = _usable_err(errs)
+        if good.any():
+            w = 1.0 / errs[good] ** 2
+            pooled[key] = (float(np.sum(w * vals[good]) / w.sum()),
+                           float(1.0 / np.sqrt(w.sum())))
+        else:
+            pooled[key] = (float(vals.mean()), np.nan)
+    keys = sorted(pooled)
+    return (np.array(keys), np.array([pooled[k][0] for k in keys]),
+            np.array([pooled[k][1] for k in keys]))
+
+
+def _stage_lam_a(run_dir, wham_subdir="wham"):
+    """A staged run's state-A interface, from its own WHAM header."""
+    header = read_wham_header(Path(run_dir) / wham_subdir
+                              / "histo_probability.txt")
+    if "lA" not in header:
+        raise ValueError(f"{run_dir}: no lA in the {wham_subdir}/"
+                         "histo_probability.txt header.")
+    return header["lA"]
+
+
+def resolve_diffusion_files(diffusion, run_dirs):
+    """The diffusion aggregate(s) to read: one per run, or one for all.
+
+    ``-diffusion`` accepts a list. With one entry per ``-runs`` directory the
+    files are paired with the runs in order. With a single entry, it is first
+    looked for *inside each run directory* - which is what the default,
+    ``plots/memb_op/diffusion_aggregate.csv``, is written for, since
+    membrane-spatial puts it there in every run - and only if that fails is
+    it taken as one already-combined profile relative to the working
+    directory.
+
+    Returns (files, per_run) - `per_run` says whether they map onto the runs.
+    """
+    entries = _split_list(diffusion)
+    if not entries:
+        raise ValueError("-diffusion is empty.")
+    if run_dirs and len(entries) == len(run_dirs) and len(entries) > 1:
+        missing = [f for f in entries if not os.path.isfile(f)]
+        if missing:
+            raise ValueError(f"-diffusion: not a file: {', '.join(missing)}")
+        return entries, True
+    if len(entries) > 1:
+        raise ValueError(
+            f"-diffusion lists {len(entries)} files but -runs has "
+            f"{len(run_dirs)} directories; give one per run, in the same "
+            "order, or a single file."
+        )
+    only = entries[0]
+    if run_dirs and not os.path.isabs(only):
+        inside = [os.path.join(d, only) for d in run_dirs]
+        if all(os.path.isfile(f) for f in inside):
+            return inside, True
+    if os.path.isfile(only):
+        return [only], False
+    where = (f" (also looked inside each of {', '.join(run_dirs)})"
+             if run_dirs and not os.path.isabs(only) else "")
+    raise ValueError(f"{only} is not a file{where}.")
+
+
 def _read_op_and_z(path, op_col, z_col):
     """(order parameter, lab-frame permeant z) from one per-path CV file."""
     with open(path) as handle:
@@ -744,10 +912,17 @@ def find_cv_files(cv_dir, max_files):
     return [files[i] for i in sorted(set(index.tolist()))]
 
 
-def resistance_profile(z, beta_g, d_z):
-    """exp(beta dG) / D at each z - the integrand, in ps/A^2."""
+def resistance_profile(z, dg, d_z, beta=1.0):
+    """R(z) = exp(beta dG) / D at each z - the integrand, in ps/A^2.
+
+    `beta` is 1/(k_B T) in the inverse of `dg`'s energy unit: pass dG in
+    kJ/mol with beta = 1/(R T), or dG already in units of k_B T with the
+    default beta = 1. The product is the same dimensionless number either
+    way, so P does not depend on which is used - only the energy axis the
+    free energy is reported on does.
+    """
     with np.errstate(over="ignore"):
-        return np.exp(beta_g) / d_z
+        return np.exp(beta * np.asarray(dg, dtype=float)) / d_z
 
 
 def permeability_from_resistance(z, resistance):
@@ -919,20 +1094,81 @@ def write_stitching(stitched, out_dir, label, overw):
     return steps
 
 
-def read_perm_data(file_path):
-    if os.path.isfile(file_path):
-        comments = []
-        with open(file_path, "r") as f:
-            for line in f:
-                if line.startswith("#"):
-                    comments.append(line.strip())
-        #... = {DeltaZ} [angstrom] ... obtains value between "=" and "["
-        delta_z = float(comments[1].split("=")[1].split("[")[0].strip())
+#: The column infretis writes the finished prefactor into, and what it means.
+#: `permeability_factor` is xi * DeltaZ / tau_ref already converted to cm/s,
+#: so multiplying it by the crossing probability gives P directly.
+_PERM_FACTOR_COLUMN = "permeability_factor (cm/s)"
 
-        perm_data = np.loadtxt(file_path, comments="#", dtype=float)
-        return delta_z, perm_data[-1,4], perm_data[-1,1] #delta_z, tau_ref, xi
-    else:
-        raise FileNotFoundError("{file_path} not found")
+
+def read_perm_data(file_path):
+    """(permeability prefactor in cm/s, xi, tau_ref in s) from a runav file.
+
+    The prefactor is read from the ``permeability_factor (cm/s)`` column
+    rather than rebuilt as ``xi * DeltaZ / tau_ref``. infretis has already
+    done that arithmetic and the unit conversion, and - decisively - DeltaZ
+    is not recorded anywhere in the file. An earlier version tried to parse it
+    out of the second comment line, which is the column header and contains no
+    ``=``, so the parse raised IndexError on every file this analysis writes.
+
+    Columns are located by name from the header line, because the sibling
+    formats differ: ``runav_permeability.txt`` reports tau_ref in phasepoints
+    and the prefactor in OP/phasepoints, and ``runav_permeability_lm1.txt``
+    has no prefactor column at all. Only the ``_units`` file is in seconds and
+    cm/s, and positional indexing would read the others as though they were.
+    """
+    if not os.path.isfile(file_path):
+        raise FileNotFoundError(f"{file_path} not found")
+
+    header = None
+    with open(file_path) as handle:
+        for line in handle:
+            if line.startswith("#"):
+                header = line
+            else:
+                break
+    if header is None:
+        raise ValueError(f"{file_path}: no header line to name the columns.")
+
+    names = [part.strip() for part in header.lstrip("#").split(",")]
+
+    def _column(name, unit_hint):
+        if name in names:
+            return names.index(name)
+        near = [n for n in names if n.split(" (")[0] == name.split(" (")[0]]
+        if near:
+            raise ValueError(
+                f"{file_path}: found '{near[0]}' where '{name}' was expected. "
+                f"The permeability is only in {unit_hint} in the "
+                "'runav_permeability_units.txt' file; the other runav variants "
+                "report phasepoints and OP units and cannot be mixed with a "
+                "resistance-model P in cm/s."
+            )
+        raise ValueError(
+            f"{file_path}: no '{name}' column. Header names: "
+            + ", ".join(names)
+        )
+
+    i_factor = _column(_PERM_FACTOR_COLUMN, "cm/s")
+    i_tau = _column("tau_ref (s)", "seconds")
+    i_xi = _column("xi", "-")
+
+    data = np.atleast_2d(np.loadtxt(file_path, comments="#", dtype=float))
+    if data.size == 0:
+        raise ValueError(f"{file_path}: no data rows.")
+    last = data[-1]
+
+    factor, tau_ref, xi = last[i_factor], last[i_tau], last[i_xi]
+    if not np.isfinite(factor):
+        # The running average is NaN until the stage has sampled DeltaZ at
+        # all; the internal stages of a staged run often never do.
+        raise ValueError(
+            f"{file_path}: the running permeability prefactor is not finite on "
+            f"its last row (xi = {xi:g}, tau_ref = {tau_ref:g} s). This stage "
+            "has not accumulated any phase points in DeltaZ, so it carries no "
+            "RETIS permeability. Point -runs at the stage that did, or drop "
+            "the comparison."
+        )
+    return float(factor), float(xi), float(tau_ref)
 
 
 def calculate_p_transit(P_A, P_M, P_B):
@@ -949,7 +1185,7 @@ def calculate_p_transit(P_A, P_M, P_B):
 
 
 
-def permeability_from_retis(delta_z, xi, tau_ref, P_transit):
+def permeability_from_retis(prefactor, P_transit):
     """
     Calculates the permeability from RETIS data with the formula:
     P_permeability = xi * Delta z / tau_ref [o^{-'}] * P_A (lambda_B|lambda_A)
@@ -957,13 +1193,17 @@ def permeability_from_retis(delta_z, xi, tau_ref, P_transit):
     An Ghysels, Sander Roet, Smaneh Davoudi and Titus S. van Erp,
     Exact non-Markovian permeability from rare event simulations
     Phys. Rev. Research, 3, 2021, 033068
+
+    `prefactor` is the xi * Delta z / tau_ref part, taken from the runav file's
+    own ``permeability_factor (cm/s)`` column: infretis has already applied
+    Delta z and the Angstrom-to-cm conversion there, and Delta z itself is not
+    written anywhere in the file, so it cannot be reapplied here.
     """
-    Angstrom_to_cm = 1e-8
-    prefactor = ((xi * delta_z) / (tau_ref)) * Angstrom_to_cm #  runav_tau_ref is in the _units file already in seconds
-    return prefactor * P_transit # in cm/s
+    return prefactor * P_transit  # in cm/s
 
 
-def _plot(z, beta_g, d_z, resistance, out_path, label, overw):
+def _plot(z, dg, d_z, resistance, out_path, label, overw,
+          energy_unit="kJ/mol"):
     _check_overwrite(out_path, overw)
     cumulative = np.concatenate(([0.0], np.cumsum(
         0.5 * (resistance[1:] + resistance[:-1]) * np.diff(z))))
@@ -971,8 +1211,10 @@ def _plot(z, beta_g, d_z, resistance, out_path, label, overw):
     fig, axes = plt.subplots(4, 1, figsize=(8, 10), sharex=True,
                              gridspec_kw={"height_ratios": [1, 1, 1.3, 1]})
 
-    axes[0].plot(z, beta_g, color="#2a7fbf", lw=2)
-    axes[0].set_ylabel(r"$\beta\,\Delta G$", fontsize=12)
+    unit_tex = {"kJ/mol": r"kJ$\,$mol$^{-1}$",
+                "kT": r"$k_\mathrm{B}T$"}.get(energy_unit, energy_unit)
+    axes[0].plot(z, dg, color="#2a7fbf", lw=2)
+    axes[0].set_ylabel(rf"$\Delta G$  ({unit_tex})", fontsize=12)
     axes[0].axhline(0.0, color="grey", lw=0.8, ls=":")
 
     axes[1].plot(z, d_z, color="#d1701f", lw=2)
@@ -981,7 +1223,8 @@ def _plot(z, beta_g, d_z, resistance, out_path, label, overw):
 
     axes[2].plot(z, resistance, color="#7b3294", lw=2)
     axes[2].set_yscale("log")
-    axes[2].set_ylabel(r"$e^{\beta\Delta G}/D$  (ps $\mathrm{\AA^{-2}}$)", fontsize=12)
+    axes[2].set_ylabel(r"$R = e^{\beta\Delta G}/D$  (ps $\mathrm{\AA^{-2}}$)",
+                       fontsize=12)
     peak = z[int(np.argmax(resistance))]
     axes[2].axvline(peak, color="grey", lw=0.8, ls="--")
     axes[2].annotate(f"peak at {peak:.2f}", (peak, np.nanmax(resistance)),
@@ -1007,10 +1250,11 @@ def _plot(z, beta_g, d_z, resistance, out_path, label, overw):
 def permeation_process(
     runs: Annotated[Optional[str], typer.Option("-runs", help="Run directories of the staged simulations, comma-separated, in order along the permeation coordinate (e.g. infinit_entry,infinit_internal,infinit_escape). Each must hold the standard wham/ folder; the histograms, crossing probabilities and path counts are read from it", rich_help_panel=panels.INPUT)] = None,
     free_energy: Annotated[str, typer.Option("-fe", help="Ready-made free-energy profile(s) instead of -runs, comma- or space-separated, in order along the permeation coordinate. Needs -pcross to reference the stages", rich_help_panel=panels.INPUT)] = "wham/histo_free_energy.txt",
-    diffusion: Annotated[str, typer.Option("-diffusion", help="diffusion_aggregate.csv from membrane-spatial", rich_help_panel=panels.INPUT)] = "membrane_plots/diffusion_aggregate.csv",
+    diffusion: Annotated[str, typer.Option("-diffusion", help="diffusion_aggregate.csv from membrane-spatial. With -runs, a single relative path is looked for inside EACH run directory (the default is where membrane-spatial writes it), or give one file per run, comma-separated, in -runs order. Each stage's D is then used over its own [lA, next lA) window: D is local and needs no rescaling between stages, and this avoids each stage's biased slabs at its own lB. A single file that is not found per run is taken as one already-combined profile", rich_help_panel=panels.INPUT)] = "plots/memb_op/diffusion_aggregate.csv",
     cv_dir: Annotated[Optional[str], typer.Option("-cv-dir", help="Folder of per-path CV .txt files used to locate the midplane with -midplane auto; defaults to ML/ inside the first -runs directory", rich_help_panel=panels.INPUT)] = None,
     label: Annotated[str, typer.Option("-label", help="Name for this run in the plot title and the summary", rich_help_panel=panels.INPUT)] = "permeant",
     d_column: Annotated[str, typer.Option("-d-column", help="Which diffusion column to use. D_z_fit is the lag-scan extrapolation MSD = c + 2D*tau and is what you want. D_z, D_z_lag2, D_z_lag3 ... are the raw per-lag MSD/2tau values behind it, useful for seeing how far from diffusive a region is, but each is biased high wherever the motion has not yet reached its plateau at that lag", rich_help_panel=panels.DATASET)] = "D_z_fit",
+    d_constant: Annotated[Optional[float], typer.Option("-d-constant", help="Use a constant diffusion coefficient instead of the profile in -diffusion. This is a check on how much the D(z) variation matters, and is not physically meaningful. D in A^2/ps (conversion: 1e-4)", rich_help_panel=panels.DATASET)] = None,
     midplane: Annotated[str, typer.Option("-midplane", help="Offset in Angstrom subtracted from the diffusion slab centres. membrane-spatial already bins on membrane_z - permeant_z, the order-parameter coordinate itself, so the default 0 is right for its diffusion_aggregate.csv. Use a number, or 'auto' to measure it from the CV trajectories, only for a profile that is genuinely on lab-frame z", rich_help_panel=panels.DATASET)] = "0",
     flip: Annotated[bool, typer.Option("-flip/-no-flip", help="Negate the diffusion axis, op = -(slab_center - midplane). Off by default because membrane-spatial's axis already runs the same way as the order parameter. Ignored when -midplane auto measures the sign", rich_help_panel=panels.DATASET)] = False,
     op_col: Annotated[str, typer.Option("-op-col", help="Order-parameter column in the CV files, for -midplane auto", rich_help_panel=panels.DATASET)] = "OP_Lamb",
@@ -1024,7 +1268,8 @@ def permeation_process(
     pcross: Annotated[Optional[str], typer.Option("-pcross", help="-fe route only: total crossing probability of each junction, comma-separated, one per stage boundary (N stages need N-1). Last row of each earlier stage's wham/Pcross.txt. Required to reference conditional staged profiles to each other", rich_help_panel=panels.DATASET)] = None,
     overlap: Annotated[Optional[float], typer.Option("-overlap", help="-fe route only: Angstroms of each junction used to match staged profiles; unset uses the whole shared range", rich_help_panel=panels.DATASET)] = None,
     min_neff: Annotated[float, typer.Option("-min-neff", help="Drop diffusion bins with fewer effective paths than this", rich_help_panel=panels.DATASET)] = 0.0,
-    bulk: Annotated[Optional[str], typer.Option("-bulk", help="'lo,hi' window treated as bulk water, where beta*dG is set to zero. Unset uses the profile's own minimum", rich_help_panel=panels.DATASET)] = None,
+    bulk: Annotated[Optional[str], typer.Option("-bulk", help="'lo,hi' window treated as bulk water, where dG is set to zero (its mean over the window). Unset uses the entry end of the profile - the first bin, in bulk water on the side the permeant enters from - which is the reference the solubility-diffusion model is written for. Give a window instead if that one bin is noisy", rich_help_panel=panels.DATASET)] = None,
+    temperature: Annotated[Optional[float], typer.Option("-temperature", help="Temperature in K, for beta = 1/(R T) in R(z) = exp(beta dG)/D and for reporting dG in kJ/mol. Unset reads [engine] temperature from the -runs directories' infretis*.toml; if none records one, dG is reported in units of k_B T instead. It cannot change P: the WHAM free energy is already dG/(k_B T), and the T that converts it to kJ/mol cancels in the exponent", rich_help_panel=panels.DATASET)] = None,
     n_bootstrap: Annotated[int, typer.Option("-n-bootstrap", help="Resamples of D within its reported error, for a confidence interval on P; 0 disables", rich_help_panel=panels.MODEL)] = 2000,
     seed: Annotated[int, typer.Option("-seed", help="Random seed for the bootstrap", rich_help_panel=panels.MODEL)] = 42,
     out_dir: Annotated[str, typer.Option("-out-dir", help="Directory for the profile table and plot", rich_help_panel=panels.OUTPUT)] = "permeation",
@@ -1069,16 +1314,35 @@ def permeation_process(
     resistance comes from three bins, P is a statement about those three bins
     and about D there, which is where D is least well determined.
     """
-    if not os.path.isfile(diffusion):
-        raise ValueError(f"{diffusion} is not a file.")
+    # `is None`, not falsiness: -d-constant 0 is a value the user supplied, and
+    # treating it as "unset" would silently fall back to reading the profile.
+    # It is also not a usable D, so it is rejected explicitly below.
+    # Resolved before any stitching so a missing file fails fast. With -runs,
+    # each run's own aggregate is used (see resolve_diffusion_files).
+    diffusion_files, diffusion_per_run = [], False
+    if d_constant is None:
+        diffusion_files, diffusion_per_run = resolve_diffusion_files(
+            diffusion, _split_list(runs))
+    elif not d_constant > 0.0:
+        raise ValueError(
+            f"-d-constant {d_constant!r} must be positive: it is a divisor in "
+            "R(z) = exp(beta dG)/D, so zero or negative gives an infinite or "
+            "negative resistance."
+        )
+
+    _d_source = (f"a constant {d_constant:g} A^2/ps"
+                 if d_constant is not None else d_column)
 
     run_dirs = _split_list(runs)
     n_stages = len(run_dirs)
+    # Filled either by stitch_runs (-runs) or from -pcross (-fe); the RETIS
+    # comparison below checks its length rather than assuming three.
+    pcrosses = []
     if run_dirs:
         for directory in run_dirs:
             if not os.path.isdir(directory):
                 raise ValueError(f"{directory} is not a directory.")
-        print(f"{n_stages} staged run(s); D from {d_column}")
+        print(f"{n_stages} staged run(s); D from {_d_source}")
         stitched, pcrosses = stitch_runs(
             run_dirs, wham_subdir=wham_subdir, pcross_col=pcross_col,
             pcross_back=([float(v) for v in _split_list(pcross_back)]
@@ -1096,7 +1360,7 @@ def permeation_process(
             if not os.path.isfile(path):
                 raise ValueError(f"{path} is not a file.")
 
-        print(f"{n_stages} free-energy profile(s); D from {d_column}")
+        print(f"{n_stages} free-energy profile(s); D from {_d_source}")
         profiles = [load_free_energy(p) for p in profile_paths]
         for path, (z_p, _) in zip(profile_paths, profiles):
             print(f"  {os.path.basename(path):<28} "
@@ -1128,98 +1392,189 @@ def permeation_process(
         print(f"  beta*dG referenced to the mean over [{lo}, {hi}] "
               f"({int(window.sum())} bins)")
     else:
-        reference = float(np.min(beta_g))
-        print(f"  beta*dG referenced to its own minimum at z = "
-              f"{z[int(np.argmin(beta_g))]:.3f}")
+        # The solubility-diffusion model wants dG relative to the reservoir
+        # the permeant comes from (Marrink & Berendsen: "relative to bulk
+        # water"), which is where the entry stage starts - the low-z end,
+        # since the stages run in ascending order along the coordinate.
+        # Referencing to the profile's minimum instead puts zero wherever the
+        # deepest well happens to be - here an interfacial well at the stage
+        # junction - and understates every barrier by that well's depth.
+        start = int(np.argmin(z))
+        reference = float(beta_g[start])
+        print(f"  dG referenced to the entry end of the profile, "
+              f"z = {z[start]:.3f} (set to 0)")
     beta_g = beta_g - reference
 
-    if str(midplane).strip().lower() in ("auto", ""):
-        folder = cv_dir or (os.path.join(run_dirs[0], "ML") if run_dirs else None)
-        if not folder or not os.path.isdir(folder):
-            raise ValueError(
-                f"-midplane auto needs the CV trajectories: {folder or '-cv-dir'} "
-                "is not a directory. Pass -cv-dir, or give -midplane as a number."
-            )
-        midplane_value, detected_flip, info = midplane_from_cv_files(
-            find_cv_files(folder, max_cv_files), op_col=op_col, z_col=z_col,
-        )
-        print(f"  midplane measured from {info['n_files']} CV file(s), "
-              f"{info['n_frames']} frames: {midplane_value:.3f} A "
-              f"(+/- {info['spread']:.3f} between frames; '{z_col}' read as "
-              f"{info['unit']})")
-        if detected_flip != flip:
-            print(f"  [warn] the fit says the order parameter runs "
-                  f"{'opposite to' if detected_flip else 'with'} lab z "
-                  f"(d{z_col}/d{op_col} = {info['slope']:+.4g}), which "
-                  f"contradicts -{'' if flip else 'no-'}flip. Using the "
-                  "measured sign.")
-        flip = detected_flip
+    # A constant D needs nothing from the diffusion profile: not the file, not
+    # its axis convention (-midplane / -flip), and not its z range. Everything
+    # below is therefore skipped rather than run and discarded - in particular
+    # the `inside` mask, which would otherwise truncate the free energy to
+    # whatever the CSV happened to span, for a D that is defined everywhere.
+    if d_constant is not None:
+        d_z = np.full_like(z, float(d_constant))
+        # NaN, not a large number: _bootstrap_permeability treats any finite
+        # positive error as usable, so a placeholder like 1e6 would not skip
+        # the bootstrap - it would run it with a relative error of ~1e8 and
+        # print a meaningless interval. NaN makes `usable` empty, which is the
+        # documented "no usable D uncertainties" path.
+        e_z = np.full_like(z, np.nan)
+        print(f"  D held constant at {d_constant:g} A^2/ps "
+              f"({d_constant * 1.0e-4:.3g} cm^2/s); "
+              f"-diffusion, -d-column, -midplane and -flip are unused")
+
     else:
-        try:
-            midplane_value = float(midplane)
-        except ValueError:
+        if str(midplane).strip().lower() in ("auto", ""):
+            folder = cv_dir or (os.path.join(run_dirs[0], "ML_mda")
+                                if run_dirs else None)
+            if not folder or not os.path.isdir(folder):
+                raise ValueError(
+                    f"-midplane auto needs the CV trajectories: "
+                    f"{folder or '-cv-dir'} is not a directory. Pass -cv-dir, "
+                    "or give -midplane as a number."
+                )
+            midplane_value, detected_flip, info = midplane_from_cv_files(
+                find_cv_files(folder, max_cv_files), op_col=op_col, z_col=z_col,
+            )
+            print(f"  midplane measured from {info['n_files']} CV file(s), "
+                  f"{info['n_frames']} frames: {midplane_value:.3f} A "
+                  f"(+/- {info['spread']:.3f} between frames; '{z_col}' read as "
+                  f"{info['unit']})")
+            if detected_flip != flip:
+                print(f"  [warn] the fit says the order parameter runs "
+                      f"{'opposite to' if detected_flip else 'with'} lab z "
+                      f"(d{z_col}/d{op_col} = {info['slope']:+.4g}), which "
+                      f"contradicts -{'' if flip else 'no-'}flip. Using the "
+                      "measured sign.")
+            flip = detected_flip
+        else:
+            try:
+                midplane_value = float(midplane)
+            except ValueError:
+                raise ValueError(
+                    f"-midplane {midplane!r} is neither a number nor 'auto'."
+                ) from None
+
+        stage_profiles = [
+            load_diffusion(path, column=d_column, min_neff=min_neff,
+                           midplane=midplane_value, flip=flip)
+            for path in diffusion_files
+        ]
+        if diffusion_per_run and len(stage_profiles) > 1:
+            lam_as = [_stage_lam_a(d, wham_subdir) for d in run_dirs]
+            last = len(lam_as) - 1
+            for k, (path, (zs, _, _)) in enumerate(zip(diffusion_files,
+                                                       stage_profiles)):
+                lo = "" if k == 0 else f"{lam_as[k]} <= "
+                hi = "" if k == last else f" < {lam_as[k + 1]}"
+                window = f"{lo}z{hi}" if (lo or hi) else "all z"
+                print(f"  D from {path}: {zs.size} slabs "
+                      f"[{zs.min():.1f}, {zs.max():.1f}], used for {window}")
+            z_d, d_vals, d_err = combine_stage_diffusion(
+                stage_profiles, lam_as, symmetrize=symmetrize)
+            print("  staged D combined by region (each slab from the stage "
+                  "whose [lA, next lA) holds it)"
+                  + (", then pooled with its mirror image" if symmetrize
+                     else ""))
+        else:
+            z_d, d_vals, d_err = stage_profiles[0]
+            print(f"  D from {diffusion_files[0]}")
+        if z_d.size < 2:
+            raise ValueError("Fewer than two usable diffusion bins.")
+        print(f"  D bins on the order-parameter axis: "
+              f"[{z_d.min():.3f}, {z_d.max():.3f}]  {z_d.size} slabs")
+
+        inside = (z >= z_d.min()) & (z <= z_d.max())
+        if not inside.any():
             raise ValueError(
-                f"-midplane {midplane!r} is neither a number nor 'auto'."
-            ) from None
+                f"The free-energy profile ([{z.min():.3f}, {z.max():.3f}]) and "
+                f"the diffusion profile ([{z_d.min():.3f}, {z_d.max():.3f}]) do "
+                "not overlap. Check -midplane and -flip: membrane-spatial's own "
+                "diffusion_aggregate.csv is already on the order-parameter axis "
+                "and wants the defaults (-midplane 0 -no-flip)."
+            )
+        if not inside.all():
+            print(f"  [warn] {int((~inside).sum())} free-energy bins fall "
+                  "outside the diffusion profile and are dropped; the integral "
+                  "is truncated there.")
+        z, beta_g = z[inside], beta_g[inside]
 
-    z_d, d_vals, d_err = load_diffusion(
-        diffusion, column=d_column, min_neff=min_neff,
-        midplane=midplane_value, flip=flip,
-    )
-    if z_d.size < 2:
-        raise ValueError("Fewer than two usable diffusion bins.")
-    print(f"  D bins on the order-parameter axis: "
-          f"[{z_d.min():.3f}, {z_d.max():.3f}]  {z_d.size} slabs")
+        d_z = np.interp(z, z_d, d_vals)
+        e_z = np.interp(z, z_d, d_err)
 
-    inside = (z >= z_d.min()) & (z <= z_d.max())
-    if not inside.any():
-        raise ValueError(
-            f"The free-energy profile ([{z.min():.3f}, {z.max():.3f}]) and the "
-            f"diffusion profile ([{z_d.min():.3f}, {z_d.max():.3f}]) do not "
-            "overlap. Check -midplane and -flip: membrane-spatial's own "
-            "diffusion_aggregate.csv is already on the order-parameter axis "
-            "and wants the defaults (-midplane 0 -no-flip)."
-        )
-    if not inside.all():
-        print(f"  [warn] {int((~inside).sum())} free-energy bins fall outside "
-              "the diffusion profile and are dropped; the integral is "
-              "truncated there.")
-    z, beta_g = z[inside], beta_g[inside]
+    # beta_g is what WHAM gives, dG/(k_B T). Carry dG in energy units from
+    # here on and put beta where it belongs, in the integrand. The product
+    # beta * dG is the same number, so P is untouched by the choice of T.
+    if temperature is None and run_dirs:
+        temperature = temperature_from_runs(run_dirs)
+    if temperature is not None:
+        if not temperature > 0.0:
+            raise ValueError(f"-temperature {temperature!r} must be positive.")
+        kt = GAS_CONSTANT_KJ * float(temperature)       # kJ/mol
+        energy_unit = "kJ/mol"
+        print(f"  T = {temperature:g} K, k_B T = {kt:.4f} kJ/mol; "
+              f"dG reported in kJ/mol, beta = 1/(R T) in the integrand")
+    else:
+        kt = 1.0
+        energy_unit = "kT"
+        print("  no temperature given or recorded in the runs; dG reported "
+              "in units of k_B T (pass -temperature for kJ/mol)")
+    beta = 1.0 / kt
+    dg = beta_g * kt
 
-    d_z = np.interp(z, z_d, d_vals)
-    e_z = np.interp(z, z_d, d_err)
-
-    resistance = resistance_profile(z, beta_g, d_z)
+    resistance = resistance_profile(z, dg, d_z, beta=beta)
     permeability_resistance, inv_p = permeability_from_resistance(z, resistance)
 
+    # None unless -runs supplied the crossing probabilities and transit data
+    # it is built from; the report below tests this rather than `run_dirs` so
+    # the two cannot drift apart.
+    permeability_retis = None
     if run_dirs:
         entry_dir =  run_dirs[0]
         runav_perm_file_path = os.path.join(entry_dir, wham_subdir, "runav_permeability_units.txt")
         if not os.path.isfile(runav_perm_file_path):
             raise FileNotFoundError(f"Permeability data file not found.\n{runav_perm_file_path}")
-        delta_z, tau_ref, xi = read_perm_data(runav_perm_file_path)
+        # calculate_p_transit is the three-state (A, membrane, B) Markov
+        # expression, so it needs exactly three stages; with fewer, indexing
+        # pcrosses[2] raised IndexError instead of saying what was missing.
+        if len(pcrosses) < 3:
+            raise ValueError(
+                f"The RETIS permeability needs three stages (A, membrane, B) "
+                f"to form P_transit, but {len(pcrosses)} crossing "
+                "probabilit(ies) were read. Pass all three run directories to "
+                "-runs, or use -fe to report the resistance model alone."
+            )
+        prefactor, xi, tau_ref = read_perm_data(runav_perm_file_path)
         P_transit = calculate_p_transit(pcrosses[0], pcrosses[1], pcrosses[2])
-        permeability_retis = permeability_from_retis(delta_z, xi, tau_ref, P_transit)
+        permeability_retis = permeability_from_retis(prefactor, P_transit)
+        print(f"  RETIS prefactor {prefactor:.6g} cm/s "
+              f"(xi = {xi:.4g}, tau_ref = {tau_ref:.4g} s) from "
+              f"{os.path.basename(runav_perm_file_path)}")
 
     Path(out_dir).mkdir(parents=True, exist_ok=True)
-    cumulative = _plot(z, beta_g, d_z, resistance,
+    cumulative = _plot(z, dg, d_z, resistance,
                        os.path.join(out_dir, "permeation_profile.png"),
-                       label, overw)
+                       label, overw, energy_unit=energy_unit)
 
     table = os.path.join(out_dir, "permeation_profile.csv")
     _check_overwrite(table, overw)
     fraction = 100.0 * cumulative / cumulative[-1] if cumulative[-1] > 0 else cumulative
     np.savetxt(
-        table, np.column_stack([z, beta_g, d_z, resistance, fraction]),
+        table, np.column_stack([z, dg, d_z, resistance, fraction]),
         delimiter=",", fmt="%.6e",
-        header="z,beta_dG,D_A2_per_ps,resistance_ps_per_A2,cumulative_percent",
+        header=(f"z,dG_{'kJ_per_mol' if energy_unit == 'kJ/mol' else 'kT'},"
+                "D_A2_per_ps,resistance_ps_per_A2,cumulative_percent"),
         comments="",
     )
     print(f"  Table -> {table}")
 
     print(f"\n1/P = {inv_p:.6g} ps/A")
     print(f"P_resistance   = {permeability_resistance:.6g} cm/s   ({label})")
-    print(f"P_retis        = {permeability_retis:.6g} cm/s")
+    # Only -runs carries the crossing probabilities and the transit data the
+    # RETIS estimate is built from; with a ready-made -fe profile there is
+    # nothing to compare against, and printing it unconditionally raised
+    # UnboundLocalError after the resistance result had already been reported.
+    if permeability_retis is not None:
+        print(f"P_retis        = {permeability_retis:.6g} cm/s")
 
     draws = _bootstrap_permeability(z, beta_g, d_z, e_z, n_bootstrap,
                                     np.random.default_rng(seed))
@@ -1235,7 +1590,10 @@ def permeation_process(
     half = int(np.searchsorted(fraction, 50.0))
     span = z[min(half + 1, z.size - 1)] - z[max(half - 1, 0)]
     print(f"\nResistance peaks at z = {z[peak]:.3f} "
-          f"(beta*dG = {beta_g[peak]:.3f}, D = {d_z[peak]:.4g} A^2/ps)")
+          f"(dG = {dg[peak]:.3f} {energy_unit}, D = {d_z[peak]:.4g} A^2/ps)")
+    top = int(np.argmax(dg))
+    print(f"Free-energy barrier   = {dg[top]:.3f} {energy_unit} at "
+          f"z = {z[top]:.3f}, above the entry end")
     print(f"Half the total resistance accumulates within ~{abs(span):.2f} A "
           f"of z = {z[half]:.3f}")
     if n_stages == 1:

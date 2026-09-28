@@ -12,12 +12,16 @@ acquires a step at the junction and the exponential turns the step into a
 factor in P.
 """
 
+import os
+
 import numpy as np
 import pytest
 
 from chiroflux.permeation_process import (
     ANGSTROM_PER_PS_TO_CM_PER_S,
+    GAS_CONSTANT_KJ,
     Stage,
+    combine_stage_diffusion,
     combine_stage_histograms,
     find_cv_files,
     free_energy_from_counts,
@@ -30,11 +34,13 @@ from chiroflux.permeation_process import (
     mirror_back_pcross,
     permeability_from_resistance,
     read_wham_header,
+    resolve_diffusion_files,
     resistance_profile,
     stage_factors,
     stage_shifts_from_pcross,
     stitch_runs,
     stitch_stage_histograms,
+    temperature_from_runs,
     write_stitching,
 )
 
@@ -769,3 +775,240 @@ class TestWriteStitching:
         z_a, g_a = free_energy_from_counts(st.centers, st.total)
         z_b, g_b = free_energy_from_runs(runs, symmetrize=True)
         assert z_a == pytest.approx(z_b) and g_a == pytest.approx(g_b)
+
+
+class TestStagedDiffusion:
+    """One D(z) from the staged runs' own diffusion aggregates.
+
+    D is local, so the stages are never rescaled against each other - the
+    only question is which stage each slab comes from. The answer is the same
+    split the free energy uses: every stage from its own lA up to the next
+    stage's lA, the first keeping everything below and the last everything
+    above.
+    """
+
+    LAM_AS = [-25.0, -13.5, 13.5]
+
+    @staticmethod
+    def _profile(z, d, err):
+        return (np.asarray(z, float), np.asarray(d, float),
+                np.asarray(err, float))
+
+    def _three_stages(self):
+        # entry reaches its own lB with an upward-biased slab there; internal
+        # likewise at +13.5; escape has a single-path slab far below its lA
+        # with a jackknife error of exactly zero.
+        entry = self._profile([-30.5, -14.5, -13.5],
+                              [0.20, 0.116, 0.184], [0.01, 0.001, 0.009])
+        internal = self._profile([-14.5, -13.5, 0.5, 12.5, 13.5],
+                                 [0.078, 0.103, 0.228, 0.123, 0.152],
+                                 [0.008, 0.007, 0.003, 0.004, 0.008])
+        escape = self._profile([4.5, 13.5, 20.5],
+                               [1.77, 0.112, 0.15], [0.0, 0.007, 0.01])
+        return [entry, internal, escape]
+
+    def _at(self, result, z):
+        zs, d, e = result
+        i = np.where(np.isclose(zs, z))[0]
+        assert i.size, f"no slab at z = {z}"
+        return d[i[0]], e[i[0]]
+
+    def test_each_slab_comes_from_the_stage_that_owns_it(self):
+        out = combine_stage_diffusion(self._three_stages(), self.LAM_AS)
+        assert self._at(out, -30.5)[0] == pytest.approx(0.20)   # entry bulk
+        assert self._at(out, -14.5)[0] == pytest.approx(0.116)  # entry, not internal
+        assert self._at(out, 0.5)[0] == pytest.approx(0.228)    # internal
+        assert self._at(out, 20.5)[0] == pytest.approx(0.15)    # escape
+
+    def test_a_stage_is_never_used_at_its_own_far_interface(self):
+        """Paths end by crossing lB, so those slabs read high."""
+        out = combine_stage_diffusion(self._three_stages(), self.LAM_AS)
+        assert self._at(out, -13.5)[0] == pytest.approx(0.103)  # not entry's 0.184
+        assert self._at(out, 13.5)[0] == pytest.approx(0.112)   # not internal's 0.152
+
+    def test_a_single_path_slab_outside_its_window_is_not_used(self):
+        """err = 0 there would be an infinite inverse-variance weight."""
+        out = combine_stage_diffusion(self._three_stages(), self.LAM_AS)
+        zs = out[0]
+        assert not np.any(np.isclose(zs, 4.5)), "escape's stray slab leaked in"
+
+    def test_stages_are_not_rescaled(self):
+        """Unlike the histograms: D is local, so values pass through as-is."""
+        stages = self._three_stages()
+        out = combine_stage_diffusion(stages, self.LAM_AS)
+        taken = dict(zip(np.round(out[0], 6), out[1]))
+        for z, d, _ in stages:
+            for zi, di in zip(z, d):
+                if round(zi, 6) in taken and taken[round(zi, 6)] == di:
+                    break
+            else:
+                pytest.fail("a stage contributed nothing, or was rescaled")
+
+    def test_the_mirror_fills_the_far_side_and_pools_the_near(self):
+        out = combine_stage_diffusion(self._three_stages(), self.LAM_AS,
+                                      symmetrize=True)
+        # far-side bulk exists only as the mirror of the entry stage
+        assert self._at(out, 30.5)[0] == pytest.approx(0.20)
+        # the two junctions are each other's mirror: inverse-variance pooled
+        d, e = self._at(out, 13.5)
+        w1, w2 = 1 / 0.007 ** 2, 1 / 0.007 ** 2
+        assert d == pytest.approx((w1 * 0.103 + w2 * 0.112) / (w1 + w2))
+        assert e == pytest.approx(1 / np.sqrt(w1 + w2))
+        assert self._at(out, -13.5)[0] == pytest.approx(d)
+
+    def test_a_zero_error_never_dominates_the_pool(self):
+        good = self._profile([-5.5], [0.2], [0.01])
+        stray = self._profile([5.5], [9.9], [0.0])
+        out = combine_stage_diffusion([good, stray], [-25.0, 0.0],
+                                      symmetrize=True)
+        assert self._at(out, 5.5)[0] == pytest.approx(0.2)
+
+    def test_a_single_profile_passes_through(self):
+        one = self._profile([-1.5, 0.5], [0.1, 0.2], [0.01, 0.02])
+        z, d, e = combine_stage_diffusion([one], [-25.0])
+        assert d == pytest.approx([0.1, 0.2])
+
+    def test_mismatched_lengths_are_refused(self):
+        with pytest.raises(ValueError):
+            combine_stage_diffusion(self._three_stages(), [-25.0, 0.0])
+
+
+class TestResolvingDiffusionFiles:
+    def _runs(self, tmp_path, n=3, with_file=True):
+        runs = []
+        for k in range(n):
+            d = tmp_path / f"run{k}"
+            (d / "plots" / "memb_op").mkdir(parents=True)
+            if with_file:
+                (d / "plots" / "memb_op" / "diffusion_aggregate.csv").write_text("x")
+            runs.append(str(d))
+        return runs
+
+    def test_the_default_is_found_inside_every_run(self, tmp_path):
+        runs = self._runs(tmp_path)
+        files, per_run = resolve_diffusion_files(
+            "plots/memb_op/diffusion_aggregate.csv", runs)
+        assert per_run and len(files) == 3
+        assert all(f.startswith(r) for f, r in zip(files, runs))
+
+    def test_one_file_per_run_is_paired_in_order(self, tmp_path):
+        runs = self._runs(tmp_path)
+        given = [os.path.join(r, "plots/memb_op/diffusion_aggregate.csv")
+                 for r in runs]
+        files, per_run = resolve_diffusion_files(",".join(given), runs)
+        assert per_run and files == given
+
+    def test_a_single_combined_file_still_works(self, tmp_path, monkeypatch):
+        runs = self._runs(tmp_path, with_file=False)
+        combined = tmp_path / "combined.csv"
+        combined.write_text("x")
+        files, per_run = resolve_diffusion_files(str(combined), runs)
+        assert files == [str(combined)] and not per_run
+
+    def test_a_count_mismatch_is_refused(self, tmp_path):
+        runs = self._runs(tmp_path)
+        with pytest.raises(ValueError, match="one per run"):
+            resolve_diffusion_files(f"{runs[0]}/a.csv,{runs[1]}/b.csv", runs)
+
+    def test_nothing_found_says_where_it_looked(self, tmp_path):
+        runs = self._runs(tmp_path, with_file=False)
+        with pytest.raises(ValueError, match="inside each"):
+            resolve_diffusion_files("plots/memb_op/diffusion_aggregate.csv", runs)
+
+
+class TestBetaAndTheReference:
+    """dG is carried in energy units; beta = 1/(R T) lives in the integrand.
+
+    WHAM gives dG/(k_B T), so multiplying by R T for reporting and dividing
+    by it again inside exp() is an identity - P must not depend on T at all.
+    """
+
+    def test_beta_times_dg_reproduces_the_dimensionless_integrand(self):
+        z = np.linspace(-10, 10, 41)
+        beta_g = 6.0 * np.exp(-(z / 4.0) ** 2)
+        d = np.full_like(z, 0.2)
+        for t in (250.0, 310.15, 400.0):
+            kt = GAS_CONSTANT_KJ * t
+            np.testing.assert_allclose(
+                resistance_profile(z, beta_g * kt, d, beta=1.0 / kt),
+                resistance_profile(z, beta_g, d),
+                rtol=1e-12,
+            )
+
+    def test_the_default_beta_keeps_old_callers_working(self):
+        z = np.array([0.0, 1.0])
+        g = np.array([0.0, np.log(10.0)])
+        np.testing.assert_allclose(resistance_profile(z, g, np.ones(2)),
+                                   [1.0, 10.0])
+
+    def _cli(self, tmp_path, extra):
+        from typer.testing import CliRunner
+        from chiroflux.cli import app
+        z = np.arange(-20.0, 20.25, 0.25)
+        # entry end sits 1.5 kT ABOVE an interfacial well, as in real data
+        g = 1.5 - 1.5 * np.exp(-((z + 12) / 2.0) ** 2) \
+            - 1.5 * np.exp(-((z - 12) / 2.0) ** 2) + 6.0 * np.exp(-(z / 3.0) ** 2)
+        fe = tmp_path / "fe.txt"
+        np.savetxt(fe, np.column_stack([z, g]))
+        out = tmp_path / "out"
+        result = CliRunner().invoke(app, [
+            "permeation", "-fe", str(fe), "-d-constant", "0.2",
+            "-out-dir", str(out), "-O", *extra])
+        assert result.exit_code == 0, result.output
+        table = np.genfromtxt(out / "permeation_profile.csv", delimiter=",",
+                              names=True)
+        return result.output, table, z, g
+
+    def test_dg_is_zero_at_the_entry_end_not_at_the_minimum(self, tmp_path):
+        _, table, z, g = self._cli(tmp_path, ["-temperature", "310.15"])
+        col = table.dtype.names[1]
+        assert col == "dG_kJ_per_mol"
+        assert table[col][0] == pytest.approx(0.0, abs=1e-9)
+        # the interfacial well is now BELOW zero, as it is relative to water
+        assert table[col].min() < -0.5 * GAS_CONSTANT_KJ * 310.15
+
+    def test_the_energy_axis_is_in_kj_per_mol(self, tmp_path):
+        _, table, z, g = self._cli(tmp_path, ["-temperature", "310.15"])
+        kt = GAS_CONSTANT_KJ * 310.15
+        np.testing.assert_allclose(table["dG_kJ_per_mol"],
+                                   (g - g[0]) * kt, rtol=1e-6, atol=1e-9)
+
+    def test_temperature_cannot_change_p(self, tmp_path):
+        ps = []
+        for t in ("250", "310.15", "400"):
+            (tmp_path / t).mkdir()
+            output, *_ = self._cli(tmp_path / t, ["-temperature", t])
+            line = next(l for l in output.splitlines() if "P_resistance" in l)
+            ps.append(float(line.split("=")[1].split("cm/s")[0]))
+        assert ps[0] == pytest.approx(ps[1], rel=1e-9)
+        assert ps[1] == pytest.approx(ps[2], rel=1e-9)
+
+    def test_without_a_temperature_it_reports_in_kt(self, tmp_path):
+        output, table, z, g = self._cli(tmp_path, [])
+        assert table.dtype.names[1] == "dG_kT"
+        np.testing.assert_allclose(table["dG_kT"], g - g[0], atol=1e-6)
+
+
+class TestTemperatureFromRuns:
+    def _run(self, tmp_path, name, temps):
+        d = tmp_path / name
+        d.mkdir()
+        for i, t in enumerate(temps):
+            (d / f"infretis_{i}.toml").write_text(
+                f"[simulation]\nsteps = 1\n[engine]\ntemperature = {t}\n")
+        return str(d)
+
+    def test_it_reads_the_engine_temperature(self, tmp_path):
+        runs = [self._run(tmp_path, "a", [310.15, 310.15]),
+                self._run(tmp_path, "b", [310.15])]
+        assert temperature_from_runs(runs) == pytest.approx(310.15)
+
+    def test_disagreeing_runs_are_refused(self, tmp_path):
+        runs = [self._run(tmp_path, "a", [310.15]),
+                self._run(tmp_path, "b", [300.0])]
+        with pytest.raises(ValueError, match="disagree"):
+            temperature_from_runs(runs)
+
+    def test_no_toml_means_none(self, tmp_path):
+        (tmp_path / "empty").mkdir()
+        assert temperature_from_runs([str(tmp_path / "empty")]) is None
