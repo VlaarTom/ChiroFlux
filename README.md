@@ -91,20 +91,27 @@ chiroflux train-deeptda -npz deeptda_ld_dataset.npz -class-names L,D
 ```
 
 `chiral-extract` and `chiral-compare` work from the raw trajectories rather than
-the CV files. Extract once per stage into one cache per enantiomer, then compare
-all stages in chain order (entry, internal, escape), so that the stages combine
-into one equilibrium ensemble:
+the CV files. Extract once per stage, then compare all stages in chain order
+(entry, internal, escape), so that the stages combine into one equilibrium
+ensemble:
 
 ```bash
 for stage in infinit_entry infinit_internal infinit_escape; do
   chiroflux chiral-extract -tpr L/$stage/gromacs_input/topol.tpr -permeant pro_yne \
-                           -load-dir L/$stage/load -cache L/chiral_cache -workers 32
+                           -load-dir L/$stage/load -workers 32
 done   # same for D
 chiroflux chiral-compare -runs-l L/infinit_entry,L/infinit_internal,L/infinit_escape \
                          -runs-d D/infinit_entry,D/infinit_internal,D/infinit_escape \
-                         -data-l post/infretis_data.txt -data-d post/infretis_data.txt \
-                         -cache-l L/chiral_cache -cache-d D/chiral_cache
+                         -data-l post/infretis_data.txt -data-d post/infretis_data.txt
 ```
+
+Each stage's cache goes to `chiral_cache/` inside its run directory, where
+`chiral-compare` finds it, so the stages can be extracted separately and from
+anywhere. The cache is kept small in inodes: `-paths-per-file` paths (default
+500) share one `.npz`, and the trajectories are read without MDAnalysis's usual
+hidden `.xtc_offsets.npz`/`.lock` files. A rerun only extracts paths that are
+not cached yet or whose `traj.txt` changed. `chiral-compare` reads only the cache
+and each path's `traj.txt`/`order.txt`, not the trajectories.
 
 `pca` instead takes the second simulation as a parallel set of options
 (`-toml2`, `-data2`, `-cv-dir2`) and fits one joint basis over both:

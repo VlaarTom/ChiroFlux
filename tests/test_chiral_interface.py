@@ -2,6 +2,9 @@
 and statistics helpers, and the CLI's argument handling. None of these need a
 trajectory."""
 
+import glob
+import os
+
 import numpy as np
 import pytest
 import typer
@@ -183,3 +186,233 @@ def test_compare_refuses_to_overwrite_without_O(tmp_path):
     with pytest.raises(ValueError, match="already exists"):
         cia.chiral_compare(xtc_l="none*.xtc", xtc_d="none*.xtc", cache_l="x",
                            cache_d="y", out_dir=str(tmp_path))
+
+
+# ── Extraction and the chunked cache, end to end ───────────────────────────
+#
+# A tiny but complete system: the neutral-proline permeant, four lipids with
+# every atom the analysis selects (two per leaflet), and two waters, written
+# as a .gro topology plus real .xtc segments in an infretis-style load/ folder.
+
+_PRO = [("CA", (0, 0, 0)), ("N", (1, 0, 0)), ("C", (-1, 0.5, 0.3)),
+        ("CB", (0, -1, -0.8)), ("HA", (0, 0.3, 1)), ("H01", (2, 0, 0)),
+        ("O01", (-2, 1, 0.5)), ("H02", (-2.5, 1.5, 0.5)), ("O", (-1, -0.2, 1.3))]
+# (name, dx, dy, depth into the membrane)
+_LIPID = [("P", 0, 0, 0), ("O13", 1, 0, 0), ("O14", -1, 0, 0), ("O12", 0, -1, 0.8),
+          ("O11", 0, 0, 1), ("C1", 0.5, 0, 2.5), ("C2", 0, 0, 3.5), ("C3", -0.5, 0, 4.5),
+          ("O21", 0, 1, 3.8), ("O22", 0, 2, 4.5), ("O31", -1, 0, 5.5), ("O32", -1.5, 0, 6)]
+_LIPIDS = [(20, 21, 1), (30, 30, 1), (20, 20, -1), (10, 10, -1)]   # x, y, leaflet
+
+
+def _system():
+    """(atom names, residue names per residue, atom -> residue, reference positions)."""
+    names, resnames, resix, pos = [], [], [], []
+    resnames.append("ORP")
+    for n, d in _PRO:
+        names.append(n)
+        resix.append(0)
+        pos.append(np.add((20, 20, 60), d))
+    for x, y, s in _LIPIDS:
+        resnames.append("DOPC")
+        z0 = 58 if s > 0 else 22
+        for n, dx, dy, depth in _LIPID:
+            names.append(n)
+            resix.append(len(resnames) - 1)
+            pos.append((x + dx, y + dy, z0 - s * depth))
+    for p in ((5, 5, 70), (35, 35, 10)):
+        resnames.append("TIP3")
+        names.append("OH2")
+        resix.append(len(resnames) - 1)
+        pos.append(p)
+    return names, resnames, np.array(resix), np.array(pos, dtype=float)
+
+
+BOX = [40.0, 40.0, 80.0, 90.0, 90.0, 90.0]
+
+
+def _universe(names, resnames, resix):
+    import MDAnalysis as mda
+
+    u = mda.Universe.empty(len(names), n_residues=len(resnames), atom_resindex=resix,
+                           trajectory=True)
+    u.add_TopologyAttr("name", names)
+    u.add_TopologyAttr("resname", resnames)
+    u.add_TopologyAttr("resid", np.arange(1, len(resnames) + 1))
+    return u
+
+
+def _write_xtc(u, path, frames, t0):
+    import MDAnalysis as mda
+
+    with mda.Writer(str(path), u.atoms.n_atoms) as w:
+        for k, p in enumerate(frames):
+            u.atoms.positions = p
+            u.dimensions = BOX
+            u.trajectory.ts.time = t0 + 2.0 * k
+            w.write(u)
+
+
+@pytest.fixture
+def run(tmp_path):
+    """A run directory with a .gro topology and three paths of two segments
+    each; each segment has frames the path does not use."""
+    names, resnames, resix, ref = _system()
+    u = _universe(names, resnames, resix)
+    u.atoms.positions = ref
+    u.dimensions = BOX
+    gro = tmp_path / "topol.gro"
+    u.atoms.write(str(gro))
+    rng = np.random.default_rng(1)
+    run_dir = tmp_path / "infinit_entry"
+    for pn in (3, 7, 12):
+        acc = run_dir / "load" / str(pn) / "accepted"
+        acc.mkdir(parents=True)
+        seg = {n: [ref + rng.normal(0, 0.3, ref.shape) for _ in range(5)]
+               for n in ("a.xtc", "b.xtc")}
+        for n, frames in seg.items():
+            _write_xtc(u, acc / n, frames, 0.0)
+        # forward through a.xtc 0-2, then a reversed segment b.xtc 3..1
+        plan = [("a.xtc", 0), ("a.xtc", 1), ("a.xtc", 2),
+                ("b.xtc", 3), ("b.xtc", 2), ("b.xtc", 1)]
+        (acc.parent / "traj.txt").write_text(
+            "# step file index vel\n"
+            + "".join(f"{k} {f} {i} 1\n" for k, (f, i) in enumerate(plan)))
+        (acc.parent / "order.txt").write_text(
+            "# time op\n" + "".join(f"{k} {op}\n" for k, op in
+                                    enumerate([-0.5, 0.5, 1.5, 2.5, 1.0, -0.2])))
+    return str(gro), run_dir
+
+
+def _direct_features(gro, unit):
+    """Reference: the same features through MDAnalysis's standard reader."""
+    import MDAnalysis as mda
+
+    T = cia._Topology(gro, cia.PERMEANTS["pro"])
+    rows = []
+    for fname, idx in unit.plan:
+        u = mda.Universe(gro, fname)
+        ts = u.trajectory[idx]
+        rows.append(cia._frame_features(T, ts.positions, ts.dimensions))
+    return np.array([r[0] for r in rows]), np.array([r[1] for r in rows])
+
+
+def _hidden_files(run_dir):
+    return [p for p in run_dir.rglob(".*") if p.is_file()]
+
+
+def test_extract_matches_the_standard_reader_and_leaves_no_files(run):
+    gro, run_dir = run
+    units = cia.units_from_load_dir(run_dir / "load", cache_dir=str(run_dir / "cache"))
+    errors = cia.extract_many(units, gro, "pro", str(run_dir / "cache"), "infinit_entry",
+                              workers=2, per_file=500)
+    assert errors == []
+    assert _hidden_files(run_dir) == []       # no .xtc_offsets.npz / .lock
+    chunks = sorted((run_dir / "cache").iterdir())
+    assert [c.name for c in chunks] == ["infinit_entry_0000000-0000499.chiral.npz"]
+
+    for u in units:
+        arr, dt, stereo = cia.load_unit(u)
+        f_ref, i_ref = _direct_features(gro, u)
+        assert arr["F"].shape == (6, len(cia.FLOAT_COLS))
+        np.testing.assert_allclose(arr["F"], f_ref, atol=1e-4)
+        np.testing.assert_array_equal(arr["I"], i_ref)
+        assert dt == pytest.approx(2.0)
+        assert stereo["lipids_R"] + stereo["lipids_S"] == len(_LIPIDS)
+
+
+def test_rerun_skips_cached_paths_and_redoes_changed_ones(run, capsys):
+    gro, run_dir = run
+    cache = str(run_dir / "cache")
+
+    def extract():
+        units = cia.units_from_load_dir(run_dir / "load", cache_dir=cache)
+        assert cia.extract_many(units, gro, "pro", cache, "entry", workers=1,
+                                per_file=2) == []
+        return units
+
+    extract()
+    names = sorted(p.name for p in (run_dir / "cache").iterdir())
+    assert names == ["entry_0000002-0000003.chiral.npz",
+                     "entry_0000006-0000007.chiral.npz",
+                     "entry_0000012-0000013.chiral.npz"]
+    capsys.readouterr()
+
+    extract()
+    assert "3 units cached already, 0 to extract" in capsys.readouterr().out
+
+    # path 7 is rewritten: drop its last phase point
+    p7 = run_dir / "load" / "7"
+    for f in ("traj.txt", "order.txt"):
+        lines = (p7 / f).read_text().splitlines(keepends=True)
+        (p7 / f).write_text("".join(lines[:-1]))
+    units = extract()
+    assert "2 units cached already, 1 to extract" in capsys.readouterr().out
+    lengths = {u.uid: len(cia.load_unit(u)[0]["F"]) for u in units}
+    assert lengths == {3: 6, 7: 5, 12: 6}
+
+
+def test_a_different_permeant_invalidates_the_cache(run, capsys):
+    gro, run_dir = run
+    cache = str(run_dir / "cache")
+    units = cia.units_from_load_dir(run_dir / "load", cache_dir=cache)
+    cia.extract_many(units, gro, "pro", cache, "entry", workers=1)
+    capsys.readouterr()
+    # pro_yne's atom names do not exist in this topology: none of the paths
+    # counts as cached, and the bad permeant fails with its own message
+    with pytest.raises(ValueError, match="ORP atom"):
+        cia.extract_many(units, gro, "pro_yne", cache, "entry", workers=1)
+    assert "0 units cached already, 3 to extract" in capsys.readouterr().out
+
+
+def test_reduce_units_from_the_cache(run):
+    gro, run_dir = run
+    cache = str(run_dir / "cache")
+    units = cia.units_from_load_dir(run_dir / "load", cache_dir=cache)
+    cia.extract_many(units, gro, "pro", cache, "entry", workers=1)
+    for u in units:
+        u.trim = (0.0, -1.0)
+    missing = cia.Unit(99, [], order_file="x", signature="nope", cache_dir=cache)
+    kept, reds, meta = cia.reduce_units(units + [missing], cia.Grid(), workers=2)
+    assert [u.uid for u in kept] == [3, 7, 12]
+    ok = meta[meta["uid"] != 99]
+    assert ok["phase_points"].tolist() == [6, 6, 6]
+    assert ok["deleted_first"].all() and ok["deleted_last"].all()   # -0.5 and -0.2
+    assert sum(r["N_raw"].sum() for r in reds) == 3 * 4
+    assert "not cached" in meta.loc[meta["uid"] == 99, "error"].item()
+
+
+def test_plain_md_units_are_cached_whole(run):
+    gro, run_dir = run
+    cache = str(run_dir / "md_cache")
+    xtcs = sorted(str(p) for p in (run_dir / "load" / "3" / "accepted").glob("*.xtc"))
+    units = cia.units_from_files(xtcs, cache)
+    assert cia.extract_many(units, gro, "pro", cache, "md", workers=1) == []
+    kept, reds, meta = cia.reduce_units(units, cia.Grid(), workers=1)
+    assert meta["phase_points"].tolist() == [5, 5]
+
+
+def test_cli_extract_defaults_to_a_cache_inside_the_run_directory(run):
+    gro, run_dir = run
+    cia.chiral_extract(tpr=gro, permeant="pro", load_dir=str(run_dir / "load"), workers=1)
+    assert [p.name for p in (run_dir / cia.DEFAULT_CACHE).iterdir()] == \
+        ["infinit_entry_0000000-0000499.chiral.npz"]
+
+
+def test_compare_runs_end_to_end_without_the_trajectories(run, tmp_path):
+    gro, run_dir = run
+    pattern = str(run_dir / "load" / "*" / "accepted" / "*.xtc")
+    cache = str(tmp_path / "md_cache")
+    cia.chiral_extract(tpr=gro, permeant="pro", xtc=pattern, cache=cache, workers=1)
+    # plain-MD units are keyed on the xtc's size and mtime, so the files stay;
+    # but nothing may read them any more: make them unreadable
+    for x in glob.glob(pattern):
+        os.chmod(x, 0)
+    try:
+        cia.chiral_compare(xtc_l=pattern, xtc_d=pattern, cache_l=cache, cache_d=cache,
+                           temperature=310.0, n_boot=10, block=2, workers=1,
+                           out_dir=str(tmp_path / "out"))
+    finally:
+        for x in glob.glob(pattern):
+            os.chmod(x, 0o644)
+    written = {p.name for p in (tmp_path / "out").iterdir()}
+    assert written == set(cia.COMPARE_OUTPUTS) - {f"stages_{s}.csv" for s in "LD"}

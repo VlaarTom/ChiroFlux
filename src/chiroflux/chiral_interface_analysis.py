@@ -50,9 +50,13 @@ x -> -x and you have L+S.)
 
 Pipeline
 --------
-  extract  Read each xtc exactly once (MDAnalysis, parallel, cached per file),
-           one row of features per frame -> <cache>/<hash>.npz
-  compare  Assemble every path from its cached frames and trim it.  Weight
+  extract  Per path (in parallel), read its xtc files once with MDAnalysis's
+           low-level reader, which writes no offset files next to them, and
+           compute one row of features for every phase point traj.txt lists,
+           in path order.  Paths are stored -paths-per-file to an .npz in
+           RUN_DIR/chiral_cache, each tagged with the SHA-1 of its traj.txt.
+  compare  Take every path's frames from the cache (no trajectory is read),
+           check them against order.txt and trim them.  Weight
            each frame so that the entry/internal/escape stages combine into
            ONE equilibrium ensemble; a single TIS run only gives a density
            conditional on its own start.  Reduce to |OP|-resolved
@@ -74,16 +78,20 @@ Usage
     for stage in infinit_entry infinit_internal infinit_escape; do
       chiroflux chiral-extract \\
           -tpr L_PRO_yne_neutral/$stage/gromacs_input/topol.tpr \\
-          -permeant pro_yne -load-dir L_PRO_yne_neutral/$stage/load \\
-          -cache L_PRO_yne_neutral/chiral_cache -workers 32
+          -permeant pro_yne -load-dir L_PRO_yne_neutral/$stage/load -workers 32
     done                                              (same for D)
 
     chiroflux chiral-compare \\
         -runs-l L_PRO_yne_neutral/infinit_entry,L_PRO_yne_neutral/infinit_internal,L_PRO_yne_neutral/infinit_escape \\
         -runs-d D_PRO_yne_neutral/infinit_entry,D_PRO_yne_neutral/infinit_internal,D_PRO_yne_neutral/infinit_escape \\
         -data-l post/infretis_data.txt -data-d post/infretis_data.txt \\
-        -cache-l L_PRO_yne_neutral/chiral_cache -cache-d D_PRO_yne_neutral/chiral_cache \\
         -out-dir comparison/chiral_interface
+
+Each stage's cache lands in RUN_DIR/chiral_cache, where compare looks for it,
+so the stages can be extracted separately, from anywhere.  An interrupted or
+repeated extract only does the paths not cached yet (or whose traj.txt
+changed).  compare needs the cache and load/*/traj.txt, load/*/order.txt, but
+not the trajectories, so it can run on a copy without them.
 
 Each run directory must hold load/ and the wham/ folder that inftools wrote
 (Pcross.txt, histo_probability.txt), the same folder permeation_process reads.
@@ -126,7 +134,7 @@ import glob
 import hashlib
 import os
 import warnings
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Optional
@@ -142,7 +150,6 @@ from .pathdata import (
     _load_interfaces_from_toml,
     _load_path_table,
     read_traj_plan,
-    traj_plan_segments,
 )
 
 KB_KCAL = 0.0019872041  # kcal / (mol K)
@@ -278,7 +285,7 @@ def _midplane(z_slab, z_p, Lz):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Extraction: one xtc -> one row of features per frame
+# Extraction: one path -> one row of features per phase point
 # ══════════════════════════════════════════════════════════════════════════════
 
 class _Topology:
@@ -288,6 +295,7 @@ class _Topology:
         import MDAnalysis as mda
         warnings.filterwarnings("ignore", module="MDAnalysis")
         self.u = mda.Universe(tpr)
+        self.n_atoms = self.u.atoms.n_atoms
         self.spec = spec
         perm = self.u.select_atoms(f"resname {spec.resname}")
         if perm.n_residues != 1:
@@ -428,42 +436,189 @@ def check_stereochemistry(T: _Topology, pos, box):
             "lipids_S": int(np.sum(lip == "S"))}
 
 
-#: Bump when the cached content changes; old caches then miss and are rebuilt.
-CACHE_VERSION = 3
+#: Bump when the cached content changes; old chunks are then ignored and rebuilt.
+CACHE_VERSION = 4
+#: Every cache chunk ends in this; anything else in a cache folder is ignored.
+CHUNK_SUFFIX = ".chiral.npz"
+#: Cache folder inside each run directory, unless one is given explicitly.
+DEFAULT_CACHE = "chiral_cache"
 
 
-def cache_name(xtc):
-    st = os.stat(xtc)
-    key = f"v{CACHE_VERSION}|{os.path.abspath(xtc)}|{st.st_size}|{int(st.st_mtime)}"
-    return hashlib.sha1(key.encode()).hexdigest()[:20] + ".npz"
+def _read_xtc(xtc, n_atoms):
+    """
+    Yield (frame index, positions [A], box dimensions [A, deg], time [ps]) for
+    every frame of `xtc`, in file order.
+
+    Uses MDAnalysis's low-level XTC reader instead of a Universe trajectory.
+    The Universe reader builds a frame-offset index on opening and saves it,
+    with a lock file, as two hidden files next to every xtc it reads
+    (.<name>.xtc_offsets.npz/.lock) - two inodes per trajectory, inside the
+    run's own load/ folder.  Reading every frame in order needs no offsets,
+    so nothing is written here.
+    """
+    from MDAnalysis.lib.formats.libmdaxdr import XTCFile
+    from MDAnalysis.lib.mdamath import triclinic_box
+
+    with XTCFile(xtc) as fh:
+        if fh.n_atoms != n_atoms:
+            raise ValueError(f"{xtc} has {fh.n_atoms} atoms, the topology {n_atoms}")
+        for i, frame in enumerate(fh):
+            box = np.asarray(triclinic_box(*frame.box), dtype=np.float32)
+            box[:3] *= 10.0                                   # nm -> A
+            yield i, frame.x * 10.0, box, float(frame.time)
 
 
-def extract_file(T: _Topology, xtc, out):
-    """Features for every frame of one xtc -> npz at `out`.  Every frame is
-    kept, including ones no path uses; paths select theirs at assembly."""
-    T.u.load_new(xtc)
-    n = T.u.trajectory.n_frames
-    n_don = len(T.spec.donors)
-    F = np.full((n, len(FLOAT_COLS)), np.nan, dtype=np.float32)
-    I = np.full((n, 1 + 2 * n_don), -1, dtype=np.int32)
-    # Bulk glycerol dihedral histogram per frame, so trimmed frames drop out
-    # of the bulk reference too.
-    G = np.zeros((n, 2, N_GLYC_BINS), dtype=np.uint16)
+def extract_unit(T: _Topology, unit):
+    """
+    Features of exactly the phase points `unit.plan` lists, in path order.
+
+    Each xtc is read once, front to back, and features are computed only for
+    the frames the plan uses: the xtc files also carry frames outside the
+    path, which no analysis here looks at.  A frame index of None (plain MD)
+    takes every frame of the file.
+
+    Returns {F, I, G, dt, stereo}: F/I/G one row per phase point; dt the frame
+    spacing in ps (the first positive spacing found); stereo the CIP check of
+    the first frame (see check_stereochemistry).
+    """
+    need = {}                                     # file -> frame indices, None = all
+    for fname, idx in unit.plan:
+        if idx is None:
+            need[fname] = None
+        elif need.get(fname, ()) is not None:
+            need.setdefault(fname, set()).add(idx)
     edges = np.linspace(-180.0, 180.0, N_GLYC_BINS + 1)
-    stereo = None
-    for i, ts in enumerate(T.u.trajectory):
-        pos = ts.positions
-        if stereo is None:
-            stereo = check_stereochemistry(T, pos, ts.dimensions)
-        F[i], I[i], glyc = _frame_features(T, pos, ts.dimensions)
-        for a in range(2):
-            G[i, a] = np.histogram(glyc[a], bins=edges)[0]
-    tmp = f"{out}.tmp.npz"
-    np.savez_compressed(tmp, F=F, I=I, G=G, dt=T.u.trajectory.dt,
-                        xtc=os.path.abspath(xtc), columns=np.array(FLOAT_COLS),
-                        **{f"stereo_{k}": v for k, v in (stereo or {}).items()})
-    os.replace(tmp, out)
-    return n
+    feats, n_frames = {}, {}
+    dt, stereo = None, None
+    for fname, idx in need.items():
+        prev_t, n = None, 0
+        for i, pos, box, t in _read_xtc(fname, T.n_atoms):
+            n = i + 1
+            if dt is None and prev_t is not None and t > prev_t:
+                dt = t - prev_t
+            prev_t = t
+            if idx is not None and i not in idx:
+                continue
+            if stereo is None:
+                stereo = check_stereochemistry(T, pos, box)
+            f_row, i_row, glyc = _frame_features(T, pos, box)
+            # Bulk glycerol dihedral histogram per frame, so trimmed frames
+            # drop out of the bulk reference too.
+            g_row = np.stack([np.histogram(glyc[a], bins=edges)[0] for a in range(2)])
+            feats[(fname, i)] = (f_row, i_row, g_row)
+        n_frames[fname] = n
+        if idx and max(idx) >= n:
+            raise ValueError(f"{fname}: traj.txt asks for frame {max(idx)}, "
+                             f"but the file has {n} frames")
+    rows = []
+    for fname, idx in unit.plan:
+        if idx is None:
+            rows += [feats[(fname, k)] for k in range(n_frames[fname])]
+        else:
+            rows.append(feats[(fname, idx)])
+    n_int = 1 + 2 * len(T.spec.donors)
+    return {
+        "F": np.array([r[0] for r in rows], dtype=np.float32).reshape(-1, len(FLOAT_COLS)),
+        "I": np.array([r[1] for r in rows], dtype=np.int32).reshape(-1, n_int),
+        "G": np.array([r[2] for r in rows], dtype=np.uint16).reshape(-1, 2, N_GLYC_BINS),
+        "dt": 0.0 if dt is None else dt,
+        "stereo": stereo or {},
+    }
+
+
+# ── The cache: chunks of paths ────────────────────────────────────────────────
+#
+# One .npz holds up to `per_file` units (paths), with each unit's phase points
+# concatenated and an index of where each starts.  Compared with one file per
+# xtc this needs a few dozen files per stage instead of three inodes per
+# trajectory, and the frames of one path are stored exactly once, in path
+# order.  Each unit's entry carries its signature (see Unit), which is what
+# says whether the entry is still valid: compare needs only the cache and the
+# small text files, never the trajectories.
+#
+# A chunk is written to a temporary name and renamed into place once all its
+# units are done, so a run killed half-way loses only the unfinished chunks,
+# and rerunning extract resumes with them.
+
+def _natural(key):
+    return (0, int(key), "") if key.isdigit() else (1, 0, key)
+
+
+def _chunk_name(tag, unit, pos, per_file):
+    """Infretis paths are grouped by path number, so a chunk's membership does
+    not shift when paths are added; plain-MD files by position."""
+    number = unit.uid if isinstance(unit.uid, (int, np.integer)) else pos
+    lo = (int(number) // per_file) * per_file
+    return f"{tag}_{lo:07d}-{lo + per_file - 1:07d}{CHUNK_SUFFIX}"
+
+
+def _chunk_index(path):
+    """(version, permeant, {key: signature}) of a chunk without decompressing
+    its frames, or None if the file cannot be read (e.g. truncated)."""
+    try:
+        with np.load(path) as d:
+            return (int(d["version"]), str(d["permeant"]),
+                    dict(zip(d["keys"].tolist(), d["signatures"].tolist())))
+    except Exception:
+        return None
+
+
+def load_chunk(path):
+    with np.load(path) as d:
+        return {k: d[k] for k in d.files}
+
+
+def chunk_entry(chunk, pos):
+    """(arrays {F, I, G}, dt, stereo) of the unit at position `pos` of a chunk."""
+    a, b = int(chunk["starts"][pos]), int(chunk["starts"][pos + 1])
+    stereo = {k: chunk[f"stereo_{k}"][pos].item()
+              for k in ("permeant", "enantiomer", "lipids_R", "lipids_S")}
+    return ({k: chunk[k][a:b] for k in ("F", "I", "G")},
+            float(chunk["dt"][pos]), stereo)
+
+
+def _chunk_entries(chunk):
+    """{key: (signature, result)} of every unit in a loaded chunk."""
+    out = {}
+    for pos, (key, sig) in enumerate(zip(chunk["keys"].tolist(),
+                                         chunk["signatures"].tolist())):
+        arr, dt, stereo = chunk_entry(chunk, pos)
+        out[key] = (sig, {**arr, "dt": dt, "stereo": stereo})
+    return out
+
+
+def _write_chunk(path, entries, permeant):
+    """entries: {key: (signature, result)} -> one compressed .npz, atomically."""
+    keys = sorted(entries, key=_natural)
+    res = [entries[k][1] for k in keys]
+    lengths = [len(r["F"]) for r in res]
+    stereo = {k: [r["stereo"].get(k, "" if k in ("permeant", "enantiomer") else -1)
+                  for r in res]
+              for k in ("permeant", "enantiomer", "lipids_R", "lipids_S")}
+    tmp = path[:-len(".npz")] + ".tmp.npz"
+    np.savez_compressed(
+        tmp, version=CACHE_VERSION, permeant=permeant, columns=np.array(FLOAT_COLS),
+        keys=np.array(keys), signatures=np.array([entries[k][0] for k in keys]),
+        starts=np.r_[0, np.cumsum(lengths)].astype(np.int64),
+        dt=np.array([r["dt"] for r in res], dtype=float),
+        F=np.concatenate([r["F"] for r in res]),
+        I=np.concatenate([r["I"] for r in res]),
+        G=np.concatenate([r["G"] for r in res]),
+        **{f"stereo_{k}": np.array(v) for k, v in stereo.items()})
+    os.replace(tmp, path)
+
+
+def _update_chunk(path, new, permeant, overwrite):
+    """Write `new` {key: (signature, result)} into the chunk at `path`, keeping
+    the old chunk's still-valid entries for every other unit."""
+    entries = {}
+    if not overwrite and os.path.exists(path):
+        info = _chunk_index(path)
+        if info is not None and info[0] == CACHE_VERSION and info[1] == permeant:
+            entries = _chunk_entries(load_chunk(path))
+    entries.update(new)
+    if entries:
+        _write_chunk(path, entries, permeant)
 
 
 _TOPO: _Topology | None = None
@@ -474,38 +629,68 @@ def _init_extract(tpr, permeant):
     _TOPO = _Topology(tpr, PERMEANTS[permeant])
 
 
-def _extract_job(xtc, cache_dir, overwrite):
-    out = os.path.join(cache_dir, cache_name(xtc))
-    if os.path.exists(out) and not overwrite:
-        return xtc, -1, None
+def _extract_job(job):
+    name, unit = job
     try:
-        return xtc, extract_file(_TOPO, xtc, out), None
+        return name, unit.key, unit.signature, extract_unit(_TOPO, unit), None
     except Exception as exc:
-        return xtc, 0, f"{type(exc).__name__}: {exc}"
+        return name, unit.key, unit.signature, None, f"{type(exc).__name__}: {exc}"
 
 
-def extract_many(xtc_files, tpr, permeant, cache_dir, workers=8, overwrite=False):
-    """Extract (and cache) every file; shared segments are only read once."""
+def extract_many(units, tpr, permeant, cache_dir, tag, workers=8, overwrite=False,
+                 per_file=500):
+    """
+    Extract every unit not yet cached (or cached from a different traj.txt,
+    permeant or cache version) into chunks of `per_file` units in `cache_dir`.
+    `tag` names the chunks, so several stages can share one folder.  Returns
+    [(key, error)] of the units that failed; they are simply absent from the
+    cache and are retried by the next run.
+    """
     os.makedirs(cache_dir, exist_ok=True)
-    files = sorted(set(xtc_files))
-    done = skipped = 0
+    for stale in glob.glob(os.path.join(cache_dir, f"*{CHUNK_SUFFIX[:-4]}.tmp.npz")):
+        os.remove(stale)                      # left behind by a killed run
+    groups = {}
+    for pos, u in enumerate(units):
+        groups.setdefault(_chunk_name(tag, u, pos, per_file), []).append(u)
+    todo = {}
+    for name, members in groups.items():
+        info = None if overwrite else _chunk_index(os.path.join(cache_dir, name))
+        valid = info is not None and info[0] == CACHE_VERSION and info[1] == permeant
+        have = info[2] if valid else {}
+        missing = [u for u in members if have.get(u.key) != u.signature]
+        if missing:
+            todo[name] = missing
+    n_todo = sum(len(m) for m in todo.values())
+    print(f"  {len(units) - n_todo} units cached already, {n_todo} to extract "
+          f"into {len(todo)} of {len(groups)} chunk file(s) in {cache_dir}")
     errors = []
+    if not todo:
+        return errors
+    # Resolve the topology once here: a wrong -tpr/-permeant then fails with
+    # its own message, instead of killing every worker's initializer and
+    # surfacing as an opaque BrokenProcessPool.
+    _Topology(tpr, PERMEANTS[permeant])
+    remaining = {name: len(m) for name, m in todo.items()}
+    new = {name: {} for name in todo}
+    jobs = [(name, u) for name in sorted(todo) for u in todo[name]]
+    # map() hands results back in submission order, which is chunk order, so
+    # at most about one chunk's results are held here at a time.
     with ProcessPoolExecutor(max_workers=workers, initializer=_init_extract,
                              initargs=(tpr, permeant)) as ex:
-        futs = [ex.submit(_extract_job, x, cache_dir, overwrite) for x in files]
-        for k, fut in enumerate(as_completed(futs), 1):
-            xtc, n, err = fut.result()
+        for k, (name, key, sig, res, err) in enumerate(ex.map(_extract_job, jobs), 1):
             if err:
-                errors.append((xtc, err))
-            elif n < 0:
-                skipped += 1
+                errors.append((key, err))
             else:
-                done += 1
+                new[name][key] = (sig, res)
+            remaining[name] -= 1
+            if remaining[name] == 0:
+                _update_chunk(os.path.join(cache_dir, name), new.pop(name),
+                              permeant, overwrite)
             if k % 200 == 0:
-                print(f"    ... {k}/{len(files)} files")
-    print(f"  extracted {done}, cached already {skipped}, failed {len(errors)}")
-    for xtc, err in errors[:10]:
-        print(f"    [!] {xtc}: {err}")
+                print(f"    ... {k}/{n_todo} units")
+    print(f"  extracted {n_todo - len(errors)}, failed {len(errors)}")
+    for key, err in errors[:10]:
+        print(f"    [!] {key}: {err}")
     return errors
 
 
@@ -519,6 +704,10 @@ class Unit:
     One statistical unit.  `plan` lists (xtc path, frame index) per phase
     point in path order.  A frame index of None means every frame of that
     file.  Units with an `order_file` are infretis paths.
+
+    `signature` identifies the unit's content for the cache: the SHA-1 of
+    traj.txt for a path (it names every file and frame), size and mtime of the
+    xtc for a plain-MD file.  `cache_dir` is where its extracted features live.
 
     Stage context, set by `setup_stages` (see "Path-ensemble reweighting"):
       weight    WFtot of the path times its stage factor
@@ -537,30 +726,46 @@ class Unit:
     stage: int = 0
     lam_a: float | None = None
     below_la: float = 1.0
+    signature: str = ""
+    cache_dir: str | None = None
 
     @property
     def files(self):
         return list(dict.fromkeys(f for f, _ in self.plan))
 
+    @property
+    def key(self):
+        return str(self.uid)
 
-def infretis_path_unit(path_dir, uid):
+
+def infretis_path_unit(path_dir, uid, cache_dir=None):
     """A path as cv_generation reads it: the traj.txt plan, plus order.txt."""
-    plan, g96_index = read_traj_plan(os.path.join(path_dir, "traj.txt"))
+    traj = os.path.join(path_dir, "traj.txt")
+    plan, g96_index = read_traj_plan(traj)
+    with open(traj, "rb") as fh:
+        signature = hashlib.sha1(fh.read()).hexdigest()
     acc = os.path.join(path_dir, "accepted")
     return Unit(uid, [(os.path.join(acc, f), i) for f, i in plan],
-                order_file=os.path.join(path_dir, "order.txt"), g96_index=g96_index)
+                order_file=os.path.join(path_dir, "order.txt"), g96_index=g96_index,
+                signature=signature, cache_dir=cache_dir)
 
 
-def units_from_load_dir(load_dir, path_numbers=None):
+def units_from_load_dir(load_dir, path_numbers=None, cache_dir=None):
     if path_numbers is None:
         path_numbers = sorted(int(p.name) for p in Path(load_dir).iterdir()
                               if p.name.isdigit() and (p / "traj.txt").exists())
-    return [infretis_path_unit(os.path.join(load_dir, str(pn)), pn)
+    return [infretis_path_unit(os.path.join(load_dir, str(pn)), pn, cache_dir)
             for pn in path_numbers]
 
 
-def units_from_files(xtc_files):
-    return [Unit(i, [(x, None)]) for i, x in enumerate(sorted(xtc_files))]
+def units_from_files(xtc_files, cache_dir=None):
+    units = []
+    for x in sorted(xtc_files):
+        st = os.stat(x)
+        units.append(Unit(os.path.abspath(x), [(x, None)],
+                          signature=f"{st.st_size}:{int(st.st_mtime)}",
+                          cache_dir=cache_dir))
+    return units
 
 
 # ── Trimming, as chiroflux.cv_generation does it ─────────────────────────────
@@ -696,6 +901,7 @@ class StageSpec:
     run_dir: str
     data_file: str
     toml_file: str
+    cache_dir: str | None = None      # default: RUN_DIR/chiral_cache
 
 
 def _find_toml(run_dir):
@@ -725,7 +931,9 @@ def setup_stages(specs, nskip=1000, wham_subdir="wham", pcross_col=3,
             raise ValueError(f"{spec.toml_file} has lambda_A = {lam_a} but "
                              f"{spec.run_dir}/{wham_subdir} was made with "
                              f"lA = {stage.lam_a}; wrong toml for this run?")
-        units = units_from_load_dir(os.path.join(spec.run_dir, "load"), path_numbers)
+        cache_dir = spec.cache_dir or os.path.join(spec.run_dir, DEFAULT_CACHE)
+        units = units_from_load_dir(os.path.join(spec.run_dir, "load"), path_numbers,
+                                    cache_dir)
         if weights == "wham":
             wtot = stage_path_weights(spec.data_file, spec.toml_file, nskip)
             xi, missing = (wham_xi(units, wtot, lam_a, lam_m1) if k == 0
@@ -814,14 +1022,35 @@ PROFILE_OBS = (
 LIFE_KINDS = CLASS_NAMES + ["lipid_contact"]
 
 
-def load_cached(xtc, cache_dir):
-    path = os.path.join(cache_dir, cache_name(xtc))
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"no v{CACHE_VERSION} cache for {xtc} in {cache_dir}; "
-                                f"run `chiroflux chiral-extract` first (caches from older versions, "
-                                f"or of a since-modified xtc, are not reused)")
-    with np.load(path) as d:
-        return {k: d[k] for k in d.files}
+def cache_index(cache_dir):
+    """{key: [(chunk path, position, signature)]} over every current-version
+    chunk in `cache_dir`.  Reads only the chunks' small index arrays."""
+    index = {}
+    for path in sorted(glob.glob(os.path.join(cache_dir, f"*{CHUNK_SUFFIX}"))):
+        info = _chunk_index(path)
+        if info is None or info[0] != CACHE_VERSION:
+            continue
+        for pos, (key, sig) in enumerate(info[2].items()):
+            index.setdefault(key, []).append((path, pos, sig))
+    return index
+
+
+def _locate(unit, index):
+    """(chunk path, position) of `unit` in its cache index; raises if it is
+    missing or was extracted from a different traj.txt/xtc."""
+    hits = index.get(unit.key, [])
+    for path, pos, sig in hits:
+        if sig == unit.signature:
+            return path, pos
+    why = ("its traj.txt (or xtc) changed since it was extracted" if hits
+           else f"no v{CACHE_VERSION} entry in {unit.cache_dir}")
+    raise LookupError(f"not cached: {why}; run `chiroflux chiral-extract` first")
+
+
+def load_unit(unit):
+    """(arrays {F, I, G}, dt, stereo) of one unit, from its cache."""
+    path, pos = _locate(unit, cache_index(unit.cache_dir))
+    return chunk_entry(load_chunk(path), pos)
 
 
 def _runs(keys):
@@ -833,37 +1062,21 @@ def _runs(keys):
     return keys[starts], np.diff(np.r_[starts, keys.size])
 
 
-def assemble_path(unit: Unit, cache_dir):
+def assemble_path(unit: Unit, arr, dt):
     """
-    The frames of one unit as a single time-ordered sequence.
+    The cached frames of one unit, checked and trimmed.
 
-    Frames are taken exactly as `unit.plan` names them (reversed segments list
-    descending indices, so they need no special handling).  For infretis
-    paths the order parameter is then checked row by row against the plan,
-    and, if `unit.trim` = (lambda_A, lambda_minus_one), the end points are
-    trimmed, both as in cv_generation.
+    `arr` holds one row per phase point exactly as `unit.plan` names them, in
+    path order (reversed segments list descending indices, so they need no
+    special handling); extract_unit built it that way.  For infretis paths
+    the order parameter is then checked row by row against the plan, and, if
+    `unit.trim` = (lambda_A, lambda_minus_one), the end points are trimmed,
+    both as in cv_generation.
 
     Returns (arrays {F, I, G}, op, dt, meta).  `op` is the order parameter
     per kept frame; plain-MD units have none and get the stereocentre depth z
     in Angstrom instead.
     """
-    parts = {"F": [], "I": [], "G": []}
-    dt = None
-    for fname, idx in traj_plan_segments(unit.plan):
-        d = load_cached(fname, cache_dir)
-        n = d["F"].shape[0]
-        if idx[0] is None:
-            sel = slice(None)
-        else:
-            sel = np.asarray(idx)
-            if sel.min() < 0 or sel.max() >= n:
-                raise ValueError(f"{fname}: traj.txt asks for frame {sel.max()}, "
-                                 f"but the file has {n} frames")
-        for k in parts:
-            parts[k].append(d[k][sel])
-        dt = float(d["dt"]) if dt is None else dt
-    arr = {k: np.concatenate(v) for k, v in parts.items()}
-
     meta = {"stage": unit.stage, "uid": unit.uid, "phase_points": len(arr["F"]),
             "ensemble": None, "deleted_first": False, "deleted_last": False}
     if unit.order_file is None:
@@ -980,53 +1193,96 @@ def reduce_path(arr, op, dt, grid: Grid, mult=None):
     return out
 
 
-def reduce_unit(unit: Unit, cache_dir, grid: Grid):
-    arr, op, dt, meta = assemble_path(unit, cache_dir)
+STEREO_COLS = ("permeant", "enantiomer", "lipids_R", "lipids_S")
+
+
+def _reduce_entry(unit: Unit, arr, dt, stereo, grid: Grid):
+    arr, op, dt, meta = assemble_path(unit, arr, dt)
+    meta.update(stereo)
     return reduce_path(arr, op, dt, grid, frame_multiplier(op, unit)), meta
+
+
+def reduce_unit(unit: Unit, grid: Grid):
+    """Reduce one unit straight from its cache (see reduce_units for many)."""
+    return _reduce_entry(unit, *load_unit(unit), grid)
 
 
 _RED: dict = {}
 
 
-def _init_reduce(cache_dir, grid):
-    _RED.update(cache_dir=cache_dir, grid=grid)
+def _init_reduce(grid):
+    _RED.update(grid=grid)
 
 
-def _reduce_job(item):
-    i, unit = item
+def _reduce_chunk_job(item):
+    """Reduce every requested unit of one chunk; the chunk is loaded once."""
+    path, members = item
     try:
-        red, meta = reduce_unit(unit, _RED["cache_dir"], _RED["grid"])
-        return i, red, meta, None
+        chunk = load_chunk(path)
     except Exception as exc:
-        return i, None, None, f"{type(exc).__name__}: {exc}"
+        return [(i, None, None, f"{path}: {type(exc).__name__}: {exc}")
+                for i, _, _ in members]
+    out = []
+    for i, unit, pos in members:
+        try:
+            red, meta = _reduce_entry(unit, *chunk_entry(chunk, pos), _RED["grid"])
+            out.append((i, red, meta, None))
+        except Exception as exc:
+            out.append((i, None, None, f"{type(exc).__name__}: {exc}"))
+    return out
 
 
-def reduce_units(units, cache_dir, grid, workers=8):
-    """Reduce all units in parallel.  Returns (kept units in input order, their
-    reductions, a per-unit trimming table).  Results are keyed by position:
-    path numbers repeat across stages."""
-    res, metas = {}, []
+def reduce_units(units, grid, workers=8):
+    """
+    Reduce all units in parallel, one chunk per job.  Returns (kept units in
+    input order, their reductions, a per-unit table of trimming and the CIP
+    check).  Results are keyed by position: path numbers repeat across stages.
+    Input order is MC order within each stage, which the block bootstrap needs.
+    """
+    indexes = {d: cache_index(d) for d in {u.cache_dir for u in units}}
+    jobs, metas, res = {}, [], {}
+
+    def fail(i, err):
+        print(f"    [!] stage {units[i].stage} path {units[i].uid}: {err}")
+        metas.append({"stage": units[i].stage, "uid": units[i].uid, "error": err})
+
+    for i, u in enumerate(units):
+        try:
+            path, pos = _locate(u, indexes[u.cache_dir])
+        except LookupError as exc:
+            fail(i, str(exc))
+            continue
+        jobs.setdefault(path, []).append((i, u, pos))
     with ProcessPoolExecutor(max_workers=workers, initializer=_init_reduce,
-                             initargs=(cache_dir, grid)) as ex:
-        for i, red, meta, err in ex.map(_reduce_job, enumerate(units), chunksize=16):
-            if err:
-                print(f"    [!] stage {units[i].stage} path {units[i].uid}: {err}")
-                metas.append({"stage": units[i].stage, "uid": units[i].uid, "error": err})
-            elif red is not None:
-                res[i] = red
-                metas.append(meta)
+                             initargs=(grid,)) as ex:
+        for out in ex.map(_reduce_chunk_job, list(jobs.items())):
+            for i, red, meta, err in out:
+                if err:
+                    fail(i, err)
+                else:
+                    res[i] = red
+                    metas.append(meta)
     order = sorted(res)
     return [units[i] for i in order], [res[i] for i in order], pd.DataFrame(metas)
 
 
-def stereo_summary(units, cache_dir):
-    """Per-file CIP check, so a mislabelled run or inverted lipids is caught
+def _report_stereo(label, meta, want):
+    """CIP check per path, so a mislabelled run or inverted lipids is caught
     before any comparison is trusted."""
-    rows = []
-    for f in sorted({f for u in units for f in u.files}):
-        d = load_cached(f, cache_dir)
-        rows.append({k[len("stereo_"):]: d[k].item() for k in d if k.startswith("stereo_")})
-    return pd.DataFrame(rows)
+    if meta.empty or "enantiomer" not in meta:
+        return pd.DataFrame()
+    st = meta.loc[meta["enantiomer"].isin(["L", "D"]), ["stage", "uid", *STEREO_COLS]]
+    if st.empty:
+        return st
+    bad = st[st["enantiomer"] != want]
+    mixed = st[(st["lipids_R"] > 0) & (st["lipids_S"] > 0)]
+    print(f"  {label}: {len(st)} paths, permeant {st['enantiomer'].value_counts().to_dict()}, "
+          f"lipids R/S = {st['lipids_R'].iloc[0]}/{st['lipids_S'].iloc[0]}")
+    if len(bad):
+        print(f"  [!] {len(bad)} {label} path(s) contain the OTHER enantiomer")
+    if len(mixed):
+        print(f"  [!] {len(mixed)} {label} path(s) have lipids of both handedness")
+    return st
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1491,13 +1747,14 @@ def _report_trimming(label, meta):
               f"{int(ok['deleted_last'].sum())}")
 
 
-def compare(unitsL, unitsD, cacheL, cacheD, out_dir, grid=None, workers=8,
+def compare(unitsL, unitsD, out_dir, grid=None, workers=8,
             temperature=310.0, n_boot=500, block=50, seed=0,
             stagesL=None, stagesD=None):
     """
     Run every comparison and write the tables to out_dir.  The units carry
-    their own weights, stage and trimming context (see `setup_stages`);
-    stagesL/stagesD are the per-stage summaries, written alongside.
+    their own weights, stage, trimming context and cache folder (see
+    `setup_stages`); stagesL/stagesD are the per-stage summaries, written
+    alongside.
     """
     grid = grid or Grid()
     os.makedirs(out_dir, exist_ok=True)
@@ -1505,22 +1762,16 @@ def compare(unitsL, unitsD, cacheL, cacheD, out_dir, grid=None, workers=8,
         if st is not None:
             st.to_csv(os.path.join(out_dir, f"stages_{label}.csv"), index=False)
 
-    for label, units, cache, want in (("L", unitsL, cacheL, "L"), ("D", unitsD, cacheD, "D")):
-        st = stereo_summary(units, cache)
-        st.to_csv(os.path.join(out_dir, f"stereochemistry_{label}.csv"), index=False)
-        bad = st[st["enantiomer"] != want]
-        mixed = st[(st["lipids_R"] > 0) & (st["lipids_S"] > 0)]
-        print(f"  {label}: {len(st)} files, permeant {st['enantiomer'].value_counts().to_dict()}, "
-              f"lipids R/S = {st['lipids_R'].iloc[0]}/{st['lipids_S'].iloc[0]}")
-        if len(bad):
-            print(f"  [!] {len(bad)} {label} file(s) contain the OTHER enantiomer")
-        if len(mixed):
-            print(f"  [!] {len(mixed)} {label} file(s) have lipids of both handedness")
-
-    uL, rL, mL = reduce_units(unitsL, cacheL, grid, workers)
-    uD, rD, mD = reduce_units(unitsD, cacheD, grid, workers)
+    uL, rL, mL = reduce_units(unitsL, grid, workers)
+    uD, rD, mD = reduce_units(unitsD, grid, workers)
+    if not rL or not rD:
+        raise RuntimeError("no path of " + ("L" if not rL else "D") + " could be "
+                           "reduced; see the [!] messages above")
     for label, meta in (("L", mL), ("D", mD)):
-        meta.to_csv(os.path.join(out_dir, f"path_trimming_{label}.csv"), index=False)
+        _report_stereo(label, meta, label).to_csv(
+            os.path.join(out_dir, f"stereochemistry_{label}.csv"), index=False)
+        meta.drop(columns=[c for c in STEREO_COLS if c in meta]).to_csv(
+            os.path.join(out_dir, f"path_trimming_{label}.csv"), index=False)
         _report_trimming(label, meta)
     eL, eD = Ensemble(uL, rL), Ensemble(uD, rD)
     print(f"  units: L {eL.n}, D {eD.n}")
@@ -1600,11 +1851,12 @@ def _split(value):
     return [v.strip() for v in value.split(",") if v.strip()] if value else []
 
 
-def _per_run(value, run_dirs, flag):
+def _per_run(value, run_dirs, flag, exists=os.path.isfile):
     """
-    One file per run directory from `value`: a single path looked for inside
+    One path per run directory from `value`: a single path looked for inside
     every run directory, or one path per run, comma-separated, in run order.
     Each path is tried inside its run directory first, then as given.
+    `exists` is os.path.isfile or os.path.isdir.
     """
     items = _split(value)
     if len(items) == 1:
@@ -1616,7 +1868,7 @@ def _per_run(value, run_dirs, flag):
     out = []
     for run_dir, item in zip(run_dirs, items):
         for cand in (os.path.join(run_dir, item), item):
-            if os.path.isfile(cand):
+            if exists(cand):
                 out.append(cand)
                 break
         else:
@@ -1625,12 +1877,14 @@ def _per_run(value, run_dirs, flag):
     return out
 
 
-def _stage_specs(runs, data, toml, side):
+def _stage_specs(runs, data, toml, cache, side):
     run_dirs = _split(runs)
     data_files = _per_run(data, run_dirs, f"-data-{side}")
     tomls = (_per_run(toml, run_dirs, f"-toml-{side}") if toml
              else [_find_toml(r) for r in run_dirs])
-    return [StageSpec(r, d, t) for r, d, t in zip(run_dirs, data_files, tomls)]
+    caches = _per_run(cache, run_dirs, f"-cache-{side}", exists=os.path.isdir)
+    return [StageSpec(r, d, t, c)
+            for r, d, t, c in zip(run_dirs, data_files, tomls, caches)]
 
 
 def chiral_extract(
@@ -1638,53 +1892,71 @@ def chiral_extract(
     tpr: Annotated[Optional[str], typer.Option("-tpr", help="Topology (.tpr) of the simulated system; atom names and residues are resolved from it once per worker. Required", rich_help_panel=panels.INPUT)] = None,
     permeant: Annotated[Optional[str], typer.Option("-permeant", help=f"Which permeant definition to use (stereocentre, CIP substituents, H-bond donors/acceptors); one of: {', '.join(sorted(PERMEANTS))}. Required", rich_help_panel=panels.INPUT)] = None,
     load_dir: Annotated[Optional[str], typer.Option("-load-dir", help="infretis load/ folder: every path in it is read through its traj.txt plan. Give this or -xtc", rich_help_panel=panels.INPUT)] = None,
-    xtc: Annotated[Optional[str], typer.Option("-xtc", help="Plain MD / umbrella windows instead of -load-dir: a glob of .xtc files (quote it)", rich_help_panel=panels.INPUT)] = None,
+    xtc: Annotated[Optional[str], typer.Option("-xtc", help="Plain MD / umbrella windows instead of -load-dir: a glob of .xtc files (quote it); each file is one unit", rich_help_panel=panels.INPUT)] = None,
 
     # ── Dataset construction ──────────────────────────────────────────────
     path_numbers: Annotated[Optional[str], typer.Option("-path-numbers", help="Only these paths of -load-dir, e.g. '1-5000,6001'; default all", rich_help_panel=panels.DATASET)] = None,
 
     # ── Model and training ────────────────────────────────────────────────
-    workers: Annotated[int, typer.Option("-workers", help="Worker processes; each reads one xtc at a time", rich_help_panel=panels.MODEL)] = 8,
+    workers: Annotated[int, typer.Option("-workers", help="Worker processes; each extracts one path at a time", rich_help_panel=panels.MODEL)] = 8,
 
     # ── Output ────────────────────────────────────────────────────────────
-    cache: Annotated[Optional[str], typer.Option("-cache", help="Cache folder for the per-xtc feature files. Share one per enantiomer across its stages: segments shared between paths and stages are then read only once. Required", rich_help_panel=panels.OUTPUT)] = None,
-    overw: Annotated[bool, typer.Option("-O", help="Re-extract files that already have a cache entry", rich_help_panel=panels.OUTPUT)] = False,
+    cache: Annotated[Optional[str], typer.Option("-cache", help=f"Cache folder. Default with -load-dir: {DEFAULT_CACHE}/ in the run directory (the parent of load/), which is where chiral-compare looks. Required with -xtc", rich_help_panel=panels.OUTPUT)] = None,
+    paths_per_file: Annotated[int, typer.Option("-paths-per-file", help="Paths stored together in one cache file. Fewer files (inodes) with larger values; a killed run loses at most the unfinished files, and extending the simulation rebuilds only the files whose paths changed", rich_help_panel=panels.OUTPUT)] = 500,
+    overw: Annotated[bool, typer.Option("-O", help="Re-extract every path, even ones already cached", rich_help_panel=panels.OUTPUT)] = False,
 ):
-    """Read every xtc of a run once and cache per-frame features for chiral-compare.
+    """Extract per-frame stereocentre-contact features of every path, for chiral-compare.
 
-    Each frame gets the permeant's depth, orientation, pose in the body frame
-    of the nearest lipid stereocentre, H-bond partners per donor, and the
-    glycerol dihedrals of the contacted lipid. Caches are keyed on the xtc's
-    path, size and mtime, so a modified xtc is re-extracted automatically.
-    Run it once per stage (entry, internal, escape) of each enantiomer.
+    Each phase point gets the permeant's depth, orientation, pose in the body
+    frame of the nearest lipid stereocentre, H-bond partners per donor, and
+    the glycerol dihedrals of the contacted lipid. Only the frames traj.txt
+    lists are computed, and they are stored in path order, -paths-per-file
+    paths per cache file. The trajectories are read with a reader that writes
+    no offset files next to them.
+
+    A path is re-extracted only if its traj.txt changed (or the permeant or
+    cache version did), so rerunning after an interruption or after extending
+    the simulation resumes where it stopped. Run it once per stage (entry,
+    internal, escape) of each enantiomer.
     """
-    if tpr is None or permeant is None or cache is None:
-        raise typer.BadParameter("-tpr, -permeant and -cache are required.")
+    if tpr is None or permeant is None:
+        raise typer.BadParameter("-tpr and -permeant are required.")
     if permeant not in PERMEANTS:
         raise typer.BadParameter(
             f"-permeant {permeant!r}: choose from {sorted(PERMEANTS)}.")
     if (load_dir is None) == (xtc is None):
         raise typer.BadParameter("Give exactly one of -load-dir and -xtc.")
-    units = _units(load_dir, xtc, path_numbers)
-    files = [f for u in units for f in u.files]
-    print(f"  {len(units)} units, {len(set(files))} unique xtc files")
-    errors = extract_many(files, tpr, permeant, cache, workers, overw)
+    if paths_per_file < 1:
+        raise typer.BadParameter("-paths-per-file must be at least 1.")
+    if load_dir is not None:
+        run_dir = os.path.dirname(os.path.abspath(load_dir))
+        cache = cache or os.path.join(run_dir, DEFAULT_CACHE)
+        tag = os.path.basename(run_dir)
+        units = units_from_load_dir(load_dir, _parse_paths(path_numbers))
+    else:
+        if cache is None:
+            raise typer.BadParameter("-cache is required with -xtc.")
+        tag = "md"
+        units = units_from_files(glob.glob(xtc))
+    files = {f for u in units for f in u.files}
+    print(f"  {len(units)} units, {len(files)} unique xtc files")
+    errors = extract_many(units, tpr, permeant, cache, tag, workers, overw, paths_per_file)
     if errors:
         raise typer.Exit(code=1)
 
 
 def chiral_compare(
     # ── Input data ────────────────────────────────────────────────────────
-    runs_l: Annotated[Optional[str], typer.Option("-runs-l", help="Run directories of the L simulation, comma-separated, in chain order (entry, internal, escape). Each holds load/ and the wham/ folder inftools wrote. Give this or -xtc-l", rich_help_panel=panels.INPUT)] = None,
+    runs_l: Annotated[Optional[str], typer.Option("-runs-l", help="Run directories of the L simulation, comma-separated, in chain order (entry, internal, escape). Each holds load/ (traj.txt and order.txt of every path; the trajectories themselves are not needed), the wham/ folder inftools wrote, and the cache. Give this or -xtc-l", rich_help_panel=panels.INPUT)] = None,
     runs_d: Annotated[Optional[str], typer.Option("-runs-d", help="Run directories of the D simulation; see -runs-l", rich_help_panel=panels.INPUT)] = None,
     data_l: Annotated[str, typer.Option("-data-l", help="infretis_data.txt of each L stage: one relative path looked for inside every run directory, or one file per run, comma-separated", rich_help_panel=panels.INPUT)] = "infretis_data.txt",
     data_d: Annotated[str, typer.Option("-data-d", help="infretis_data.txt of each D stage; see -data-l", rich_help_panel=panels.INPUT)] = "infretis_data.txt",
     toml_l: Annotated[Optional[str], typer.Option("-toml-l", help="infretis.toml of each L stage, same rules as -data-l; unset uses RUN_DIR/infretis.toml, else RUN_DIR/post/infretis.toml", rich_help_panel=panels.INPUT)] = None,
     toml_d: Annotated[Optional[str], typer.Option("-toml-d", help="infretis.toml of each D stage; see -toml-l", rich_help_panel=panels.INPUT)] = None,
+    cache_l: Annotated[str, typer.Option("-cache-l", help=f"Cache folder of each L stage, same rules as -data-l (default: {DEFAULT_CACHE}/ inside every run directory, where chiral-extract puts it). With -xtc-l: the one folder chiral-extract -cache wrote", rich_help_panel=panels.INPUT)] = DEFAULT_CACHE,
+    cache_d: Annotated[str, typer.Option("-cache-d", help="Cache folder of each D stage; see -cache-l", rich_help_panel=panels.INPUT)] = DEFAULT_CACHE,
     xtc_l: Annotated[Optional[str], typer.Option("-xtc-l", help="Plain MD instead of -runs-l: a glob of .xtc files (quote it); each file is its own unweighted, untrimmed unit", rich_help_panel=panels.INPUT)] = None,
     xtc_d: Annotated[Optional[str], typer.Option("-xtc-d", help="Plain MD instead of -runs-d; see -xtc-l", rich_help_panel=panels.INPUT)] = None,
-    cache_l: Annotated[Optional[str], typer.Option("-cache-l", help="Cache folder chiral-extract wrote for L. Required", rich_help_panel=panels.INPUT)] = None,
-    cache_d: Annotated[Optional[str], typer.Option("-cache-d", help="Cache folder chiral-extract wrote for D. Required", rich_help_panel=panels.INPUT)] = None,
 
     # ── Dataset construction ──────────────────────────────────────────────
     path_numbers: Annotated[Optional[str], typer.Option("-path-numbers", help="Only these path numbers of every stage, e.g. '1-5000,6001'; default all", rich_help_panel=panels.DATASET)] = None,
@@ -1702,7 +1974,7 @@ def chiral_compare(
     n_boot: Annotated[int, typer.Option("-n-boot", help="Block-bootstrap replicates for every confidence interval and p-value (the pose-map permutation test always uses 1000 permutations)", rich_help_panel=panels.MODEL)] = 500,
     block: Annotated[int, typer.Option("-block", help="Paths per contiguous MC block in the bootstrap and permutation test; capped at half a stage's path count", rich_help_panel=panels.MODEL)] = 50,
     seed: Annotated[int, typer.Option("-seed", help="Random seed for the bootstrap and permutation test", rich_help_panel=panels.MODEL)] = 0,
-    workers: Annotated[int, typer.Option("-workers", help="Worker processes for assembling and reducing the paths", rich_help_panel=panels.MODEL)] = 8,
+    workers: Annotated[int, typer.Option("-workers", help="Worker processes for reducing the paths; each takes one cache file at a time", rich_help_panel=panels.MODEL)] = 8,
 
     # ── Output ────────────────────────────────────────────────────────────
     out_dir: Annotated[str, typer.Option("-out-dir", help="Directory for the comparison tables", rich_help_panel=panels.OUTPUT)] = "chiral_interface",
@@ -1721,9 +1993,9 @@ def chiral_compare(
     With all stages (entry, internal, escape) and WHAM weights, the depth
     profiles are equilibrium quantities; with a single stage they are
     conditional on that run's start. See the module docstring for details.
+    The trajectories are not read: only the cache and each path's traj.txt
+    and order.txt.
     """
-    if cache_l is None or cache_d is None:
-        raise typer.BadParameter("-cache-l and -cache-d are required.")
     for side, runs, xtc in (("l", runs_l, xtc_l), ("d", runs_d, xtc_d)):
         if (runs is None) == (xtc is None):
             raise typer.BadParameter(f"Give exactly one of -runs-{side} and -xtc-{side}.")
@@ -1733,13 +2005,16 @@ def chiral_compare(
     grid = Grid(depth_edges=np.arange(0.0, depth_max + 1e-9, depth_step),
                 contact_cut=contact_cut)
     sides, summaries, run_dirs = [], [], []
-    for side, runs, data, toml, xtc in (("l", runs_l, data_l, toml_l, xtc_l),
-                                        ("d", runs_d, data_d, toml_d, xtc_d)):
+    for side, runs, data, toml, cache, xtc in (
+            ("l", runs_l, data_l, toml_l, cache_l, xtc_l),
+            ("d", runs_d, data_d, toml_d, cache_d, xtc_d)):
         if runs is None:
-            sides.append(units_from_files(glob.glob(xtc)))
+            if not os.path.isdir(cache):
+                raise typer.BadParameter(f"-cache-{side}: {cache} is not a folder")
+            sides.append(units_from_files(glob.glob(xtc), cache))
             summaries.append(None)
             continue
-        specs = _stage_specs(runs, data, toml, side)
+        specs = _stage_specs(runs, data, toml, cache, side)
         run_dirs += [sp.run_dir for sp in specs]
         units, summary = setup_stages(specs, nskip, wham_subdir, pcross_col,
                                       trim=trim,
@@ -1765,6 +2040,5 @@ def chiral_compare(
     if temperature is None:
         raise typer.BadParameter("No temperature found in the runs' tomls; pass -temperature.")
     print(f"  T = {temperature} K")
-    compare(sides[0], sides[1], cache_l, cache_d, out_dir, grid, workers,
-            temperature, n_boot, block, seed,
+    compare(sides[0], sides[1], out_dir, grid, workers, temperature, n_boot, block, seed,
             stagesL=summaries[0], stagesD=summaries[1])
