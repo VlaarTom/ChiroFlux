@@ -71,6 +71,8 @@ chiroflux COMMAND --help
 | `prepare-deeptda-data` | Builds a frame-level, weighted DeepTDA training set labelled reactive/non-reactive. |
 | `prepare-deeptda-data-ld` | Same, but labelled by which of two simulations each frame came from. |
 | `train-deeptda` | Trains a 2-state DeepTDA CV on either dataset and reports the input correlations that show which CVs drive it. |
+| `chiral-extract` | Reads each trajectory once and caches per-frame features at the lipid stereocentres (depth, pose in the glycerol body frame, H-bond partners, glycerol dihedrals) for `chiral-compare`. |
+| `chiral-compare` | L vs D comparison built on the diastereomeric-contact mechanism of Hu et al. (Nat. Chem. 2021): ddG and observables by depth, the implied ln(P_L/P_D), sn-2 vs sn-1 H-bonding, pose maps, contact lifetimes and glycerol response, with block-bootstrap errors over paths. |
 
 A typical single-simulation run:
 
@@ -86,6 +88,22 @@ CV folder inside it:
 chiroflux shap-enantiomer          -dir-l /path/to/L/folder/ -dir-d /path/to/D/folder/
 chiroflux prepare-deeptda-data-ld  -dir-l /path/to/L/folder/ -dir-d /path/to/D/folder/
 chiroflux train-deeptda -npz deeptda_ld_dataset.npz -class-names L,D
+```
+
+`chiral-extract` and `chiral-compare` work from the raw trajectories rather than
+the CV files. Extract once per stage into one cache per enantiomer, then compare
+all stages in chain order (entry, internal, escape), so that the stages combine
+into one equilibrium ensemble:
+
+```bash
+for stage in infinit_entry infinit_internal infinit_escape; do
+  chiroflux chiral-extract -tpr L/$stage/gromacs_input/topol.tpr -permeant pro_yne \
+                           -load-dir L/$stage/load -cache L/chiral_cache -workers 32
+done   # same for D
+chiroflux chiral-compare -runs-l L/infinit_entry,L/infinit_internal,L/infinit_escape \
+                         -runs-d D/infinit_entry,D/infinit_internal,D/infinit_escape \
+                         -data-l post/infretis_data.txt -data-d post/infretis_data.txt \
+                         -cache-l L/chiral_cache -cache-d D/chiral_cache
 ```
 
 `pca` instead takes the second simulation as a parallel set of options

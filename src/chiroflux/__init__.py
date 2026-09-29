@@ -17,6 +17,7 @@ Each analysis lives in its own module and is imported from there::
         prepare_deeptda_data_ld,
     )
     from chiroflux.train_deeptda import train_deeptda
+    from chiroflux.chiral_interface_analysis import chiral_extract, chiral_compare
 
 They are deliberately *not* re-exported here. Two of them share a name with
 their own module (``prepare_deeptda_data``, ``train_deeptda``), so a
@@ -43,6 +44,10 @@ What each one does:
 ``train_deeptda``
     Trains a DeepTDA collective variable on those datasets (needs the
     optional ``deeptda`` extra).
+``chiral_extract`` / ``chiral_compare``
+    Trajectory-level L vs D comparison at the lipid stereocentres: per-frame
+    features cached from the xtc files, then depth-resolved free energies,
+    H-bond partners, poses and lifetimes with block-bootstrap errors.
 
 Every entry point is also a subcommand of the ``chiroflux`` CLI.
 """

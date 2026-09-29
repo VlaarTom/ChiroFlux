@@ -118,6 +118,16 @@ _COMMANDS = {
         "train_deeptda",
         "Train a 2-state DeepTDA CV on a prepare-deeptda-data dataset.",
     ),
+    "chiral-extract": _Command(
+        "chiral_interface_analysis",
+        "chiral_extract",
+        "Cache per-frame stereocentre-contact features per xtc, for chiral-compare.",
+    ),
+    "chiral-compare": _Command(
+        "chiral_interface_analysis",
+        "chiral_compare",
+        "L vs D at the lipid stereocentres: ddG, H-bond partners, poses, lifetimes.",
+    ),
 }
 
 
