@@ -14,7 +14,7 @@ import typer
 from MDAnalysis.analysis import distances
 
 from . import panels
-from .pathdata import read_traj_plan, traj_plan_segments
+from .pathdata import read_traj_plan, remove_offset_files, traj_plan_segments
 
 # ── PARALLELISM CONFIGURATION ─────────────────────────────────────────────────
 ERROR_LOG  = "errors_neighbour.log"
@@ -585,17 +585,22 @@ def process_single_path_neighbour(
               f"{len(xtc_files)} xtc file(s)"
               + (f", slab_range={slab_range}" if slab_range else ", slab_range=auto"))
 
-        counts_df, _ = calculate_neighbour_slab_counts(
-            topology         = topol_file,
-            xtc_files        = xtc_files,
-            frame_plan       = frame_plan,
-            permeant_resname = permeant_resname,
-            weight           = 1.0,        # applied at aggregation
-            lipid_resnames   = lipid_resnames,
-            slab_width       = slab_width,
-            bilayer_normal   = bilayer_normal,
-            slab_range       = slab_range,
-        )
+        try:
+            counts_df, _ = calculate_neighbour_slab_counts(
+                topology         = topol_file,
+                xtc_files        = xtc_files,
+                frame_plan       = frame_plan,
+                permeant_resname = permeant_resname,
+                weight           = 1.0,        # applied at aggregation
+                lipid_resnames   = lipid_resnames,
+                slab_width       = slab_width,
+                bilayer_normal   = bilayer_normal,
+                slab_range       = slab_range,
+            )
+        finally:
+            # Done with this path's xtc files: drop the offset index MDAnalysis
+            # saved next to each of them (see remove_offset_files).
+            remove_offset_files(xtc_files)
 
         with open(out_csv, 'w') as f:
             f.write(f"# {'reactive' if reactive else 'non-reactive'}\n")

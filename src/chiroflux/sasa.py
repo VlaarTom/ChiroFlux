@@ -161,7 +161,7 @@ from .cv_histograms import (
     update_histogram,
     write_stats_csv,
 )
-from .pathdata import read_traj_plan, traj_plan_segments
+from .pathdata import read_traj_plan, remove_offset_files, traj_plan_segments
 
 try:
     from tqdm import tqdm
@@ -906,6 +906,8 @@ def process_path(job):
         dbg(f"CRASH path {path_num}\n{tb}")
         return {"path_num": path_num, "group": group,
                 "error": f"{type(e).__name__}: {e}", "traceback": tb}
+    finally:
+        _remove_path_offsets(job)
 
     dt = time.time() - t0
     if res.get("error"):
@@ -914,6 +916,18 @@ def process_path(job):
         dbg(f"DONE  path {path_num}  {res['n_frames']} frames  "
             f"{dt:.1f} s  RSS {rss_mb():.0f} MB")
     return res
+
+
+def _remove_path_offsets(job):
+    """Done with this path's segments: drop the offset index MDAnalysis saved
+    next to each of them (see pathdata.remove_offset_files).  Runs however the
+    path ended, including the early returns and crashes of the impl."""
+    path_dir = os.path.join(job[1], str(job[0]))
+    try:
+        segments, _ = read_traj_plan_for(os.path.join(path_dir, "traj.txt"))
+    except OSError:
+        return
+    remove_offset_files(os.path.join(path_dir, "accepted", seg) for seg, _ in segments)
 
 
 def _process_path_impl(job):

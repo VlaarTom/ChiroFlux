@@ -36,7 +36,7 @@ import numpy as np
 import typer
 
 from . import panels
-from .pathdata import _check_overwrite
+from .pathdata import _check_overwrite, remove_offset_files
 
 _MDANALYSIS_HINT = (
     "chiroflux leaflet-index needs MDAnalysis, which is a required dependency "
@@ -276,6 +276,12 @@ def leaflet_index(
             f"{topology} carries no coordinates ({exc}). Pass a frame with "
             "-coords, e.g. -coords gromacs_input/conf.g96."
         ) from exc
+    finally:
+        # The one frame used is in memory now and the file is not read again,
+        # so an .xtc/.trr -coords is done with: drop the offset index
+        # MDAnalysis saved next to it (see remove_offset_files).
+        if coords:
+            remove_offset_files(coords)
 
     if midplane is None:
         used_midplane, n_head = _shared_midplane(universe, resnames, leaflet_atom)

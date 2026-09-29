@@ -20,7 +20,7 @@ from scipy.interpolate import RBFInterpolator
 from scipy.spatial import cKDTree
 
 from . import panels
-from .pathdata import read_traj_plan, traj_plan_segments
+from .pathdata import read_traj_plan, remove_offset_files, traj_plan_segments
 
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -3478,43 +3478,48 @@ def process_single_path(
             + (f", skipping {sorted(skipped_groups)}" if skipped_groups else "")
         )
 
-        results = calculate_selected_slab_profiles(
-            topology            = topol_file,
-            xtc_files           = xtc_files,
-            frame_plan          = frame_plan,
-            permeant_resname    = permeant_resname,
-            needed_groups       = needed,
-            # Unweighted on purpose: the path weight is applied when the
-            # paths are aggregated, so a renormalisation of the weights after
-            # the simulations are extended needs a re-aggregation, not a rerun.
-            # Every accumulator is linear in it (+= w*x, += w), so that is exact.
-            weight              = 1.0,
-            lipid_resnames      = lipid_resnames,
-            slab_width          = slab_width,
-            bilayer_normal      = bilayer_normal,
-            slab_range          = slab_range,
-            chain_bonds         = CHAIN_BONDS,
-            tilt_endpoints      = TILT_ENDPOINTS,
-            phosphorus_name     = phosphorus_name,
-            water_resname       = water_resname,
-            water_oxygen_name   = water_oxygen_name,
-            r_max               = r_max,
-            n_radial_bins       = n_radial_bins,
-            n_z_bins            = n_z_bins,
-            water_z_range       = water_z_range,
-            curvature_smoothing = curvature_smoothing,
-            curvature_method    = curvature_method,
-            curvature_wavelength = curvature_wavelength,
-            curvature_surface   = curvature_surface,
-            dt                  = dt,
-            lag_frames          = lag_frames,
-            n_lags              = n_lags,
-            grid_spacing        = grid_spacing,
-            stamp_radius        = stamp_radius,
-            near_n              = near_n,
-            spatial_extent      = spatial_extent,
-            n_depth_bins        = n_depth_bins,
-        )
+        try:
+            results = calculate_selected_slab_profiles(
+                topology            = topol_file,
+                xtc_files           = xtc_files,
+                frame_plan          = frame_plan,
+                permeant_resname    = permeant_resname,
+                needed_groups       = needed,
+                # Unweighted on purpose: the path weight is applied when the
+                # paths are aggregated, so a renormalisation of the weights after
+                # the simulations are extended needs a re-aggregation, not a rerun.
+                # Every accumulator is linear in it (+= w*x, += w), so that is exact.
+                weight              = 1.0,
+                lipid_resnames      = lipid_resnames,
+                slab_width          = slab_width,
+                bilayer_normal      = bilayer_normal,
+                slab_range          = slab_range,
+                chain_bonds         = CHAIN_BONDS,
+                tilt_endpoints      = TILT_ENDPOINTS,
+                phosphorus_name     = phosphorus_name,
+                water_resname       = water_resname,
+                water_oxygen_name   = water_oxygen_name,
+                r_max               = r_max,
+                n_radial_bins       = n_radial_bins,
+                n_z_bins            = n_z_bins,
+                water_z_range       = water_z_range,
+                curvature_smoothing = curvature_smoothing,
+                curvature_method    = curvature_method,
+                curvature_wavelength = curvature_wavelength,
+                curvature_surface   = curvature_surface,
+                dt                  = dt,
+                lag_frames          = lag_frames,
+                n_lags              = n_lags,
+                grid_spacing        = grid_spacing,
+                stamp_radius        = stamp_radius,
+                near_n              = near_n,
+                spatial_extent      = spatial_extent,
+                n_depth_bins        = n_depth_bins,
+            )
+        finally:
+            # Done with this path's xtc files: drop the offset index MDAnalysis
+            # saved next to each of them (see remove_offset_files).
+            remove_offset_files(xtc_files)
 
         tables = {}
         for group, df_tuple in results.items():

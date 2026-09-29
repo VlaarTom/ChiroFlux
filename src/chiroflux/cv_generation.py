@@ -14,7 +14,7 @@ import tomli
 import typer
 
 from . import panels
-from .pathdata import read_traj_plan, traj_plan_segments
+from .pathdata import read_traj_plan, remove_offset_files, traj_plan_segments
 
 # MDAnalysis is a required dependency, but only this module uses it and it costs
 # ~0.5s to import, so it is bound on first use rather than at import time. That
@@ -1590,7 +1590,12 @@ def process_single_path(path_number, overwrite, lambda_A, lambda_B, lambda_minus
                     "refusing to guess the correspondence.")
 
         # ── Exactly the frames traj.txt names, in path order ──────────────────
-        box, small, scalars = gather_path_arrays(plan, path_folder)
+        try:
+            box, small, scalars = gather_path_arrays(plan, path_folder)
+        finally:
+            # Done with this path's xtc files: drop the offset index MDAnalysis
+            # saved next to each of them (see remove_offset_files).
+            remove_offset_files(os.path.join(path_folder, f) for f, _ in plan)
         n_frames = box.shape[0]
 
         lx, ly, lz = box[:, 0], box[:, 1], box[:, 2]

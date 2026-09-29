@@ -22,6 +22,7 @@ stay that way - it is what lets the analyses that need no machine learning
 lightgbm entirely.
 """
 
+import os
 import warnings
 from pathlib import Path
 
@@ -101,6 +102,34 @@ def traj_plan_segments(plan):
         else:
             segments[-1][1].append(frame_index)
     return segments
+
+
+def remove_offset_files(trajectories):
+    """Delete the frame-offset index MDAnalysis leaves next to XTC/TRR files.
+
+    Opening an .xtc/.trr through an MDAnalysis Universe indexes the byte
+    offset of every frame and saves it as ``.<name>_offsets.npz``, plus a
+    ``.<name>_offsets.lock`` that its file lock leaves behind: two hidden
+    files, so two inodes, per trajectory, inside the run's load/ folders.
+    They only speed up the next opening of the same file, so every analysis
+    calls this once it is done with a path's trajectories. Rebuilding the
+    index on a later opening is one quick scan of the frame headers.
+
+    Missing files are fine (another format, or a folder MDAnalysis could not
+    write to). Accepts one path or an iterable of paths.
+    """
+    if isinstance(trajectories, (str, os.PathLike)):
+        trajectories = [trajectories]
+    for traj in {os.fspath(t) for t in trajectories}:
+        head, tail = os.path.split(traj)
+        for ending in ("npz", "lock"):
+            try:
+                os.remove(os.path.join(head, f".{tail}_offsets.{ending}"))
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                warnings.warn(f"could not remove MDAnalysis offset file: {exc}",
+                              stacklevel=2)
 
 
 def _check_overwrite(path, overw):
