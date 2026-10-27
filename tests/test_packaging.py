@@ -48,6 +48,7 @@ def test_documented_entry_points_are_importable():
         ("train_deeptda", "train_deeptda"),
         ("chiral_interface_analysis", "chiral_extract"),
         ("chiral_interface_analysis", "chiral_compare"),
+        ("chiral_plot", "chiral_plot"),
     ]:
         module = import_module(f"chiroflux.{module_name}")
         assert callable(getattr(module, function_name)), function_name
@@ -77,6 +78,7 @@ def test_cli_registry_covers_every_entry_point():
         ("train_deeptda", "train_deeptda"),
         ("chiral_interface_analysis", "chiral_extract"),
         ("chiral_interface_analysis", "chiral_compare"),
+        ("chiral_plot", "chiral_plot"),
     }
 
 
@@ -254,6 +256,7 @@ PANELLED_COMMANDS = [
     ("train_deeptda", "train_deeptda"),
     ("chiral_interface_analysis", "chiral_extract"),
     ("chiral_interface_analysis", "chiral_compare"),
+    ("chiral_plot", "chiral_plot"),
 ]
 
 

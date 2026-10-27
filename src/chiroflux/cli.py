@@ -128,6 +128,11 @@ _COMMANDS = {
         "chiral_compare",
         "L vs D at the lipid stereocentres: ddG, H-bond partners, poses, lifetimes.",
     ),
+    "chiral-plot": _Command(
+        "chiral_plot",
+        "chiral_plot",
+        "Redraw the figures of a chiral-compare result from its tables.",
+    ),
 }
 
 

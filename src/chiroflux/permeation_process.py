@@ -1083,7 +1083,7 @@ def write_stitching(stitched, out_dir, label, overw):
 
     fig.suptitle(f"Stitched histogram — {label}", fontsize=12, color=_INK_SECONDARY)
     fig.tight_layout()
-    fig.savefig(png, dpi=200, facecolor=_SURFACE)
+    fig.savefig(png, dpi=300, facecolor=_SURFACE)
     plt.close(fig)
 
     print(f"  Stitching plot -> {png}")
@@ -1190,7 +1190,7 @@ def permeability_from_retis(prefactor, P_transit):
     Calculates the permeability from RETIS data with the formula:
     P_permeability = xi * Delta z / tau_ref [o^{-'}] * P_A (lambda_B|lambda_A)
 
-    An Ghysels, Sander Roet, Smaneh Davoudi and Titus S. van Erp,
+    An Ghysels, Sander Roet, Samaneh Davoudi and Titus S. van Erp,
     Exact non-Markovian permeability from rare event simulations
     Phys. Rev. Research, 3, 2021, 033068
 
@@ -1241,10 +1241,59 @@ def _plot(z, dg, d_z, resistance, out_path, label, overw,
     fig.suptitle(f"Resistance to permeation — {label}", fontsize=12,
                  color="#444444")
     fig.tight_layout()
-    fig.savefig(out_path, dpi=200)
+    fig.savefig(out_path, dpi=300)
     plt.close(fig)
     print(f"  Profile plot -> {out_path}")
     return cumulative
+
+def _plot_combined(z1, dg1, d_z1, resistance1, label1, z2, dg2, d_z2, resistance2, 
+                   label2, out_path, overw, energy_unit="kJ/mol"
+                   ):
+    _check_overwrite(out_path, overw)
+    fig, axes = plt.subplots(4, 1, figsize=(8, 10), sharex=True,
+                             gridspec_kw={"height_ratios": [1, 1, 1.3, 1]})
+    unit_tex = {"kJ/mol": r"kJ$\,$mol$^{-1}$",
+            "kT": r"$k_\mathrm{B}T$"}.get(energy_unit, energy_unit)
+        
+    colors = {"L": "#2a7fbf", "D": "#d1701f"}
+    for z, dg, d_z, resistance, label in [(z1, dg1, d_z1, resistance1, label1),
+                                        (z2, dg2, d_z2, resistance2, label2)]:
+        color = colors.get(label[0], "#555555")
+        cumulative = np.concatenate(([0.0], np.cumsum(
+            0.5 * (resistance[1:] + resistance[:-1]) * np.diff(z))))
+
+        axes[0].plot(z, dg, color=color, lw=2, label=label)
+        axes[0].set_ylabel(rf"$\Delta G$  ({unit_tex})", fontsize=14)
+        axes[0].axhline(0.0, color="grey", lw=0.8, ls=":")
+        axes[0].legend(frameon=False, fontsize=10, loc="upper left")
+
+        axes[1].plot(z, d_z, color=color, lw=2, label=label)
+        axes[1].set_yscale("log")
+        axes[1].set_ylabel(r"$D$  ($\mathrm{\AA^2\,ps^{-1}}$)", fontsize=14)
+
+        axes[2].plot(z, resistance, color=color, lw=2, label=label)
+        axes[2].set_yscale("log")
+        axes[2].set_ylabel(r"$R = e^{\beta\Delta G}/D$  (ps $\mathrm{\AA^{-2}}$)",
+                        fontsize=12)
+        peak = z[int(np.argmax(resistance))]
+        axes[2].axvline(peak, color="grey", lw=0.8, ls="--")
+        axes[2].annotate(f"peak at {peak:.2f}", (peak, np.nanmax(resistance)),
+                        textcoords="offset points", xytext=(7.5, 12), fontsize=10,
+                        color=color)
+
+        axes[3].plot(z, 100.0 * cumulative / cumulative[-1], color=color, lw=2, label=label)
+        axes[3].set_ylabel("cumulative\nresistance (%)", fontsize=14)
+        axes[3].set_xlabel("position along the order parameter (Å)", fontsize=14)
+        axes[3].tick_params(axis='x', labelsize=16)
+        axes[3].set_ylim(0, 100)
+
+    for ax in axes:
+        ax.spines[["top", "right"]].set_visible(False)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+    print(f"  Profile plot -> {out_path}")
 
 
 def permeation_process(
@@ -1600,3 +1649,40 @@ def permeation_process(
         print("\n[warn] one stage only, so this covers part of the membrane. A "
               "partial integral underestimates 1/P and therefore OVERESTIMATES "
               "P - pass every stage to -runs for a complete number.")
+
+    # If both permeation profiles exist, make a plot combining the two.
+    # Assumes cwd is either L_PRO_(yne_)neutral or D_PRO_(yne_)neutral and 
+    # the other profile is in the simmilar named out_dir.
+    cwd = os.path.basename(os.getcwd())
+    other_dir = None
+    if cwd[:2] in ("L_", "D_"):
+        other_dir = {"L": "D", "D": "L"}[cwd[0]] + cwd[1:]
+        label1, label2 = cwd, other_dir
+    else:
+        print("Warning: the working directory does not start with 'L_' or 'D_'. Skipping combined plot.")
+
+    if other_dir is not None:
+        rel_out = os.path.relpath(out_dir)
+        other_path = os.path.join("..", other_dir, rel_out, "permeation_profile.csv")
+        if rel_out.startswith(".."):
+            print(f"Warning: -out-dir {out_dir} is outside the run directory; "
+                  "cannot find the matching profile of the other enantiomer. Skipping combined plot.")
+        elif not os.path.isfile(other_path):
+            print(f"Warning: The other permeation profile file '{other_path}' does not exist. Skipping combined plot.")
+        else:
+            z2, dg2, d_z2, resistance2, _ = np.loadtxt(other_path, delimiter=",", skiprows=1).T
+            with open(other_path) as fh:
+                other_unit = "kJ/mol" if "kJ_per_mol" in fh.readline() else "kT"
+            if other_unit != energy_unit and temperature is None:
+                print("Warning: the two profiles are in different units and no temperature is known. Skipping combined plot.")
+            else:
+                if other_unit != energy_unit:
+                    # Assumes the other run used the same T as this one.
+                    kt_other = GAS_CONSTANT_KJ * temperature
+                    dg2 = dg2 * kt_other if energy_unit == "kJ/mol" else dg2 / kt_other
+                combined_out_path = os.path.join("..", "combined_permeation_profiles")
+                os.makedirs(combined_out_path, exist_ok=True)
+                combined_png = os.path.join(combined_out_path, f"{cwd[2:]}_permeation_combined.png")
+                _plot_combined(z, dg, d_z, resistance, label1,
+                               z2, dg2, d_z2, resistance2, label2,
+                               combined_png, overw, energy_unit=energy_unit)
