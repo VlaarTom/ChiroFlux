@@ -210,6 +210,7 @@ REF_COL = "OP_Lamb"
 #                     run's OP convention.  None = every overlapping bin.
 # MERGE_MIN_FRAC    : bins below this fraction of a histogram's peak are ignored
 #                     when fitting the "match" factor (they are the noisy tails).
+OTHER_DIR         = None
 OTHER_ML_DIR      = "ML_mda"
 OTHER_WEIGHTS = "path_weights.txt"
 SYMMETRIC_OP      = True
@@ -2224,7 +2225,7 @@ def histograms(
 
     # ── Dataset construction ──────────────────────────────────────────────
     merge_other: Annotated[bool, typer.Option("-merge-other/-no-merge-other", help="Fold a second simulation's histograms into this one.", rich_help_panel=panels.DATASET)] = False,
-    other_dir: Annotated[str, typer.Option("-other-dir", help="The other simulation's root folder (used when -merge-other).", rich_help_panel=panels.DATASET)] = ...,
+    other_dir: Annotated[str, typer.Option("-other-dir", help="The other simulation's root folder (used when -merge-other).", rich_help_panel=panels.DATASET)] = OTHER_DIR,
     other_ml_dir: Annotated[str, typer.Option("-other-ml-dir", help="The other simulation's ML folder (used when -merge-other).", rich_help_panel=panels.DATASET)] = OTHER_ML_DIR,
     other_weights: Annotated[str, typer.Option("-other-weights", help="The other simulation's path_weights file.", rich_help_panel=panels.DATASET)] = OTHER_WEIGHTS,
     correction_apply_to: Annotated[str, typer.Option("-correction-apply-to", help="Which run the escape/entry correction factor multiplies: 'local' or 'other'.", rich_help_panel=panels.DATASET)] = CORRECTION_APPLY_TO,

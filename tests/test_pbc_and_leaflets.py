@@ -687,3 +687,42 @@ class TestSpeciesReadOffTheAllLipidSurface:
                     {"curvature_wavelength": 0.0}):
             with pytest.raises(ValueError, match="-curvature-"):
                 _run(pdb, xtc, {"structural"}, **bad)
+
+
+class TestDepthBinnedDeformationAndWater:
+    """The radial_depth group splits the structural group's radial
+    deformation and water profiles by permeant depth; summed back over depth
+    they must be exactly what the structural group accumulates."""
+
+    def test_summed_over_depth_it_is_the_structural_profile(self,
+                                                            synthetic_membrane):
+        pdb, xtc = synthetic_membrane
+        out = _run(pdb, xtc, {"structural", "radial_depth"},
+                   r_max=12.0, n_radial_bins=4, n_z_bins=8)
+        _thick, deform, water_z = out["structural"]
+        deform_d, water_z_d = out["radial_depth"]
+        assert len(deform_d) == 2                      # n_depth_bins
+        for name in ("def_upper", "def_lower", "water_radial"):
+            for i, rc in enumerate(deform["r_center"]):
+                col = ms.bin_column(name, "r", rc)
+                for part in ("wsum", "wtot"):
+                    np.testing.assert_allclose(
+                        deform_d[f"{col}_{part}"].sum(),
+                        deform[f"{name}_{part}"].iloc[i], rtol=1e-12)
+        for i, zc in enumerate(water_z["z_center"]):
+            col = ms.bin_column("water_z", "z", zc)
+            np.testing.assert_allclose(water_z_d[f"{col}_wsum"].sum(),
+                                       water_z["water_z_wsum"].iloc[i],
+                                       rtol=1e-12)
+
+    def test_it_runs_without_the_structural_group(self, synthetic_membrane):
+        pdb, xtc = synthetic_membrane
+        out = _run(pdb, xtc, {"radial_depth"}, r_max=12.0, n_radial_bins=4,
+                   n_z_bins=8)
+        assert set(out) == {"radial_depth"}
+        deform_d, water_z_d = out["radial_depth"]
+        assert deform_d.columns[0] == water_z_d.columns[0] == "depth_center"
+        # every frame lands in one depth bin, once (the water density is
+        # finite in every frame, unlike a radial bin no phosphate falls in)
+        wtot = water_z_d[[c for c in water_z_d.columns if c.endswith("_wtot")]]
+        np.testing.assert_allclose(wtot.sum(axis=0), 20.0)

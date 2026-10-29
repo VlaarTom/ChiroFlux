@@ -1,6 +1,7 @@
 import os
 
 os.environ["OMP_NUM_THREADS"] = "1"
+import re
 import traceback
 import warnings
 import zipfile
@@ -1846,7 +1847,31 @@ OBSERVABLE_GROUPS = {
     'diffusion'    : ('diff',),
     'diffusion_xy' : ('diff_xy',),
     'spatial'      : ('spatial',),
+    # A group of its own rather than part of 'structural', so that files
+    # written before it existed get only these two tables computed on the
+    # next run, not the thickness and curvature fits again.
+    'radial_depth' : ('deform_depth', 'water_z_depth'),
 }
+
+
+def bin_column(name, axis, center):
+    """Column name of one radial (axis 'r') or z (axis 'z') bin, e.g.
+    'def_upper_r3.00' or 'water_z_z-39.33'.
+
+    The bin centre is in the name, so a per-path table or an aggregate CSV
+    with the permeant depth as its axis still says which radius or height
+    each column is - nothing else has to be kept in step with it.
+    """
+    return f"{name}_{axis}{float(center) + 0.0:.2f}"
+
+
+_BIN_COLUMN = re.compile(r'^(.*)_([rz])(-?\d+\.\d+)$')
+
+
+def split_bin_column(column):
+    """(name, axis, centre) of a bin_column name, or None for any other."""
+    m = _BIN_COLUMN.match(column)
+    return (m.group(1), m.group(2), float(m.group(3))) if m else None
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Per-path output file
@@ -1905,7 +1930,16 @@ OBSERVABLE_GROUPS = {
 #: with a version-3 one mixes two different map origins in the same average.
 PATH_FILE_VERSION = 6
 
-_TABLE_KEYS = ('p2', 'tilt', 'thick', 'deform', 'water_z', 'diff', 'diff_xy')
+#: The tables on the slab, radial or water-z axis that aggregate_all_results
+#: pools and plots.
+_PROFILE_KEYS = ('p2', 'tilt', 'thick', 'deform', 'water_z', 'diff', 'diff_xy')
+
+#: The radial deformation and water profiles per permeant-depth bin: the
+#: axis is the depth, the radius or height is in each column's name (see
+#: bin_column). Pooled by aggregate_radial_depth.
+_DEPTH_BINNED_KEYS = ('deform_depth', 'water_z_depth')
+
+_TABLE_KEYS = _PROFILE_KEYS + _DEPTH_BINNED_KEYS
 
 
 def path_output_file(path_number, out_dir=None):
@@ -2098,6 +2132,83 @@ def read_path_spatial(path):
         }
 
 
+#: What -paths can select, besides 'all'. Read from each path file's metadata,
+#: so choosing a subset re-aggregates but recomputes nothing.
+PATH_CLASSES = ('reactive', 'unreactive', 'minus')
+
+
+def read_path_meta(path):
+    """The scalars the worker stored with the path ({} if there is no file)."""
+    data = _open_current(path)
+    if data is None:
+        return {}
+    with data:
+        return {name.partition('__')[2]: data[name].item()
+                for name in data.files
+                if name.startswith('meta__') and name != 'meta__version'}
+
+
+def path_class_of(meta):
+    """'minus', 'reactive' or 'unreactive' from a path's metadata, else None.
+
+    'reactive' is what get_reactive_paths stored: the path's largest order
+    parameter is beyond lambda_B. A [0-] path never gets there, but counting
+    it as unreactive would mix a different ensemble into that class, so it
+    is a class of its own - the same split chiral-compare makes.
+    """
+    if 'ensemble' not in meta or 'reactive' not in meta:
+        return None
+    if meta['ensemble'] == 'minus':
+        return 'minus'
+    return 'reactive' if bool(meta['reactive']) else 'unreactive'
+
+
+def parse_path_subsets(text):
+    """The -paths selection as a tuple, refusing unknown classes up front."""
+    subsets = tuple(s.strip() for s in text.split(',') if s.strip())
+    valid = ('all',) + PATH_CLASSES
+    bad = [s for s in subsets if s not in valid]
+    if bad or not subsets:
+        raise typer.BadParameter(
+            f"-paths: {', '.join(bad) or repr(text)} is not one of "
+            f"{', '.join(valid)}.")
+    return subsets
+
+
+def select_paths(weights, path_start, path_end, subset, out_dir=None):
+    """`weights` restricted to the paths of one class.
+
+    The aggregation already leaves out every path without a positive weight,
+    so a subset needs no change to it: the paths of the other classes simply
+    have none. 'all' returns the weights unchanged. Paths whose file carries
+    no class (written before the metadata existed) are left out of every
+    subset and counted.
+    """
+    if subset == 'all':
+        return weights
+    kept, unknown = {}, 0
+    total = picked = 0.0
+    for pn in range(path_start, path_end + 1):
+        w = weights.get(pn, 0.0)
+        if not w > 0.0:
+            continue
+        cls = path_class_of(read_path_meta(path_output_file(pn, out_dir)))
+        if cls is None:
+            unknown += 1
+            continue
+        total += w
+        if cls == subset:
+            kept[pn] = w
+            picked += w
+    share = picked / total if total > 0 else 0.0
+    print(f"  [paths] {subset}: {len(kept)} weighted path(s), "
+          f"{100 * share:.2f}% of the classified path weight")
+    if unknown:
+        print(f"  [paths] {unknown} weighted path(s) have no class in their "
+              "file and are left out of every subset.")
+    return kept
+
+
 def _has_near_columns(path, group, near_n):
     """
     Whether an existing file already carries the near-permeant columns for
@@ -2195,6 +2306,7 @@ def calculate_selected_slab_profiles(
     run_diffusion     = 'diffusion'    in needed_groups
     run_diffusion_xy  = 'diffusion_xy' in needed_groups
     run_spatial       = 'spatial'      in needed_groups
+    run_radial_depth  = 'radial_depth' in needed_groups
 
     axis      = {'x': 0, 'y': 1, 'z': 2}[bilayer_normal.lower()]
     normal    = MEMBRANE_NORMAL
@@ -2341,7 +2453,10 @@ def calculate_selected_slab_profiles(
         n_defect_wtot     = np.zeros(n_slabs)
         H_radial_wsum     = np.zeros(n_radial_bins)
         H_radial_wtot     = np.zeros(n_radial_bins)
+        water_z_wsum = np.zeros(n_z_bins)
+        water_z_wtot = np.zeros(n_z_bins)
 
+    if run_structural or run_radial_depth:
         # Fixed, midplane-relative water grid. Previously this opened a
         # second Universe purely to read the first frame's box height and
         # built the grid from it, which made the axis differ between paths
@@ -2351,9 +2466,22 @@ def calculate_selected_slab_profiles(
         z_edges   = np.linspace(float(water_z_range[0]),
                                 float(water_z_range[1]), n_z_bins + 1)
         z_centers = 0.5 * (z_edges[:-1] + z_edges[1:])
-        water_z_wsum = np.zeros(n_z_bins)
-        water_z_wtot = np.zeros(n_z_bins)
         _water_z_range_checked = False
+
+    if run_radial_depth:
+        # The radial deformation and water profiles again, but per permeant-
+        # depth bin (the spatial maps' bins) instead of summed over every
+        # frame. Summed, they mix depths, so two path classes that reach
+        # different depths differ for that reason alone; per bin they can be
+        # compared depth-matched. (n_depth, n_bins) each.
+        _rd_edges, _rd_centers = build_depth_bins(edges, n_depth_bins)
+        _rd_n = len(_rd_centers)
+        rd_wsum = {name: np.zeros((_rd_n, n))
+                   for name, n in (('def_upper', n_radial_bins),
+                                   ('def_lower', n_radial_bins),
+                                   ('water_radial', n_radial_bins),
+                                   ('water_z', n_z_bins))}
+        rd_wtot = {name: np.zeros_like(arr) for name, arr in rd_wsum.items()}
 
     # ── Diffusion accumulators ────────────────────────────────────────────────
     # wsum holds summed squared displacement over 2*n_dim*tau and wtot the
@@ -2808,6 +2936,64 @@ def calculate_selected_slab_profiles(
                                     near_phi_wsum[(N, sp, chain)][slab_idx]   += weight * phi_n
                                     near_phi_wtot[(N, sp, chain)][slab_idx]   += weight
 
+            # ── Deformation and water profiles (STRUCTURAL, RADIAL_DEPTH) ────
+            # Computed once per frame for whichever of the two groups needs
+            # them: the structural group sums them over all frames, the
+            # radial-depth group per permeant-depth bin.
+            if run_structural or run_radial_depth:
+                _, def_u, def_l = radial_deformation_profile(
+                    u,
+                    permeant_resname    = permeant_resname,
+                    lipid_resnames      = lipid_resnames,
+                    phosphorus_name     = phosphorus_name,
+                    bilayer_normal_axis = axis,
+                    r_max               = r_max,
+                    n_bins              = n_radial_bins,
+                )
+
+                # z_edges is handed in, so the returned density is binned on
+                # exactly the grid whose centers are written to the CSV. The
+                # old call let the function build its own per-frame grid and
+                # then discarded the centers it came back with.
+                if not _water_z_range_checked:
+                    _box_z_now = float(u.dimensions[axis])
+                    if (z_edges[-1] - z_edges[0]) > _box_z_now:
+                        print(f"  [worker] WARNING: --water-z-range spans "
+                              f"{z_edges[-1] - z_edges[0]:.1f} Å but the box "
+                              f"is only {_box_z_now:.1f} Å tall; bins beyond "
+                              f"±{_box_z_now / 2:.1f} Å are unreachable after "
+                              f"minimum-image wrapping and will stay empty.")
+                    _water_z_range_checked = True
+
+                _, rad_cnt, _, z_dens, n_def = water_defect_profile(
+                    u,
+                    permeant_resname    = permeant_resname,
+                    lipid_resnames      = lipid_resnames,
+                    phosphorus_name     = phosphorus_name,
+                    water_resname       = water_resname,
+                    water_oxygen_name   = water_oxygen_name,
+                    bilayer_normal_axis = axis,
+                    r_max               = r_max,
+                    n_radial_bins       = n_radial_bins,
+                    z_edges             = z_edges,
+                )
+
+            # ── RADIAL_DEPTH group ────────────────────────────────────────────
+            if run_radial_depth:
+                # Same perm_z and the same bins as the spatial maps, so depth
+                # bin d here is depth bin d there.
+                _rd_idx = int(np.clip(
+                    np.searchsorted(_rd_edges, perm_z, side='right') - 1,
+                    0, _rd_n - 1
+                ))
+                for name, vals in (('def_upper', def_u), ('def_lower', def_l),
+                                   ('water_radial', rad_cnt),
+                                   ('water_z', z_dens)):
+                    vals = np.asarray(vals, dtype=float)
+                    ok = np.isfinite(vals)
+                    rd_wsum[name][_rd_idx][ok] += weight * vals[ok]
+                    rd_wtot[name][_rd_idx][ok] += weight
+
             # ── STRUCTURAL group ──────────────────────────────────────────────
             if run_structural:
                 for sp in _STRUCT_SPECIES:
@@ -2846,16 +3032,8 @@ def calculate_selected_slab_profiles(
                                     near_thick_wsum[(N, sp)][slab_idx] += weight * thick_val_n
                                     near_thick_wtot[(N, sp)][slab_idx] += weight
 
-                # Deformation and water: mixed / whole-bilayer only
-                _, def_u, def_l = radial_deformation_profile(
-                    u,
-                    permeant_resname    = permeant_resname,
-                    lipid_resnames      = lipid_resnames,
-                    phosphorus_name     = phosphorus_name,
-                    bilayer_normal_axis = axis,
-                    r_max               = r_max,
-                    n_bins              = n_radial_bins,
-                )
+                # Deformation and water: mixed / whole-bilayer only, from
+                # the profiles computed above
                 for bi in range(n_radial_bins):
                     if np.isfinite(def_u[bi]):
                         def_upper_wsum[bi] += weight * def_u[bi]
@@ -2864,32 +3042,6 @@ def calculate_selected_slab_profiles(
                         def_lower_wsum[bi] += weight * def_l[bi]
                         def_lower_wtot[bi] += weight
 
-                # z_edges is handed in, so the returned density is binned on
-                # exactly the grid whose centers are written to the CSV. The
-                # old call let the function build its own per-frame grid and
-                # then discarded the centers it came back with.
-                if not _water_z_range_checked:
-                    _box_z_now = float(u.dimensions[axis])
-                    if (z_edges[-1] - z_edges[0]) > _box_z_now:
-                        print(f"  [worker] WARNING: --water-z-range spans "
-                              f"{z_edges[-1] - z_edges[0]:.1f} Å but the box "
-                              f"is only {_box_z_now:.1f} Å tall; bins beyond "
-                              f"±{_box_z_now / 2:.1f} Å are unreachable after "
-                              f"minimum-image wrapping and will stay empty.")
-                    _water_z_range_checked = True
-
-                _, rad_cnt, _, z_dens, n_def = water_defect_profile(
-                    u,
-                    permeant_resname    = permeant_resname,
-                    lipid_resnames      = lipid_resnames,
-                    phosphorus_name     = phosphorus_name,
-                    water_resname       = water_resname,
-                    water_oxygen_name   = water_oxygen_name,
-                    bilayer_normal_axis = axis,
-                    r_max               = r_max,
-                    n_radial_bins       = n_radial_bins,
-                    z_edges             = z_edges,
-                )
                 water_radial_wsum += weight * rad_cnt
                 water_radial_wtot += weight
                 water_z_wsum      += weight * z_dens
@@ -3371,6 +3523,21 @@ def calculate_selected_slab_profiles(
         diff_xy_data['n_windows_wtot'] = nwin_xy_wtot
         output['diffusion_xy'] = (pd.DataFrame(diff_xy_data),)
 
+    if run_radial_depth:
+        deform_d = {'depth_center': _rd_centers}
+        for name in ('def_upper', 'def_lower', 'water_radial'):
+            for bi, rc in enumerate(r_centers):
+                col = bin_column(name, 'r', rc)
+                deform_d[f'{col}_wsum'] = rd_wsum[name][:, bi]
+                deform_d[f'{col}_wtot'] = rd_wtot[name][:, bi]
+        water_d = {'depth_center': _rd_centers}
+        for zi, zc in enumerate(z_centers):
+            col = bin_column('water_z', 'z', zc)
+            water_d[f'{col}_wsum'] = rd_wsum['water_z'][:, zi]
+            water_d[f'{col}_wtot'] = rd_wtot['water_z'][:, zi]
+        output['radial_depth'] = (pd.DataFrame(deform_d),
+                                  pd.DataFrame(water_d))
+
     if run_spatial:
         output['spatial'] = (_spatial_acc, _grid_shape, _x_coords, _y_coords,
                              _depth_edges)
@@ -3387,6 +3554,7 @@ _GROUP_TABLE_KEYS = {
     'structural'   : [(0, 'thick'), (1, 'deform'), (2, 'water_z')],
     'diffusion'    : [(0, 'diff')],
     'diffusion_xy' : [(0, 'diff_xy')],
+    'radial_depth' : [(0, 'deform_depth'), (1, 'water_z_depth')],
 }
 
 
@@ -3905,7 +4073,7 @@ def read_path_axis(path, key):
         return np.asarray(data[name]) if name in data.files else None
 
 
-def _scan_tables(path_start, path_end, weights, kinds=_TABLE_KEYS):
+def _scan_tables(path_start, path_end, weights, kinds=_PROFILE_KEYS):
     """Metadata pass: which paths contribute, on what axis, with what columns.
 
     Reads only each file's column names and axis, never its data, so the
@@ -3976,7 +4144,7 @@ def _stream_tables(path_numbers, kind, weights):
         yield _weighted(tables[kind], weights.get(pn, 0.0))
 
 
-def _collect_tables(path_start, path_end, weights, kinds=_TABLE_KEYS):
+def _collect_tables(path_start, path_end, weights, kinds=_PROFILE_KEYS):
     """Every path's tables with its current weight applied, one open per path.
 
     Returns ({kind: path_numbers}, {kind: DataFrames}); the path numbers are
@@ -4146,7 +4314,7 @@ def aggregate_all_results(path_start, path_end, weights, n_blocks=20,
     _FIT_PREFIX = {'diff': 'D_z', 'diff_xy': 'D_xy'}
     results = {}
     reported = False
-    for kind in _TABLE_KEYS:
+    for kind in _PROFILE_KEYS:
         pn_list, centers, axis_name, ws, wt = scan[kind]
         if not pn_list:
             raise RuntimeError(f"No '{kind}' tables found to aggregate.")
@@ -4172,6 +4340,28 @@ def aggregate_all_results(path_start, path_end, weights, n_blocks=20,
     return (results['p2'], results['tilt'], results['thick'],
             results['deform'], results['water_z'], results['diff'],
             results['diff_xy'])
+
+
+def aggregate_radial_depth(path_start, path_end, weights, n_blocks=20):
+    """The depth-binned deformation and water tables, pooled like the profiles.
+
+    Returns {kind: DataFrame} for whichever of the two tables some weighted
+    path holds - possibly neither, for files written before the radial_depth
+    group existed. Every column gets the same _wtot/_neff/_err companions as
+    the profiles, so depth_binned_matrix can mask and band them.
+    """
+    scan = _scan_tables(path_start, path_end, weights, kinds=_DEPTH_BINNED_KEYS)
+    out = {}
+    for kind in _DEPTH_BINNED_KEYS:
+        pn_list, centers, axis_name, ws, wt = scan[kind]
+        if not pn_list:
+            continue
+        out[kind] = _pool_streamed(
+            lambda pl=pn_list, k=kind: _stream_tables(pl, k, weights),
+            len(pn_list), centers, axis_name, ws, wt,
+            path_numbers=pn_list, n_blocks=n_blocks,
+        )
+    return out
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -4682,6 +4872,73 @@ def plot_diffusion_xy_profile(diff_xy_agg, min_neff=MIN_NEFF, output_path=None):
     )
 
 
+#: (table, profile, colour-bar label, x label, colour map) of the
+#: depth-binned deformation and water figures.
+DEPTH_BINNED_PLOTS = (
+    ('deform_depth', 'def_upper', 'Upper-leaflet P z-deformation (Å)',
+     'Lateral distance from permeant (Å)', 'RdBu_r'),
+    ('deform_depth', 'def_lower', 'Lower-leaflet P z-deformation (Å)',
+     'Lateral distance from permeant (Å)', 'RdBu_r'),
+    ('deform_depth', 'water_radial', 'Core water density (Å⁻²)',
+     'Lateral distance from permeant (Å)', 'viridis'),
+    ('water_z_depth', 'water_z', 'Water density (Å⁻³)',
+     'z − bilayer midplane (Å)', 'viridis'),
+)
+
+
+def depth_binned_matrix(df, name, suffix=''):
+    """One profile of a depth-binned table as a (n_depth, n_bins) array.
+
+    Returns (bin centres, columns, values): the columns of `name` sorted by
+    the radius or height in their names, and df[column + suffix] for each,
+    so suffix '_neff' or '_err' gives the companion of the same layout.
+    """
+    found = sorted((parts[2], col) for col in df.columns
+                   for parts in [split_bin_column(col)]
+                   if parts and parts[0] == name)
+    centers = np.array([c for c, _ in found])
+    columns = [col for _, col in found]
+    if not columns:
+        return centers, columns, np.empty((len(df), 0))
+    values = np.column_stack([df[col + suffix].to_numpy(dtype=float)
+                              for col in columns])
+    return centers, columns, values
+
+
+def plot_depth_binned(agg, name, label, xlabel, cmap='viridis',
+                      min_neff=MIN_NEFF, output_path=None):
+    """A radial or water-z profile against the permeant depth, as a heat map.
+
+    Cells resting on fewer than `min_neff` effective paths are left blank,
+    as the 1-D profiles blank their bins.
+    """
+    x, _, vals = depth_binned_matrix(agg, name)
+    if vals.size == 0:
+        return None
+    _, _, neff = depth_binned_matrix(agg, name, '_neff')
+    if min_neff and min_neff > 0:
+        vals = np.where(neff < min_neff, np.nan, vals)
+    depth = agg.iloc[:, 0].to_numpy(dtype=float)
+
+    vmin = vmax = None
+    finite = np.abs(vals[np.isfinite(vals)])
+    if cmap == 'RdBu_r' and finite.size:
+        vmax = float(np.percentile(finite, 98))
+        vmin = -vmax
+    fig, ax = plt.subplots(figsize=(8, 5))
+    im = ax.pcolormesh(x, depth, np.ma.masked_invalid(vals), cmap=cmap,
+                       vmin=vmin, vmax=vmax, shading='nearest')
+    ax.set_xlabel(xlabel, fontsize=13)
+    ax.set_ylabel('Permeant z-displacement (Å)', fontsize=13)
+    fig.colorbar(im, ax=ax, label=label)
+    plt.tight_layout()
+    if output_path:
+        plt.savefig(output_path, dpi=300)
+    else:
+        plt.show()
+    return fig
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Spatial map plotting helpers  (leaflet-aware)
 # ═════════════════════════════════════════════════════════════════════════════
@@ -5016,6 +5273,159 @@ def plot_spatial_overview(
 # CLI entry point
 # ═════════════════════════════════════════════════════════════════════════════
 
+def _aggregate_and_plot(args, end, weights, plot_out, leaflets,
+                        lipid_species):
+    """Aggregate the paths that carry a weight in `weights` and plot them.
+
+    `weights` is already restricted to one path class (see select_paths);
+    the pooling leaves out every path without a positive weight, so the
+    same code serves all paths and any subset of them.
+    """
+    os.makedirs(plot_out, exist_ok=True)
+    print("Aggregating results...")
+
+    p2_agg, tilt_agg, thick_agg, deform_agg, water_z_agg, diff_agg, \
+        diff_xy_agg = aggregate_all_results(args.start, end, weights,
+                                            n_blocks=args.n_blocks,
+                                            fit_lags=args.fit_lags)
+
+    for agg, name in (
+        (p2_agg,       "p2_aggregate.csv"),
+        (tilt_agg,     "tilt_aggregate.csv"),
+        (thick_agg,    "thickness_aggregate.csv"),
+        (deform_agg,   "deformation_aggregate.csv"),
+        (water_z_agg,  "water_z_aggregate.csv"),
+        (diff_agg,     "diffusion_aggregate.csv"),
+        (diff_xy_agg,  "diffusion_xy_aggregate.csv"),
+    ):
+        agg.to_csv(os.path.join(plot_out, name),
+                   index=False, float_format='%.6e')
+        print(f"  -> {name}")
+
+    min_neff = args.min_neff
+    for chain in CHAIN_BONDS:
+        plot_p2_profile(
+            p2_agg, chain=chain,
+            lipid_species=lipid_species, leaflets=leaflets, min_neff=min_neff,
+            output_path=os.path.join(plot_out, f"p2_{chain}.png"))
+    plot_tilt_profile(
+        tilt_agg, lipid_species=lipid_species, leaflets=leaflets,
+        min_neff=min_neff,
+        output_path=os.path.join(plot_out, "tilt_angles.png"))
+    plot_thickness_profile(
+        thick_agg, lipid_species=lipid_species, leaflets=leaflets,
+        min_neff=min_neff,
+        output_path=os.path.join(plot_out, "thickness.png"))
+    plot_deformation_profile(
+        deform_agg, min_neff=min_neff,
+        output_path=os.path.join(plot_out, "deformation.png"))
+    plot_water_defect(
+        deform_agg, water_z_agg, min_neff=min_neff,
+        output_path=os.path.join(plot_out, "water_defect.png"))
+    plot_curvature_profile(
+        thick_agg, deform_agg, lipid_species=lipid_species, min_neff=min_neff,
+        output_path=os.path.join(plot_out, "curvature.png"))
+
+    if args.near_n:
+        near_n = tuple(args.near_n)
+        for chain in CHAIN_BONDS:
+            plot_near_vs_bulk_p2(
+                p2_agg, chain=chain, near_n=near_n, min_neff=min_neff,
+                output_path=os.path.join(plot_out, f"near_vs_bulk_p2_{chain}.png"))
+            plot_near_vs_bulk_tilt(
+                tilt_agg, chain=chain, near_n=near_n, min_neff=min_neff,
+                output_path=os.path.join(plot_out, f"near_vs_bulk_tilt_{chain}.png"))
+        plot_near_vs_bulk_thickness(
+            thick_agg, near_n=near_n, min_neff=min_neff,
+            output_path=os.path.join(plot_out, "near_vs_bulk_thickness.png"))
+        plot_near_vs_bulk_curvature(
+            thick_agg, near_n=near_n, min_neff=min_neff,
+            output_path=os.path.join(plot_out, "near_vs_bulk_curvature.png"))
+
+    plot_diffusion_profile(
+        diff_agg, min_neff=min_neff,
+        output_path=os.path.join(plot_out, "diffusion.png"))
+    plot_diffusion_xy_profile(
+        diff_xy_agg, min_neff=min_neff,
+        output_path=os.path.join(plot_out, "diffusion_xy.png"))
+
+    depth_binned = aggregate_radial_depth(args.start, end, weights,
+                                          n_blocks=args.n_blocks)
+    if not depth_binned:
+        print("  [radial-depth] no path holds the depth-binned deformation "
+              "and water tables yet")
+    for kind, agg in depth_binned.items():
+        agg.to_csv(os.path.join(plot_out, f"{kind}_aggregate.csv"),
+                   index=False, float_format='%.6e')
+        print(f"  -> {kind}_aggregate.csv")
+    for kind, name, label, xlabel, cmap in DEPTH_BINNED_PLOTS:
+        if kind in depth_binned:
+            plot_depth_binned(
+                depth_binned[kind], name, label, xlabel, cmap,
+                min_neff=min_neff,
+                output_path=os.path.join(plot_out, f"{name}_vs_depth.png"))
+
+    # Spatial maps
+    print("Aggregating spatial maps...")
+    try:
+        sp_agg, sp_x, sp_y, sp_shape, sp_depth = aggregate_spatial_maps(
+            args.start, end, weights
+        )
+        agg_npz = os.path.join(plot_out, "spatial_aggregate.npz")
+        save_spatial_maps(sp_agg, sp_shape, sp_x, sp_y, sp_depth, agg_npz)
+        print("  -> spatial_aggregate.npz")
+
+        # 'occupancy' is the historical depth-integrated view; 'uniform'
+        # strips out how long the permeant lingered at each depth, which
+        # is what makes maps comparable between simulations.
+        depth_w = (None if args.spatial_depth_weighting == 'occupancy'
+                   else 'uniform')
+        ov_sfx  = '' if depth_w is None else f'_{depth_w}'
+
+        plot_all_spatial_maps(
+            agg_npz,
+            chain_bonds   = CHAIN_BONDS,
+            lipid_species = lipid_species,
+            leaflets      = leaflets,
+            output_dir    = plot_out,
+            plot_bonds    = args.plot_bonds,
+            depth_weights = depth_w,
+        )
+
+        for chain in CHAIN_BONDS:
+            plot_spatial_overview(
+                agg_npz,
+                chain         = chain,
+                lipid_species = lipid_species,
+                leaflets      = leaflets,
+                depth_weights = depth_w,
+                output_path   = os.path.join(
+                    plot_out, f"spatial_overview_{chain}{ov_sfx}.png"
+                ),
+            )
+
+        if args.spatial_depth_plots:
+            sp_maps = SpatialMaps(agg_npz)
+            for d in range(sp_maps.n_depth):
+                lo, hi = sp_maps.depth_edges[d], sp_maps.depth_edges[d + 1]
+                for chain in CHAIN_BONDS:
+                    plot_spatial_overview(
+                        agg_npz,
+                        chain         = chain,
+                        lipid_species = lipid_species,
+                        leaflets      = leaflets,
+                        depth         = d,
+                        output_path   = os.path.join(
+                            plot_out,
+                            f"spatial_overview_{chain}_zbin{d}.png"
+                        ),
+                    )
+                print(f"  -> depth bin {d}: z {lo:.1f}…{hi:.1f} Å")
+
+    except RuntimeError as exc:
+        print(f"  [spatial] Skipping spatial plots: {exc}")
+
+
 def membrane_spatial(
     # ── Input data ────────────────────────────────────────────
     weights: Annotated[str, typer.Option("-weights", "--weights", help="WHAM path weights, applied when the paths are aggregated (-plot). Computing the per-path files does not need them: those store unweighted sums, so after the weights change a rerun with -plot re-aggregates without recomputing any path", rich_help_panel=panels.INPUT)] = 'path_weights.txt',
@@ -5026,6 +5436,7 @@ def membrane_spatial(
     # ── Dataset construction ──────────────────────────────────
     start: Annotated[int, typer.Option("-start", "--start", help="", rich_help_panel=panels.DATASET)] = ...,
     end: Annotated[Optional[int], typer.Option("-end", "--end", help="", rich_help_panel=panels.DATASET)] = None,
+    paths_opt: Annotated[str, typer.Option("-paths", "--paths", help="Comma-separated path classes to aggregate and plot with -plot, each on its own: all, reactive, unreactive, minus. 'all' writes to the usual folder, a class to a subfolder of it named after the class. The class is read from each path file's metadata ([0-] paths are 'minus', never 'unreactive'), so choosing one re-aggregates and recomputes nothing. To test a difference between two classes, use membrane-compare.", rich_help_panel=panels.DATASET)] = "all",
     lag_frames: Annotated[int, typer.Option("-lag-frames", "--lag-frames", help="Base lag in frames for the local diffusion estimate, D = <dz^2>/(2 tau) over the windows starting in each slab. The scan runs at 1..N times this, so 1 is almost always right; raise it only if consecutive frames are so close together that even the longest lag in the scan is still pre-diffusive.", rich_help_panel=panels.DATASET)] = 1,
     fit_lags: Annotated[Optional[str], typer.Option("-fit-lags", "--fit-lags", help="Which of the scanned lags the D_z_fit / D_xy_fit extrapolation uses: a range '2-6', an open range '3-', or a list '1,3,5'. Default is all of them. This is an aggregation-time choice, so changing it re-aggregates but does not recompute. Narrow the top end where <obs>_fit_resid is large at steep D gradients (long windows straddling them smear the contrast); raise the bottom end where the residual is large even in flat regions (the shortest lags are not yet diffusive).", rich_help_panel=panels.DATASET)] = None,
     n_lags: Annotated[int, typer.Option("-n-lags", "--n-lags", help="How many lags to scan, k = 1..N times -lag-frames. D_app(tau) equals D only inside the diffusive window, so instead of trusting one lag the aggregate fits MSD = c + 2nD*tau across the scan and reports the slope as D_z_fit / D_xy_fit; the intercept c absorbs cage rattling. Per-lag values stay available as D_z, D_z_lag2, D_z_lag3 ... The upper lag must still keep sqrt(2 D tau) below the slab width, so more is not always better. 2 reduces the fit to the old two-point check.", rich_help_panel=panels.DATASET)] = 6,
@@ -5068,6 +5479,8 @@ def membrane_spatial(
     # `--near-n` with no values did
     near_n_opt = _split_values(near_n_opt, "-near-n", int, None) if near_n_opt.strip() else []
     leaflets_opt = _split_values(leaflets_opt, "-leaflets", str, None)
+    # checked before the per-path pass, which can take hours
+    subsets = parse_path_subsets(paths_opt)
     # These were module-level assignments in the original __main__ block, so
     # helper functions below still read them as globals. Declaring them here
     # keeps that working now that the block lives inside a function.
@@ -5153,131 +5566,14 @@ def membrane_spatial(
     )
 
     if args.plot:
-        os.makedirs(PLOT_OUT, exist_ok=True)
-        print("Aggregating results...")
-        weights = load_path_weights(args.weights)
-
-        p2_agg, tilt_agg, thick_agg, deform_agg, water_z_agg, diff_agg, \
-            diff_xy_agg = aggregate_all_results(args.start, end, weights,
-                                                n_blocks=args.n_blocks,
-                                                fit_lags=args.fit_lags)
-
-        for agg, name in (
-            (p2_agg,       "p2_aggregate.csv"),
-            (tilt_agg,     "tilt_aggregate.csv"),
-            (thick_agg,    "thickness_aggregate.csv"),
-            (deform_agg,   "deformation_aggregate.csv"),
-            (water_z_agg,  "water_z_aggregate.csv"),
-            (diff_agg,     "diffusion_aggregate.csv"),
-            (diff_xy_agg,  "diffusion_xy_aggregate.csv"),
-        ):
-            agg.to_csv(os.path.join(PLOT_OUT, name),
-                       index=False, float_format='%.6e')
-            print(f"  -> {name}")
-
-        min_neff = args.min_neff
-        for chain in CHAIN_BONDS:
-            plot_p2_profile(
-                p2_agg, chain=chain,
-                lipid_species=_species, leaflets=leaflets, min_neff=min_neff,
-                output_path=os.path.join(PLOT_OUT, f"p2_{chain}.png"))
-        plot_tilt_profile(
-            tilt_agg, lipid_species=_species, leaflets=leaflets,
-            min_neff=min_neff,
-            output_path=os.path.join(PLOT_OUT, "tilt_angles.png"))
-        plot_thickness_profile(
-            thick_agg, lipid_species=_species, leaflets=leaflets,
-            min_neff=min_neff,
-            output_path=os.path.join(PLOT_OUT, "thickness.png"))
-        plot_deformation_profile(
-            deform_agg, min_neff=min_neff,
-            output_path=os.path.join(PLOT_OUT, "deformation.png"))
-        plot_water_defect(
-            deform_agg, water_z_agg, min_neff=min_neff,
-            output_path=os.path.join(PLOT_OUT, "water_defect.png"))
-        plot_curvature_profile(
-            thick_agg, deform_agg, lipid_species=_species, min_neff=min_neff,
-            output_path=os.path.join(PLOT_OUT, "curvature.png"))
-
-        if args.near_n:
-            near_n = tuple(args.near_n)
-            for chain in CHAIN_BONDS:
-                plot_near_vs_bulk_p2(
-                    p2_agg, chain=chain, near_n=near_n, min_neff=min_neff,
-                    output_path=os.path.join(PLOT_OUT, f"near_vs_bulk_p2_{chain}.png"))
-                plot_near_vs_bulk_tilt(
-                    tilt_agg, chain=chain, near_n=near_n, min_neff=min_neff,
-                    output_path=os.path.join(PLOT_OUT, f"near_vs_bulk_tilt_{chain}.png"))
-            plot_near_vs_bulk_thickness(
-                thick_agg, near_n=near_n, min_neff=min_neff,
-                output_path=os.path.join(PLOT_OUT, "near_vs_bulk_thickness.png"))
-            plot_near_vs_bulk_curvature(
-                thick_agg, near_n=near_n, min_neff=min_neff,
-                output_path=os.path.join(PLOT_OUT, "near_vs_bulk_curvature.png"))
-
-        plot_diffusion_profile(
-            diff_agg, min_neff=min_neff,
-            output_path=os.path.join(PLOT_OUT, "diffusion.png"))
-        plot_diffusion_xy_profile(
-            diff_xy_agg, min_neff=min_neff,
-            output_path=os.path.join(PLOT_OUT, "diffusion_xy.png"))
-
-        # Spatial maps
-        print("Aggregating spatial maps...")
-        try:
-            sp_agg, sp_x, sp_y, sp_shape, sp_depth = aggregate_spatial_maps(
-                args.start, end, weights
-            )
-            agg_npz = os.path.join(PLOT_OUT, "spatial_aggregate.npz")
-            save_spatial_maps(sp_agg, sp_shape, sp_x, sp_y, sp_depth, agg_npz)
-            print("  -> spatial_aggregate.npz")
-
-            # 'occupancy' is the historical depth-integrated view; 'uniform'
-            # strips out how long the permeant lingered at each depth, which
-            # is what makes maps comparable between simulations.
-            depth_w = (None if args.spatial_depth_weighting == 'occupancy'
-                       else 'uniform')
-            ov_sfx  = '' if depth_w is None else f'_{depth_w}'
-
-            plot_all_spatial_maps(
-                agg_npz,
-                chain_bonds   = CHAIN_BONDS,
-                lipid_species = _species,
-                leaflets      = leaflets,
-                output_dir    = PLOT_OUT,
-                plot_bonds    = args.plot_bonds,
-                depth_weights = depth_w,
-            )
-
-            for chain in CHAIN_BONDS:
-                plot_spatial_overview(
-                    agg_npz,
-                    chain         = chain,
-                    lipid_species = _species,
-                    leaflets      = leaflets,
-                    depth_weights = depth_w,
-                    output_path   = os.path.join(
-                        PLOT_OUT, f"spatial_overview_{chain}{ov_sfx}.png"
-                    ),
-                )
-
-            if args.spatial_depth_plots:
-                sp_maps = SpatialMaps(agg_npz)
-                for d in range(sp_maps.n_depth):
-                    lo, hi = sp_maps.depth_edges[d], sp_maps.depth_edges[d + 1]
-                    for chain in CHAIN_BONDS:
-                        plot_spatial_overview(
-                            agg_npz,
-                            chain         = chain,
-                            lipid_species = _species,
-                            leaflets      = leaflets,
-                            depth         = d,
-                            output_path   = os.path.join(
-                                PLOT_OUT,
-                                f"spatial_overview_{chain}_zbin{d}.png"
-                            ),
-                        )
-                    print(f"  -> depth bin {d}: z {lo:.1f}…{hi:.1f} Å")
-
-        except RuntimeError as exc:
-            print(f"  [spatial] Skipping spatial plots: {exc}")
+        all_weights = load_path_weights(args.weights)
+        for subset in subsets:
+            plot_out = (PLOT_OUT if subset == 'all'
+                        else os.path.join(PLOT_OUT, subset))
+            print(f"\n══ {subset} paths -> {plot_out} ══")
+            weights = select_paths(all_weights, args.start, end, subset)
+            if not weights:
+                print(f"  no weighted {subset} paths; nothing to aggregate")
+                continue
+            _aggregate_and_plot(args, end, weights, plot_out, leaflets,
+                                _species)

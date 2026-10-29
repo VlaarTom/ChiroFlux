@@ -31,7 +31,8 @@ from chiroflux.membrane_spatial import (
     write_path_output,
 )
 
-ALL_TABLES = ("p2", "tilt", "thick", "deform", "water_z", "diff", "diff_xy")
+ALL_TABLES = ("p2", "tilt", "thick", "deform", "water_z", "diff", "diff_xy",
+              "deform_depth", "water_z_depth")
 
 
 def _table(axis_name, n_rows, columns, rng, scale=1.0):
@@ -52,6 +53,10 @@ def _all_tables(rng, n_slabs=8):
         "water_z": _table("z_center", 6, ["water_z_wsum", "water_z_wtot"], rng),
         "diff":    _table("slab_center", n_slabs, ["D_z_wsum", "D_z_wtot"], rng),
         "diff_xy": _table("slab_center", n_slabs, ["D_xy_wsum", "D_xy_wtot"], rng),
+        "deform_depth": _table("depth_center", 3, ["def_upper_r1.00_wsum",
+                                                   "def_upper_r1.00_wtot"], rng),
+        "water_z_depth": _table("depth_center", 3, ["water_z_z-1.50_wsum",
+                                                    "water_z_z-1.50_wtot"], rng),
     }
 
 
@@ -222,7 +227,19 @@ class TestNeededGroups:
         write_path_output(path, tables={k: tables[k] for k in
                                         ("p2", "tilt", "thick", "deform", "water_z")})
         assert _needed_groups(path, overwrite=False) == \
-            {"diffusion", "diffusion_xy", "spatial"}
+            {"diffusion", "diffusion_xy", "spatial", "radial_depth"}
+
+    def test_a_file_from_before_the_depth_binned_tables_needs_only_those(
+            self, tmp_path):
+        """Not the thickness and curvature fits again: that is why the
+        depth-binned deformation and water are a group of their own."""
+        rng = np.random.default_rng(16)
+        tables = _all_tables(rng)
+        path = tmp_path / "1.npz"
+        write_path_output(path, tables={k: v for k, v in tables.items()
+                                        if k not in ms._DEPTH_BINNED_KEYS},
+                          spatial=_spatial(rng))
+        assert _needed_groups(path, overwrite=False) == {"radial_depth"}
 
     def test_a_group_with_one_of_its_tables_missing_is_needed(self, tmp_path):
         rng = np.random.default_rng(13)

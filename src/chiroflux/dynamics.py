@@ -62,6 +62,17 @@ expectation, but ``specE`` is measured through a Hann taper that weights the
 middle of the window, so on a single short, strongly correlated segment it is
 the *noisier* of the two estimates of the same quantity - which is the point.
 
+Anchoring. By default each window sits on the path's first crossing of an
+interface, which compares reactive and non-reactive paths at the same depth.
+``-align event`` anchors on the outcome instead: a reactive path on its first
+crossing of ``-event-op`` (the centre crossing, or lambda_B), a non-reactive
+path on its turning point, the frame of its largest order parameter. That is
+the comparison "what did the membrane do as the permeant got through, versus
+as it was turned back", and ``event_traces.png`` shows the class-averaged CVs
+lined up on that frame. The two events need not lie at the same depth - most
+non-reactive paths turn back early - so ``-event-min-op`` keeps only the
+non-reactive paths that turned back at or beyond a given depth.
+
 Note on leakage: ``-window-mode centered`` includes frames *after* the crossing,
 which are part of the path's future and therefore partly encode the
 reactive/non-reactive label. That is fine when the features are read as a
@@ -92,6 +103,7 @@ from .pathdata import (
     _first_crossing_idx,
     _load_path_table,
     _load_trajectory,
+    _read_path_header,
 )
 from .plotting import (
     _fig_inches,
@@ -272,6 +284,33 @@ def _window_bounds(crossing, n_frames, width, mode, min_frames):
     return (lo, hi) if (hi - lo) >= min_frames else None
 
 
+ALIGN_MODES = ("interface", "event")
+
+
+def _event_anchor(op_vals, reactive, event_op, event_min_op=None):
+    """Frame of a path's outcome event, or None.
+
+    Reactive: the first frame at or beyond `event_op`. Non-reactive: the
+    turning point, i.e. the (first) frame of largest order parameter - or
+    None when that lies short of `event_min_op`, so a comparison can be
+    restricted to paths that were turned back at a comparable depth.
+    """
+    if reactive:
+        return _first_crossing_idx(op_vals, event_op)
+    turn = int(np.argmax(op_vals))
+    if event_min_op is not None and op_vals[turn] < event_min_op:
+        return None
+    return turn
+
+
+def _anchor_frames(op_vals, interfaces, align, reactive=None, event_op=None,
+                   event_min_op=None):
+    """Anchor frame per window slot: one per interface, or the single event."""
+    if align == "interface":
+        return [_first_crossing_idx(op_vals, lam) for lam in interfaces]
+    return [_event_anchor(op_vals, reactive, event_op, event_min_op)]
+
+
 def _feature_names(cv_names, kinds):
     """Flat feature names, CV-major so a CV's kinds stay adjacent."""
     return [f"{cv}_{kind}" for cv in cv_names for kind in kinds]
@@ -300,6 +339,9 @@ def _extract_dynamical_features(
     sym_angle_cols=None,
     encoding="utf-8",
     exclude=None,
+    align="interface",
+    event_op=None,
+    event_min_op=None,
 ):
     """Compute per-path, per-CV, per-interface window features in one pass.
 
@@ -307,18 +349,24 @@ def _extract_dynamical_features(
     ~20 interfaces x ~100 frames a stored window array runs to terabytes, so
     each window is reduced to its features as soon as it is read.
 
+    With `align` "event" the interface axis has length 1 and holds the window
+    around each path's outcome event (see `_event_anchor`).
+
     Returns
     -------
-    feats      : (N_paths, N_cvs * len(kinds), N_interfaces) float64, NaN where
+    feats      : (N_paths, N_cvs * len(kinds), N_anchors) float64, NaN where
                  the path supplied no acceptable window.
     feat_names : flat feature names matching axis 1.
     cv_names   : the CV names behind them (with angle renames applied).
-    n_windows  : (N_interfaces,) count of paths that contributed a window.
+    n_windows  : (N_anchors,) count of paths that contributed a window.
+    anchor_op  : (N_paths, N_anchors) order parameter at the anchor frame,
+                 NaN where the path has no anchor there. Whether that anchor
+                 also got a window is in `n_windows`/`feats`.
     """
     cv_dir = Path(cv_dir)
     width = 2 * half_window + 1
     n_paths = len(pnr_expected)
-    n_int = len(interfaces)
+    n_int = len(interfaces) if align == "interface" else 1
 
     cv_names, op_idx, cv_idxs = _discover_columns(
         cv_dir, pnr_expected, op_col, cv_cols, encoding, exclude=exclude
@@ -343,6 +391,7 @@ def _extract_dynamical_features(
     want_spec = any(k in SPEC_KINDS for k in kinds)
     feats = np.full((n_paths, n_cvs * n_kinds, n_int), np.nan, dtype=np.float64)
     n_windows = np.zeros(n_int, dtype=int)
+    anchor_op = np.full((n_paths, n_int), np.nan)
 
     missing = 0
     for row_j, pnr in enumerate(pnr_expected):
@@ -362,11 +411,14 @@ def _extract_dynamical_features(
 
         op_vals = frames[:, op_idx]
         n_frames = len(op_vals)
+        reactive = _read_path_header(fpath, encoding)[0] if align == "event" else None
+        anchors = _anchor_frames(op_vals, interfaces, align, reactive,
+                                 event_op, event_min_op)
 
-        for alpha in range(n_int):
-            crossing = _first_crossing_idx(op_vals, interfaces[alpha])
+        for alpha, crossing in enumerate(anchors):
             if crossing is None:
                 continue
+            anchor_op[row_j, alpha] = op_vals[crossing]
             bounds = _window_bounds(crossing, n_frames, width, window_mode, min_frames)
             if bounds is None:
                 continue
@@ -406,7 +458,8 @@ def _extract_dynamical_features(
     if missing:
         print(f"  [warn] {missing}/{n_paths} trajectory files not found in {cv_dir}.")
 
-    return feats, _feature_names(display_names, kinds), display_names, n_windows
+    return (feats, _feature_names(display_names, kinds), display_names,
+            n_windows, anchor_op)
 
 
 # ---------------------------------------------------------------------------
@@ -508,6 +561,7 @@ def _pairwise_lag_matrices(
     cv_dir, pnr_expected, interfaces, op_col, sel_cv_cols, labels, weights,
     half_window, window_mode, min_frames, max_lag, dt,
     angle_cols=None, sym_angle_cols=None, encoding="utf-8",
+    align="interface", event_op=None, event_min_op=None,
 ):
     """Class-resolved pairwise lead/lag between a small set of CVs.
 
@@ -522,7 +576,7 @@ def _pairwise_lag_matrices(
     """
     cv_dir = Path(cv_dir)
     width = 2 * half_window + 1
-    n_int = len(interfaces)
+    n_int = len(interfaces) if align == "interface" else 1
 
     cv_names, op_idx, cv_idxs = _discover_columns(
         cv_dir, pnr_expected, op_col, list(sel_cv_cols), encoding, exclude=None
@@ -560,8 +614,9 @@ def _pairwise_lag_matrices(
             continue
 
         op_vals = frames[:, op_idx]
-        for alpha in range(n_int):
-            crossing = _first_crossing_idx(op_vals, interfaces[alpha])
+        anchors = _anchor_frames(op_vals, interfaces, align, bool(cls),
+                                 event_op, event_min_op)
+        for alpha, crossing in enumerate(anchors):
             if crossing is None:
                 continue
             bounds = _window_bounds(crossing, len(op_vals), width, window_mode, min_frames)
@@ -594,6 +649,186 @@ def _pairwise_lag_matrices(
     with np.errstate(invalid="ignore", divide="ignore"):
         means = np.where(wtot > 0, wsum / np.where(wtot > 0, wtot, 1.0), np.nan)
     return means[1] - means[0], display
+
+
+# ---------------------------------------------------------------------------
+# Event-aligned traces (-align event)
+# ---------------------------------------------------------------------------
+
+def _print_event_summary(anchor_op, feats_event, labels):
+    """How many paths of each class got an event window, and at what depth.
+
+    The two events are defined differently, so whether they sit at a
+    comparable order parameter is not guaranteed and has to be looked at:
+    a large gap means the class difference partly reflects depth.
+    """
+    has_window = np.any(np.isfinite(feats_event), axis=1)
+    for cls, name in ((1, "reactive"), (0, "non-reactive")):
+        in_cls = labels == cls
+        anchored = in_cls & np.isfinite(anchor_op)
+        used = anchored & has_window
+        line = (f"  {name:>12}: {int(in_cls.sum())} paths, {int(anchored.sum())} "
+                f"with an event, {int(used.sum())} with a full window")
+        if used.any():
+            q10, q50, q90 = np.percentile(anchor_op[used], [10, 50, 90])
+            line += f"; event OP median {q50:.3g} (10-90%: {q10:.3g} .. {q90:.3g})"
+        print(line)
+    if np.any((labels == 1) & np.isfinite(anchor_op) & ~has_window):
+        print("  NOTE: reactive paths that reached the event but supplied no window\n"
+              "        usually end too soon after it for a centered window; use\n"
+              "        -window-mode pre or a lower -event-op.")
+
+
+def _trace_offsets(half_window, window_mode):
+    """Frame offsets from the anchor that a window can cover."""
+    width = 2 * half_window + 1
+    if window_mode == "centered":
+        return np.arange(-half_window, half_window + 1)
+    return np.arange(-(width - 1), 1)
+
+
+def _event_traces(
+    cv_dir, pnr_expected, op_col, sel_cv_cols, labels, weights,
+    half_window, window_mode, min_frames, event_op, event_min_op,
+    angle_cols=None, sym_angle_cols=None, encoding="utf-8",
+):
+    """Weighted mean of each CV against time from the outcome event, per class.
+
+    Each path contributes its window around `_event_anchor`, placed on a
+    common offset axis, so the curves show what the CVs did in the run-up to
+    (and with a centered window, after) the permeant getting through or being
+    turned back. The order parameter itself is always the first trace: it
+    shows what the alignment did.
+
+    Every offset is its own weighted mean, so clipped windows (-min-frames)
+    contribute where they have frames. The error is the weighted standard
+    deviation over sqrt(Kish n_eff), which treats paths as independent - the
+    same assumption every per-interface effect size here makes.
+
+    Returns
+    -------
+    offsets : (T,) frame offsets from the event.
+    names   : trace names, `op_col` first.
+    mean, err, neff : (2, K, T) arrays, class 0 = non-reactive, 1 = reactive.
+    """
+    cv_dir = Path(cv_dir)
+    width = 2 * half_window + 1
+    offsets = _trace_offsets(half_window, window_mode)
+    T = len(offsets)
+
+    wanted = [op_col] + [c for c in sel_cv_cols if c != op_col]
+    cv_names, op_idx, cv_idxs = _discover_columns(
+        cv_dir, pnr_expected, op_col, wanted[1:], encoding, exclude=None
+    )
+    names = [op_col] + list(cv_names)
+    cols = [op_idx] + list(cv_idxs)
+    transforms = {}
+    for col in angle_cols or []:
+        if col in names:
+            transforms[names.index(col)] = "cos"
+            names[names.index(col)] = f"cos({col})"
+    for col in sym_angle_cols or []:
+        if col in names:
+            transforms[names.index(col)] = "cos2"
+            names[names.index(col)] = f"cos2({col})"
+
+    K = len(cols)
+    S0 = np.zeros((2, K, T))
+    S1 = np.zeros((2, K, T))
+    S2 = np.zeros((2, K, T))
+    W2 = np.zeros((2, K, T))
+
+    for row_j, pnr in enumerate(pnr_expected):
+        lab, w = labels[row_j], weights[row_j]
+        if not np.isfinite(lab) or not np.isfinite(w) or w <= 0:
+            continue
+        cls = int(lab)
+        fpath = cv_dir / f"{pnr}.txt"
+        if not fpath.exists():
+            continue
+        try:
+            frames = _load_trajectory(fpath, encoding)
+        except Exception:
+            continue
+        if frames.shape[1] <= max(cols):
+            continue
+
+        op_vals = frames[:, op_idx]
+        anchor = _event_anchor(op_vals, bool(cls), event_op, event_min_op)
+        if anchor is None:
+            continue
+        bounds = _window_bounds(anchor, len(op_vals), width, window_mode, min_frames)
+        if bounds is None:
+            continue
+        lo, hi = bounds
+        t = np.arange(lo, hi) - anchor - offsets[0]
+
+        for k, ci in enumerate(cols):
+            x = frames[lo:hi, ci]
+            if k in transforms:
+                x = _apply_angle_series(x, transforms[k])
+            ok = np.isfinite(x)
+            S0[cls, k, t[ok]] += w
+            S1[cls, k, t[ok]] += w * x[ok]
+            S2[cls, k, t[ok]] += w * x[ok] ** 2
+            W2[cls, k, t[ok]] += w * w
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mean = S1 / S0
+        var = np.maximum(S2 / S0 - mean**2, 0.0)
+        neff = S0**2 / W2
+        err = np.sqrt(var / neff)
+    return offsets, names, mean, err, np.nan_to_num(neff)
+
+
+def _write_event_traces(offsets, names, mean, err, neff, dt, out_path, overw=False):
+    """Long-format table of the event-aligned traces."""
+    _check_overwrite(out_path, overw)
+    with open(out_path, "w") as f:
+        f.write("# offset_frames\ttime\tcv\tclass\tmean\terr\tn_eff\n")
+        for k, name in enumerate(names):
+            for cls, cls_name in ((1, "reactive"), (0, "non-reactive")):
+                for ti, off in enumerate(offsets):
+                    f.write(
+                        f"{off}\t{off * dt:.6g}\t{name}\t{cls_name}\t"
+                        f"{mean[cls, k, ti]:.6g}\t{err[cls, k, ti]:.6g}\t"
+                        f"{neff[cls, k, ti]:.3f}\n"
+                    )
+    print(f"Event-aligned traces saved to {out_path}")
+
+
+def _plot_event_traces(offsets, names, mean, err, dt, unit, event_op, out_path,
+                       overw=False):
+    """One panel per trace: reactive vs non-reactive, aligned on the event."""
+    _check_overwrite(out_path, overw)
+    K = len(names)
+    ncols = min(3, K)
+    nrows = int(np.ceil(K / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4.2 * ncols, 2.9 * nrows),
+                             squeeze=False, sharex=True)
+    t = offsets * dt
+    for k, name in enumerate(names):
+        ax = axes.flat[k]
+        for cls, label, color in ((1, "reactive", "C3"), (0, "non-reactive", "C0")):
+            m, e = mean[cls, k], err[cls, k]
+            ax.plot(t, m, color=color, lw=1.4, label=label)
+            ax.fill_between(t, m - e, m + e, color=color, alpha=0.25, lw=0)
+        ax.axvline(0.0, color="0.4", lw=0.8, ls="--")
+        ax.set_title(name, fontsize=9)
+        ax.tick_params(labelsize=8)
+    for ax in axes.flat[K:]:
+        ax.set_visible(False)
+    for ax in axes[-1]:
+        ax.set_xlabel(f"time from event [{unit}]", fontsize=8)
+    axes.flat[0].legend(fontsize=7, frameon=False)
+    fig.suptitle(
+        f"Aligned on the event: reactive at OP = {event_op:g}, "
+        "non-reactive at the turning point (±1 s.e.)", fontsize=10,
+    )
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"Event-aligned trace figure saved to {out_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -714,12 +949,17 @@ def dynamics(
     dt: Annotated[float, typer.Option("-dt", help="Time between stored frames. Default 1.0 = report tau in frames and frequencies in 1/frame", rich_help_panel=panels.DATASET)] = 1.0,
     time_unit: Annotated[str, typer.Option("-time-unit", help="Name of the -dt unit, used in axis labels only", rich_help_panel=panels.DATASET)] = "frames",
     max_lag: Annotated[int, typer.Option("-max-lag", help="Largest lead/lag searched, in frames", rich_help_panel=panels.DATASET)] = 25,
+    align: Annotated[str, typer.Option("-align", help="'interface': a window at each interface crossing (same depth for both classes). 'event': one window per path at its outcome - reactive paths at their first crossing of -event-op, non-reactive paths at their turning point", rich_help_panel=panels.DATASET)] = "interface",
+    event_op: Annotated[Optional[float], typer.Option("-event-op", help="-align event: OP value a reactive path is anchored on; default = the last interface (lambda_B). Use the membrane centre (e.g. 0) for a stage that spans it", rich_help_panel=panels.DATASET)] = None,
+    event_min_op: Annotated[Optional[float], typer.Option("-event-min-op", help="-align event: keep only non-reactive paths whose turning point reaches this OP, so both classes are compared at a similar depth; default = all", rich_help_panel=panels.DATASET)] = None,
     cv_cols: Annotated[Optional[str], typer.Option("-cv-cols", help="Comma-separated CV columns to use; default = all except -op-col", rich_help_panel=panels.SELECT)] = None,
     exclude: Annotated[Optional[str], typer.Option("-exclude", help="Comma-separated substrings; CVs whose name matches one are dropped (only when -cv-cols is unset)", rich_help_panel=panels.SELECT)] = None,
+    trace_cols: Annotated[Optional[str], typer.Option("-trace-cols", help="-align event: comma-separated CVs to draw as event-aligned traces; default = the -trace-top CVs with the largest effect", rich_help_panel=panels.SELECT)] = None,
     angle_cols: Annotated[Optional[str], typer.Option("-angle-cols", help="Comma-separated CV columns in degrees to convert to cos(θ) (asymmetric molecules)", rich_help_panel=panels.REPR)] = None,
     sym_angle_cols: Annotated[Optional[str], typer.Option("-sym-angle-cols", help="Comma-separated CV columns in degrees to convert to cos²(θ) (symmetric molecules)", rich_help_panel=panels.REPR)] = None,
     spectral: Annotated[bool, typer.Option("-spectral", help="Also compute the FFT features (spectral energy, main frequency, centroid, entropy)", rich_help_panel=panels.MODEL)] = False,
     pair_lags: Annotated[int, typer.Option("-pair-lags", help="Pairwise lead/lag matrices for the top-K CVs (second pass over the files); 0 disables", rich_help_panel=panels.MODEL)] = 8,
+    trace_top: Annotated[int, typer.Option("-trace-top", help="-align event: event-aligned mean traces for the top-K CVs (another pass over the files); 0 disables", rich_help_panel=panels.MODEL)] = 8,
     plot_top: Annotated[int, typer.Option("-plot-top", help="Draw only this many features per figure, chosen by effect size; 0 draws all. A dynamics run has N_cvs x N_kinds features, and an uncapped figure exceeds matplotlib's size limit", rich_help_panel=panels.OUTPUT)] = 40,
     plot_dir: Annotated[str, typer.Option("-plot-dir", help="Root directory for output plots", rich_help_panel=panels.OUTPUT)] = "dynamics_plots",
     out: Annotated[str, typer.Option("-out", help="Output file for the feature rankings", rich_help_panel=panels.OUTPUT)] = "dynamics_ranking.txt",
@@ -760,9 +1000,21 @@ def dynamics(
     real frame spacing to get physical units. Note that -window-mode centered
     includes post-crossing frames, which partly encode the outcome — use
     'pre' when the features are meant to be predictive rather than descriptive.
+
+    -align event replaces the interface windows by one window per path at its
+    outcome: reactive paths where they first reach -event-op (default
+    lambda_B), non-reactive paths at their turning point. The per-interface
+    outputs then come out once, prefixed event_, and two more are written:
+      event_traces.png / .txt       — class-averaged CVs against time from
+                                      the event (OP first, then -trace-cols
+                                      or the -trace-top strongest CVs)
+    Reactive paths end soon after lambda_B, so with the default -event-op a
+    centered window drops most of them; use -window-mode pre there.
     """
     if window_mode not in ("centered", "pre"):
         raise ValueError(f"-window-mode must be 'centered' or 'pre', got {window_mode!r}")
+    if align not in ALIGN_MODES:
+        raise ValueError(f"-align must be one of {ALIGN_MODES}, got {align!r}")
     if half_window < 4:
         raise ValueError("-half-window must be at least 4 for the window features to mean anything.")
 
@@ -775,6 +1027,21 @@ def dynamics(
 
     pnr, maxop, path_f, path_w = _load_path_table(data, nskip, M)
     path_weights = _compute_path_weights(maxop, path_f, path_w, interfaces)
+
+    # The window slots: one per interface, or the single outcome event.
+    if align == "event":
+        if event_op is None:
+            event_op = float(interfaces[-1])
+        anchor_lams = np.array([event_op])
+        anchor_tags = ["event"]
+        print(f"Aligned on the event: reactive paths at their first OP >= {event_op:g}, "
+              "non-reactive paths at their turning point"
+              + (f" (only those reaching OP >= {event_min_op:g})"
+                 if event_min_op is not None else "") + ".")
+    else:
+        anchor_lams = interfaces
+        anchor_tags = [f"interface_{i:03d}" for i in range(M)]
+    n_anchor = len(anchor_lams)
 
     ranking_out = os.path.join(plot_dir, out)
     redundancy_out = os.path.join(plot_dir, redundancy_file)
@@ -799,7 +1066,7 @@ def dynamics(
             "        resolution length-dependent; prefer -min-frames 0 where possible."
         )
 
-    feats, feat_names, cv_names, n_windows = _extract_dynamical_features(
+    feats, feat_names, cv_names, n_windows, anchor_op = _extract_dynamical_features(
         cv_dir=cv_dir,
         pnr_expected=pnr,
         interfaces=interfaces,
@@ -814,40 +1081,49 @@ def dynamics(
         angle_cols=angle_cols.split(",") if angle_cols else None,
         sym_angle_cols=sym_angle_cols.split(",") if sym_angle_cols else None,
         exclude=exclude.split(",") if exclude else None,
+        align=align,
+        event_op=event_op,
+        event_min_op=event_min_op,
     )
 
     labels, is_plus = _extract_path_metadata(cv_dir, pnr)
     feats = feats[is_plus]
     labels = labels[is_plus]
     path_weights = path_weights[is_plus]
+    anchor_op = anchor_op[is_plus]
 
     n_kinds = len(kinds)
     n_cvs = len(cv_names)
     print(
         f"{int(np.sum(is_plus))} plus-ensemble paths  |  {n_cvs} CVs x "
-        f"{n_kinds} kinds = {len(feat_names)} features  |  {M} interfaces."
+        f"{n_kinds} kinds = {len(feat_names)} features  |  "
+        + ("1 event." if align == "event" else f"{M} interfaces.")
     )
+    if align == "event":
+        _print_event_summary(anchor_op[:, 0], feats[:, :, 0], labels)
 
     # --- per-interface effect sizes -------------------------------------------
     results = []
-    lag_diff = np.full((M, n_cvs), np.nan)
+    lag_diff = np.full((n_anchor, n_cvs), np.nan)
     lag_kind_idx = kinds.index("lagOP")
 
-    for i in range(M):
+    for i in range(n_anchor):
         start = datetime.datetime.now()
         X_i = feats[:, :, i]
 
         usable = np.any(np.isfinite(X_i), axis=1) & np.isfinite(labels)
         n_pos = int(np.sum(labels[usable] == 1))
         n_neg = int(np.sum(labels[usable] == 0))
+        where = ("[event]" if align == "event"
+                 else f"[interface {i + 1:3d}/{M}] lambda = {interfaces[i]:.4f}")
         print(
-            f"\n[interface {i + 1:3d}/{M}] lambda = {interfaces[i]:.4f}  "
+            f"\n{where}  "
             f"({n_pos} reactive, {n_neg} non-reactive, {n_windows[i]} full windows)"
         )
 
         if min(n_pos, n_neg) < min_class:
             print(f"  SKIP: fewer than {min_class} paths in one class with a usable window.")
-            results.append({"interface": i, "lambda": interfaces[i], "ranking": None})
+            results.append({"interface": i, "lambda": anchor_lams[i], "ranking": None})
             continue
 
         metrics = _interface_metrics(X_i, labels, path_weights, feat_names)
@@ -858,7 +1134,7 @@ def dynamics(
             m0 = _weighted_class_mean(col, labels, path_weights, 0)
             lag_diff[i, cv] = m1 - m0
 
-        prefix = f"interface_{i:03d}_"
+        prefix = f"{anchor_tags[i]}_"
         _plot_importance_bar(
             np.abs(np.nan_to_num(metrics["cohens_d"])), feat_names,
             str(Path(plot_dir) / f"{prefix}effect_bar.png"), overw=overw,
@@ -872,22 +1148,25 @@ def dynamics(
         order = np.argsort(abs_d)[::-1]
         results.append({
             "interface": i,
-            "lambda": interfaces[i],
+            "lambda": anchor_lams[i],
             "ranking": [(feat_names[idx], float(abs_d[idx])) for idx in order],
             "metrics": metrics,
         })
-        print(f"Interface {i + 1}/{M} done in {datetime.datetime.now() - start}.")
+        done = "Event" if align == "event" else f"Interface {i + 1}/{M}"
+        print(f"{done} done in {datetime.datetime.now() - start}.")
 
     # --- cross-interface summaries -------------------------------------------
-    _plot_interface_heatmap(
-        results, feat_names,
-        str(Path(plot_dir) / "interface_heatmap.png"), overw=overw,
-        value_label="|Cohen's d|",
-        title="|Cohen's d| of dynamical features across interfaces",
-        top_n=plot_top,
-    )
+    # With one event row the heatmap would only repeat event_effect_bar.png.
+    if align == "interface":
+        _plot_interface_heatmap(
+            results, feat_names,
+            str(Path(plot_dir) / "interface_heatmap.png"), overw=overw,
+            value_label="|Cohen's d|",
+            title="|Cohen's d| of dynamical features across interfaces",
+            top_n=plot_top,
+        )
     _plot_lag_profile(
-        lag_diff, cv_names, interfaces,
+        lag_diff, cv_names, anchor_lams,
         str(Path(plot_dir) / "lag_profile.png"), unit=time_unit, overw=overw,
         top_n=plot_top,
     )
@@ -914,50 +1193,79 @@ def dynamics(
             flag = "  <-- redundant" if np.isfinite(red[i, j]) and red[i, j] > 0.9 else ""
             print(f"  {ka:>9} vs {kb:<9} {red[i, j]:6.3f}{flag}")
 
+    # --- CVs ranked by their strongest feature, for the second passes ---------
+    mean_abs_d = np.full(n_cvs, np.nan)
+    for cv in range(n_cvs):
+        vals = []
+        for r in results:
+            if r["ranking"] is None:
+                continue
+            d = np.abs(r["metrics"]["cohens_d"][cv * n_kinds:(cv + 1) * n_kinds])
+            if np.any(np.isfinite(d)):
+                vals.append(np.nanmax(d))
+        if vals:
+            mean_abs_d[cv] = float(np.mean(vals))
+
+    def _top_raw_names(K):
+        top = np.argsort(np.nan_to_num(mean_abs_d))[::-1][:K]
+        # _discover_columns matches the file's own column names, so ask for
+        # the pre-transform names rather than the cos()-renamed ones.
+        raw_names, _, _ = _discover_columns(
+            Path(cv_dir), pnr, op_col,
+            cv_cols.split(",") if cv_cols else None, "utf-8",
+            exclude=exclude.split(",") if exclude else None,
+        )
+        return [raw_names[i] for i in sorted(top)]
+
+    angle_list = angle_cols.split(",") if angle_cols else None
+    sym_angle_list = sym_angle_cols.split(",") if sym_angle_cols else None
+
     # --- pairwise event ordering (second pass) -------------------------------
-    if pair_lags > 0:
-        mean_abs_d = np.full(n_cvs, np.nan)
-        for cv in range(n_cvs):
-            vals = []
-            for r in results:
-                if r["ranking"] is None:
-                    continue
-                d = np.abs(r["metrics"]["cohens_d"][cv * n_kinds:(cv + 1) * n_kinds])
-                if np.any(np.isfinite(d)):
-                    vals.append(np.nanmax(d))
-            if vals:
-                mean_abs_d[cv] = float(np.mean(vals))
+    if pair_lags > 0 and np.any(np.isfinite(mean_abs_d)):
+        K = int(min(pair_lags, n_cvs))
+        sel = _top_raw_names(K)
+        print(f"\nPairwise lead/lag for the top {K} CVs: {', '.join(sel)}")
+        print("  (second pass over the trajectory files)")
 
-        if np.any(np.isfinite(mean_abs_d)):
-            K = int(min(pair_lags, n_cvs))
-            top = np.argsort(np.nan_to_num(mean_abs_d))[::-1][:K]
-            # _discover_columns matches the file's own column names, so ask for
-            # the pre-transform names rather than the cos()-renamed ones.
-            raw_names, _, _ = _discover_columns(
-                Path(cv_dir), pnr, op_col,
-                cv_cols.split(",") if cv_cols else None, "utf-8",
-                exclude=exclude.split(",") if exclude else None,
+        diff, disp = _pairwise_lag_matrices(
+            cv_dir, pnr[is_plus], interfaces, op_col, sel, labels, path_weights,
+            half_window, window_mode, min_frames, max_lag, dt,
+            angle_cols=angle_list, sym_angle_cols=sym_angle_list,
+            align=align, event_op=event_op, event_min_op=event_min_op,
+        )
+        for i in range(n_anchor):
+            _plot_pair_lag(
+                diff[i], disp,
+                str(Path(plot_dir) / f"{anchor_tags[i]}_pairlag.png"),
+                unit=time_unit, lam=anchor_lams[i], overw=overw,
             )
-            sel = [raw_names[i] for i in sorted(top)]
-            print(f"\nPairwise lead/lag for the top {K} CVs: {', '.join(sel)}")
-            print("  (second pass over the trajectory files)")
 
-            diff, disp = _pairwise_lag_matrices(
-                cv_dir, pnr[is_plus], interfaces, op_col, sel, labels, path_weights,
-                half_window, window_mode, min_frames, max_lag, dt,
-                angle_cols=angle_cols.split(",") if angle_cols else None,
-                sym_angle_cols=sym_angle_cols.split(",") if sym_angle_cols else None,
+    # --- event-aligned traces (another pass) ---------------------------------
+    if align == "event" and (trace_cols or trace_top > 0):
+        if trace_cols:
+            sel = trace_cols.split(",")
+        elif np.any(np.isfinite(mean_abs_d)):
+            sel = _top_raw_names(int(min(trace_top, n_cvs)))
+        else:
+            sel = []
+        if sel:
+            print(f"\nEvent-aligned traces for: {', '.join(sel)}")
+            offsets, names, mean, err, neff = _event_traces(
+                cv_dir, pnr[is_plus], op_col, sel, labels, path_weights,
+                half_window, window_mode, min_frames, event_op, event_min_op,
+                angle_cols=angle_list, sym_angle_cols=sym_angle_list,
             )
-            for i in range(M):
-                _plot_pair_lag(
-                    diff[i], disp,
-                    str(Path(plot_dir) / f"interface_{i:03d}_pairlag.png"),
-                    unit=time_unit, lam=interfaces[i], overw=overw,
-                )
+            _write_event_traces(offsets, names, mean, err, neff, dt,
+                                str(Path(plot_dir) / "event_traces.txt"), overw=overw)
+            _plot_event_traces(offsets, names, mean, err, dt, time_unit, event_op,
+                               str(Path(plot_dir) / "event_traces.png"), overw=overw)
 
     # --- rankings ------------------------------------------------------------
     with open(ranking_out, "w") as f:
         f.write(f"# window = {width} frames, mode = {window_mode}, dt = {dt} {time_unit}\n")
+        if align == "event":
+            f.write(f"# align = event: reactive at OP >= {event_op:g}, non-reactive at "
+                    f"the turning point (min OP {event_min_op}); lambda = event OP\n")
         f.write("# interface\tlambda\trank\tfeature\tabs_cohens_d\tcohens_d\tspearman\tks\n")
         for r in results:
             if r["ranking"] is None:

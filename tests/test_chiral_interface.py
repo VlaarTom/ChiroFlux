@@ -829,6 +829,44 @@ def test_a_different_permeant_invalidates_the_cache(run, capsys):
     assert "0 units cached already, 3 to extract" in capsys.readouterr().out
 
 
+def test_merge_combines_chunks_of_the_same_name_from_two_places(run, tmp_path):
+    gro, run_dir = run
+    units = cia.units_from_load_dir(run_dir / "load")
+    a, b, out = (str(tmp_path / n) for n in ("a", "b", "merged"))
+    # the stage extracted in two halves: both write entry_0000000-0000499,
+    # and b also with a different -paths-per-file
+    cia.extract_many(units[:2], gro, "pro", a, "entry", workers=1)
+    cia.extract_many(units[2:], gro, "pro", b, "entry", workers=1)
+    cia.extract_many(units[2:], gro, "pro", b, "entry", workers=1, per_file=10)
+    written = cia.merge_caches([a, b], out)
+    assert written == {"entry_0000000-0000499.chiral.npz": 3,
+                       "entry_0000010-0000019.chiral.npz": 1}
+    for u in units:
+        u.cache_dir = out
+        arr, _, _ = cia.load_unit(u)
+        u.cache_dir = a if u in units[:2] else b
+        np.testing.assert_array_equal(arr["F"], cia.load_unit(u)[0]["F"])
+
+    # merging into one of the sources keeps what it held
+    assert cia.merge_caches([b], a) == written
+
+
+def test_merge_refuses_a_path_cached_from_different_traj_files(run, tmp_path):
+    gro, run_dir = run
+    units = cia.units_from_load_dir(run_dir / "load")
+    a, b, out = (str(tmp_path / n) for n in ("a", "b", "merged"))
+    cia.extract_many(units, gro, "pro", a, "entry", workers=1)
+    p7 = run_dir / "load" / "7"
+    for f in ("traj.txt", "order.txt"):
+        lines = (p7 / f).read_text().splitlines(keepends=True)
+        (p7 / f).write_text("".join(lines[:-1]))
+    cia.extract_many(cia.units_from_load_dir(run_dir / "load"), gro, "pro", b, "entry",
+                     workers=1)
+    with pytest.raises(ValueError, match="path 7"):
+        cia.merge_caches([a, b], out)
+    assert not os.path.exists(out)
+
+
 def test_reduce_units_from_the_cache(run):
     gro, run_dir = run
     cache = str(run_dir / "cache")

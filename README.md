@@ -66,7 +66,7 @@ chiroflux COMMAND --help
 | `shap-ml` | Fits WHAM-weighted classifiers (random forest, logistic regression, gradient boosting, LightGBM, SVM) per interface and explains them with SHAP. |
 | `shap-enantiomer` | Same, but the label is *which of two simulations* a path came from. |
 | `statistics` | Model-free weighted effect sizes (Cohen's d, Spearman ρ, KS distance) per interface — a cheap sanity check on the SHAP rankings. |
-| `dynamics` | Time-resolved CV features in a window around each crossing: fluctuation amplitude, autocorrelation time, and lead/lag event ordering against the order parameter. Optional FFT features, with a built-in redundancy check against them. |
+| `dynamics` | Time-resolved CV features in a window around each crossing: fluctuation amplitude, autocorrelation time, and lead/lag event ordering against the order parameter. Optional FFT features, with a built-in redundancy check against them. `-align event` anchors on the outcome instead (reactive: crossing `-event-op`; unreactive: turning point) and writes class-averaged traces around it. |
 | `pca` | Weighted PCA of the CV space, optionally on a joint basis fitted across two simulations so they can be compared in the same coordinates. |
 | `prepare-deeptda-data` | Builds a frame-level, weighted DeepTDA training set labelled reactive/non-reactive. |
 | `prepare-deeptda-data-ld` | Same, but labelled by which of two simulations each frame came from. |
@@ -506,7 +506,7 @@ and they do **not** all take the same correction:
 | --- | --- | --- |
 | `PRO_hCN_*`, `PRO_hCN_*_s1..s3`, `PRO_nCos_*`, `PRO_azim_*`, `PRO_sign_vol`, `PRO_dih_chiral` | signed **pseudoscalar**, zero-centred | `-mirror-l` / `-mirror-d` |
 | `Mem_u_tilt`, `Mem_l_tilt`, `PRO_mode_ring`, `PRO_mode_O`, `PRO_mode_N` | cosine of a **true vector** against +z | `-flip-l` / `-flip-d` (negation, on a cos-valued column) |
-| `PRO_rMin_*`, `Mem_u_tiltN`, `Mem_l_tiltN` | true scalar (a distance, a count) | **none** — these are reflection-invariant |
+| `PRO_rMin_*`, `Mem_u_tiltN`, `Mem_l_tiltN`, `Mem_u_nP`, `Mem_l_nP`, `Water_wire`, `Water_cluster` | true scalar (a distance, a count, a flag) | **none** — these are reflection-invariant |
 
 Mirroring the handed columns is right and does not throw the chirality signal
 away. To leading order the lipid environment is achiral, so an L path's `hCN`

@@ -199,3 +199,136 @@ class TestKindRedundancy:
         assert red[0, 1] == pytest.approx(1.0, abs=1e-6)
         assert red[0, 2] < 0.3
         assert np.allclose(np.diag(red), 1.0)
+
+
+# ---------------------------------------------------------------------------
+# -align event
+# ---------------------------------------------------------------------------
+
+from chiroflux.dynamics import (  # noqa: E402
+    _anchor_frames,
+    _event_anchor,
+    _event_traces,
+    _trace_offsets,
+)
+
+
+class TestEventAnchor:
+    OP = np.array([0.0, 0.5, 1.2, 1.9, 2.4, 1.0, 0.1])
+
+    def test_reactive_anchors_on_the_first_crossing(self):
+        assert _event_anchor(self.OP, True, event_op=1.5) == 3
+
+    def test_reactive_without_a_crossing_has_no_event(self):
+        assert _event_anchor(self.OP, True, event_op=3.0) is None
+
+    def test_non_reactive_anchors_on_the_turning_point(self):
+        assert _event_anchor(self.OP, False, event_op=1.5) == 4
+
+    def test_shallow_turning_points_can_be_excluded(self):
+        assert _event_anchor(self.OP, False, 1.5, event_min_op=2.4) == 4
+        assert _event_anchor(self.OP, False, 1.5, event_min_op=2.5) is None
+
+    def test_interface_mode_is_unchanged(self):
+        assert _anchor_frames(self.OP, [0.4, 2.0, 9.0], "interface") == [1, 4, None]
+        assert _anchor_frames(self.OP, [0.4, 2.0], "event", True, 1.5) == [3]
+
+    def test_trace_offsets_match_the_window(self):
+        assert list(_trace_offsets(2, "centered")) == [-2, -1, 0, 1, 2]
+        assert list(_trace_offsets(2, "pre")) == [-4, -3, -2, -1, 0]
+
+
+INTERFACES_EV = [0.0, 1.0, 2.0]
+N_FRAMES_EV = 60
+SAG_FROM = 8  # frames before the event at which the reactive CV drops
+
+
+def _write_event_sim(root, n_per_class=12, seed=0):
+    """Reactive paths ramp through lambda_B and their CV drops SAG_FROM frames
+    before the crossing; non-reactive paths peak at OP 1.5 with a flat CV."""
+    rng = np.random.default_rng(seed)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "infretis.toml").write_text(f"[simulation]\ninterfaces = {INTERFACES_EV}\n")
+    ml = root / "ML"
+    ml.mkdir(exist_ok=True)
+    rows = []
+    t = np.arange(N_FRAMES_EV)
+    for pnr in range(2 * n_per_class):
+        reactive = pnr < n_per_class
+        if reactive:
+            op = np.linspace(-0.2, 2.05, N_FRAMES_EV)
+            event = int(np.argmax(op >= 2.0))
+            cv = np.where(t >= event - SAG_FROM, -1.0, 0.0)
+            rows.append(f"{pnr} {N_FRAMES_EV} {op.max():.3f} ---- 1.0 1.0 ---- 1.0 1.0")
+        else:
+            op = 1.5 - 1.7 * np.abs(t - 30) / 30
+            cv = np.zeros(N_FRAMES_EV)
+            rows.append(f"{pnr} {N_FRAMES_EV} {op.max():.3f} ---- 1.0 ---- ---- 1.0 ----")
+        cv = cv + rng.normal(scale=0.01, size=N_FRAMES_EV)
+        noise = rng.normal(size=N_FRAMES_EV)
+        lines = ["# reactive" if reactive else "# non-reactive", "# plus ensemble",
+                 "# info", "OP_Lamb cvA cvB"]
+        lines += [f"{a:.5f} {b:.5f} {c:.5f}" for a, b, c in zip(op, cv, noise)]
+        (ml / f"{pnr}.txt").write_text("\n".join(lines) + "\n")
+    (root / "infretis_data.txt").write_text("\n".join(rows) + "\n")
+    return root
+
+
+class TestEventTraces:
+    def test_traces_line_up_on_the_event(self, tmp_path):
+        root = _write_event_sim(tmp_path / "sim")
+        pnr = np.arange(24)
+        labels = (pnr < 12).astype(float)
+        offsets, names, mean, err, neff = _event_traces(
+            root / "ML", pnr, "OP_Lamb", ["cvA"], labels, np.ones(24),
+            half_window=10, window_mode="pre", min_frames=0,
+            event_op=2.0, event_min_op=None,
+        )
+        assert names == ["OP_Lamb", "cvA"]
+        assert offsets[-1] == 0
+        cv = names.index("cvA")
+        at = {off: i for i, off in enumerate(offsets)}
+        # Reactive: the drop starts exactly SAG_FROM frames before the event.
+        assert mean[1, cv, at[-SAG_FROM]] == pytest.approx(-1.0, abs=0.02)
+        assert mean[1, cv, at[-SAG_FROM - 1]] == pytest.approx(0.0, abs=0.02)
+        assert np.allclose(mean[0, cv], 0.0, atol=0.02)
+        # The OP trace shows the alignment itself: reactive at lambda_B,
+        # non-reactive at its turning point.
+        assert mean[1, 0, at[0]] >= 2.0
+        assert mean[0, 0, at[0]] == pytest.approx(1.5)
+        assert np.all(neff[:, :, at[0]] == pytest.approx(12.0))
+
+    def test_min_op_drops_shallow_non_reactive_paths(self, tmp_path):
+        root = _write_event_sim(tmp_path / "sim")
+        pnr = np.arange(24)
+        labels = (pnr < 12).astype(float)
+        *_, neff = _event_traces(
+            root / "ML", pnr, "OP_Lamb", ["cvA"], labels, np.ones(24),
+            half_window=10, window_mode="pre", min_frames=0,
+            event_op=2.0, event_min_op=1.6,
+        )
+        assert np.all(neff[0] == 0)
+        assert np.all(neff[1, :, -1] > 0)
+
+    def test_command_end_to_end(self, tmp_path):
+        from chiroflux.dynamics import dynamics
+
+        root = _write_event_sim(tmp_path / "sim")
+        out = tmp_path / "plots"
+        dynamics(
+            toml=str(root / "infretis.toml"), data=str(root / "infretis_data.txt"),
+            cv_dir=str(root / "ML"), nskip=0, half_window=10, window_mode="pre",
+            min_class=2, align="event", pair_lags=2, trace_top=2,
+            plot_dir=str(out),
+        )
+        for name in ("event_effect_bar.png", "event_traces.png", "event_traces.txt",
+                     "event_pairlag.png", "lag_profile.png", "dynamics_ranking.txt"):
+            assert (out / name).exists(), name
+        assert not (out / "interface_heatmap.png").exists()
+        assert "align = event" in (out / "dynamics_ranking.txt").read_text()
+
+    def test_unknown_align_mode_is_rejected(self, tmp_path):
+        from chiroflux.dynamics import dynamics
+
+        with pytest.raises(ValueError, match="-align"):
+            dynamics(align="centre", plot_dir=str(tmp_path))

@@ -872,9 +872,8 @@ def compute_local_chain_tilt(pro_xy, coords_c2, coords_cc, z_mid, box, radius=1.
     -------
     cos_tilt : (n_frames,)  cosine between the mean-C2 -> mean-CC vector and
                +z. Where fewer than `min_count` atoms of either group qualify,
-               the whole-leaflet tilt is substituted rather than NaN - the same
-               fallback `compute_local_deformation` makes for its local z, and
-               it keeps a sparse patch from voiding the frame for every
+               the whole-leaflet tilt is substituted rather than NaN, which
+               keeps a sparse patch from voiding the frame for every
                downstream analysis that requires all-finite rows.
     count    : (n_frames,)  number of C2 atoms in range, as a float, so the
                substituted frames can be identified after the fact.
@@ -1010,14 +1009,42 @@ def compute_cremer_pople(coords_ring, box):
     return q2, phi2
 
 
-def compute_local_deformation(pro_xy, coords_p, box, radius=1.0):
+def compute_local_deformation(pro_xy, coords_p, box, z_mid, radius=1.0, min_count=3):
     """
-    Local membrane deformation around the permeant.
+    Local height of one leaflet's phosphate layer around the permeant.
+
+    The local patch is every phosphate within `radius` of the permeant in the
+    membrane plane, topped up with the laterally nearest ones until it holds
+    `min_count`. An earlier version had no top-up and fell back to the leaflet
+    mean when the disc was empty, so the deformation read exactly 0 - and an
+    empty disc is what a permeant that has pushed the headgroups aside
+    produces. The distortion being measured was reported as its absence, and
+    the frames could not be identified afterwards because the count was
+    discarded.
+
+    Parameters
+    ----------
+    z_mid : (n_frames,) bilayer midplane, used only to tell which way is
+            "into the membrane" for `deepest`.
+
+    Returns
+    -------
+    deformation : (n_frames,) local mean z minus the leaflet mean z.
+    local_z     : (n_frames,) local mean z.
+    deepest     : (n_frames,) z of the patch phosphate furthest toward the
+                  midplane, minus the leaflet mean z. Same raw-z sign as
+                  `deformation`: negative for an upper leaflet pulled down,
+                  positive for a lower one pulled up. A single headgroup
+                  dragged in by the permeant shows here undiluted, where the
+                  patch mean averages it with its neighbours.
+    count       : (n_frames,) phosphates inside `radius`, as a float. Below
+                  `min_count` the patch was topped up from further out.
     """
     p = np.asarray(coords_p, dtype=float)
     n_frames = p.shape[0]
     p = p.reshape(n_frames, -1, 3)
     box = _normalize_box(box, n_frames)
+    z_mid = np.asarray(z_mid, dtype=float).reshape(n_frames)
 
     pro_xy = np.asarray(pro_xy, dtype=float).reshape(n_frames, -1)[:, :2]
 
@@ -1026,13 +1053,151 @@ def compute_local_deformation(pro_xy, coords_p, box, radius=1.0):
     dxy = dxy - bxy * np.round(dxy / bxy)
     r_xy = np.linalg.norm(dxy, axis=-1)
 
-    mask = r_xy < radius
-    count = mask.sum(axis=1)
-    global_z = p[:, :, 2].mean(axis=1)
-    local_sum = np.where(mask, p[:, :, 2], 0.0).sum(axis=1)
-    local_z = np.where(count > 0, local_sum / np.maximum(count, 1), global_z)
+    k = min(min_count, p.shape[1])
+    kth = np.partition(r_xy, k - 1, axis=1)[:, k - 1]
+    inside = r_xy < radius
+    mask = inside | (r_xy <= kth[:, None])
 
-    return local_z - global_z, local_z, count.astype(float)
+    z = p[:, :, 2]
+    global_z = z.mean(axis=1)
+    local_z = np.where(mask, z, 0.0).sum(axis=1) / mask.sum(axis=1)
+
+    lowest = np.where(mask, z, np.inf).min(axis=1)
+    highest = np.where(mask, z, -np.inf).max(axis=1)
+    deepest = np.where(z_mid < global_z, lowest, highest)
+
+    return (local_z - global_z, local_z, deepest - global_z,
+            inside.sum(axis=1).astype(float))
+
+
+#: Shortest membrane undulation, in nm, that counts as curvature rather than
+#: single-lipid protrusion; membrane-spatial's -curvature-wavelength default.
+CURV_WAVELENGTH = 2.0
+
+
+def compute_local_curvature(pro_xy, coords_p, box, wavelength=CURV_WAVELENGTH):
+    """
+    Mean curvature H of one leaflet's phosphate surface, under the permeant.
+
+    Each frame's leaflet is fitted with the same low-pass periodic Fourier
+    surface membrane-spatial uses for `-curvature-method fourier` (modes of
+    wavelength >= `wavelength` only), and H is evaluated analytically at the
+    permeant's lateral position. That is a curvature *of the membrane* at the
+    permeant, not of whichever phosphates happen to be closest, so it stays
+    defined when the permeant has cleared its own patch.
+
+    A leaflet with fewer phosphates than the series has coefficients cannot
+    determine the fit; rather than write NaN (which voids the frame for every
+    analysis that needs all-finite rows) the cutoff is lengthened until it
+    can. With no mode left the fitted surface is flat and H is 0, which is
+    then the honest answer at that resolution.
+
+    Sign follows the raw z axis (Monge gauge, z up): a dimple in the upper
+    leaflet under the permeant is H > 0, the matching bulge of the lower
+    leaflet toward the core H < 0. Units are 1/nm.
+    """
+    # membrane_spatial imports MDAnalysis at module level; by the time any
+    # CV is computed it has been loaded already, so this costs nothing.
+    from .membrane_spatial import _fourier_modes, _monge_curvature
+
+    p = np.asarray(coords_p, dtype=float)
+    n_frames = p.shape[0]
+    p = p.reshape(n_frames, -1, 3)
+    box = _normalize_box(box, n_frames)
+    pro_xy = np.asarray(pro_xy, dtype=float).reshape(n_frames, -1)[:, :2]
+    n_p = p.shape[1]
+
+    H = np.zeros(n_frames)
+    for f in range(n_frames):
+        lx, ly = box[f, 0], box[f, 1]
+        cut = wavelength
+        q = _fourier_modes(lx, ly, cut)
+        while len(q) and n_p < 1 + 2 * len(q):
+            cut *= 1.25
+            q = _fourier_modes(lx, ly, cut)
+        if not len(q):
+            continue
+
+        phase = p[f, :, :2] @ q.T
+        A = np.hstack([np.ones((n_p, 1)), np.cos(phase), np.sin(phase)])
+        coef, *_ = np.linalg.lstsq(A, p[f, :, 2], rcond=None)
+        a, b = coef[1:1 + len(q)], coef[1 + len(q):]
+
+        ph = q @ pro_xy[f]
+        d1 = -np.sin(ph) * a + np.cos(ph) * b
+        d2 = -np.cos(ph) * a - np.sin(ph) * b
+        qx, qy = q[:, 0], q[:, 1]
+        H[f], _ = _monge_curvature(d1 @ qx, d1 @ qy, d2 @ qx**2, d2 @ qy**2,
+                                   d2 @ (qx * qy))
+    return H
+
+
+#: Water O-O distance (nm) for two waters to count as hydrogen-bonded in a
+#: wire: the first minimum of the TIP3P oxygen-oxygen g(r).
+WIRE_OO_CUTOFF = 0.35
+
+
+def compute_water_wire(orp_pos, water_o, z_top, z_bot, box3, cutoff=WIRE_OO_CUTOFF):
+    """
+    Whether a chain of water links the permeant to water outside the core.
+
+    Water counts near the permeant (Water, Water_06, Water_10) cannot tell a
+    hydrated pocket that is cut off from the solvent from a wire that reaches
+    it, and a connected wire is what lets a polar permeant stay hydrated on
+    its way in. This follows the hydrogen-bond network instead: waters whose
+    oxygens lie within `cutoff` are linked, the permeant's own first shell
+    (any permeant atom within `cutoff`) is the start, and the search runs
+    through core waters only.
+
+    The core is the slab between the two leaflets' glycerol planes, `z_top`
+    and `z_bot`. Water beyond them hydrates the headgroups and is joined to
+    the bulk in practice, so it is where a wire ends; placing the boundary at
+    the phosphates instead would count the headgroup water network as part of
+    the defect, and every permeant in the headgroup region would sit in one
+    huge "cluster". With the permeant itself outside the core, any water
+    contact is a wire.
+
+    Returns
+    -------
+    wire    : 1.0 if the permeant's water reaches a non-core water, else 0.0.
+    cluster : number of core waters connected to the permeant through core
+              waters - the size of the water defect it carries.
+    """
+    from scipy.spatial import cKDTree
+
+    box3 = np.asarray(box3, dtype=float)[:3]
+    water_o = np.asarray(water_o, dtype=float)
+    mid = 0.5 * (z_top + z_bot)
+    half = 0.5 * abs(z_top - z_bot)
+    dz = water_o[:, 2] - mid
+    dz -= box3[2] * np.round(dz / box3[2])
+    core = np.abs(dz) < half
+
+    def _wrap(pos):
+        w = np.mod(pos, box3)
+        # float `%` can round a tiny negative coordinate up to exactly L,
+        # which cKDTree's periodic box rejects.
+        return np.where(w >= box3, w - box3, w)
+
+    tree = cKDTree(_wrap(water_o), boxsize=box3)
+    shell = set()
+    for hits in tree.query_ball_point(_wrap(np.asarray(orp_pos, dtype=float)), cutoff):
+        shell.update(hits)
+
+    wire = any(not core[i] for i in shell)
+    seen = {i for i in shell if core[i]}
+    frontier = list(seen)
+    while frontier:
+        nxt = []
+        for hits in tree.query_ball_point(_wrap(water_o[frontier]), cutoff):
+            for j in hits:
+                if not core[j]:
+                    wire = True
+                elif j not in seen:
+                    seen.add(j)
+                    nxt.append(j)
+        frontier = nxt
+    return float(wire), float(len(seen))
 
 
 # ── New helpers replacing the gmx-specific machinery ──────────────────────────
@@ -1188,7 +1353,7 @@ def _init_system(gromacs_input="../gromacs_input"):
     global IDX_TETRA5, CN_DOPC_GROUPS, CN_POPC_GROUPS, IDX_CN_REF, IDX_CN_REF_COMBINED
     global ZCOM_GROUPS, ZCOM_SCALAR_GROUPS, _ref_u, IDX_ORP_ALL, IDX_ORP_N
     global IDX_ORP_H01, IDX_ORP_O01, IDX_ORP_H02, IDX_PHOSPHATE, IDX_CARBONYL
-    global IDX_NITROGEN, IDX_WATER, IDX_DOPC_ALL, IDX_POPC_ALL, HEAVY_MASSES
+    global IDX_NITROGEN, IDX_WATER, IDX_WATER_O, IDX_DOPC_ALL, IDX_POPC_ALL, HEAVY_MASSES
     global ORP_MASSES, ZCOM_MASSES, REF_BACKBONE_POS, COORD_NUM_SPECS_MAIN, COORD_NUM_SPECS_EXTRA
     global COORD_NUM_SPECS, _SEL_IDX_DOPC, _SEL_IDX_POPC
     if _SYSTEM_READY:
@@ -1268,6 +1433,7 @@ def _init_system(gromacs_input="../gromacs_input"):
     IDX_CARBONYL  = _ref_u.select_atoms("resname DOPC POPC and name O21 O22 O31 O32").indices
     IDX_NITROGEN  = _ref_u.select_atoms("resname DOPC POPC and name N").indices
     IDX_WATER    = _ref_u.select_atoms("resname TIP3").indices
+    IDX_WATER_O  = _ref_u.select_atoms("resname TIP3 and name OH2").indices
     IDX_DOPC_ALL = _ref_u.select_atoms("resname DOPC").indices
     IDX_POPC_ALL = _ref_u.select_atoms("resname POPC").indices
     HEAVY_MASSES = _ref_u.atoms[IDX_HEAVY].masses.copy()
@@ -1378,7 +1544,7 @@ def gather_path_arrays(plan, path_folder):
         small_idx[f'popc_{i}'] = CN_POPC_GROUPS[i]
 
     scalar_keys = (['water_03', 'dopc_05', 'popc_05', 'water_06', 'water_10',
-                    'hb_po', 'hb_co', 'hb_n']
+                    'hb_po', 'hb_co', 'hb_n', 'wire', 'wire_n']
                    + [f'zcom_{gi}' for gi in ZCOM_SCALAR_GROUPS])
 
     n_frames = len(plan)
@@ -1457,6 +1623,12 @@ def gather_path_arrays(plan, path_folder):
                 idx = ZCOM_GROUPS[gi]
                 scalars[f'zcom_{gi}'][out_i] = np.average(pos[idx, 2], weights=masses)
 
+            # Needs the whole water set, so it is reduced here like the counts
+            # above; the core boundary is the glycerol C2 plane of each leaflet.
+            scalars['wire'][out_i], scalars['wire_n'][out_i] = compute_water_wire(
+                orp_pos, pos[IDX_WATER_O],
+                scalars['zcom_9'][out_i], scalars['zcom_10'][out_i], box3,
+            )
 
     return box, small, scalars
 
@@ -1658,8 +1830,16 @@ def process_single_path(path_number, overwrite, lambda_A, lambda_B, lambda_minus
         pro_xy = orp_com[:, :2]
         z_PRO = orp_com[:, 2]
 
-        def_u, locz_u, _ = compute_local_deformation(pro_xy, lip_Pu, pbc_box, radius=1.0)
-        def_l, locz_l, _ = compute_local_deformation(pro_xy, lip_Pl, pbc_box, radius=1.0)
+        z_mid_P = 0.5 * (lip_Pu.reshape(n_frames, -1, 3)[:, :, 2].mean(axis=1)
+                         + lip_Pl.reshape(n_frames, -1, 3)[:, :, 2].mean(axis=1))
+        def_u, locz_u, deep_u, nP_u = compute_local_deformation(
+            pro_xy, lip_Pu, pbc_box, z_mid_P, radius=1.0
+        )
+        def_l, locz_l, deep_l, nP_l = compute_local_deformation(
+            pro_xy, lip_Pl, pbc_box, z_mid_P, radius=1.0
+        )
+        curvH_u = compute_local_curvature(pro_xy, lip_Pu, pbc_box)
+        curvH_l = compute_local_curvature(pro_xy, lip_Pl, pbc_box)
 
         # Nandi's second orientational coordinate: the tilt of the acyl chain
         # relative to the surface normal. C210 is the sn-2 chain carbon, i.e.
@@ -1808,6 +1988,20 @@ def process_single_path(path_number, overwrite, lambda_A, lambda_B, lambda_minus
         params['PRO_mode_ring'] = np.squeeze(mode_ring)
         params['PRO_mode_O'] = np.squeeze(mode_O)
         params['PRO_mode_N'] = np.squeeze(mode_N)
+
+        # ── Membrane distortion around the permeant (appended) ─────────────
+        # nP counts the phosphates inside the 1 nm disc behind Mem_*_def;
+        # below 3 the patch was topped up with the nearest ones from further
+        # out. It is a count, not a z-signed quantity, and is named so that a
+        # "_def" pattern does not catch it. defDeep is z-signed like def.
+        params['Mem_u_nP'] = np.squeeze(nP_u)
+        params['Mem_l_nP'] = np.squeeze(nP_l)
+        params['Mem_u_defDeep'] = np.squeeze(deep_u)
+        params['Mem_l_defDeep'] = np.squeeze(deep_l)
+        params['Mem_u_curvH'] = np.squeeze(curvH_u)
+        params['Mem_l_curvH'] = np.squeeze(curvH_l)
+        params['Water_wire'] = np.squeeze(scalars['wire'])
+        params['Water_cluster'] = np.squeeze(scalars['wire_n'])
 
         write_ML_txt(path_number, reactive, ensemble, lambda_A, lambda_minus_one, **params)
         return (path_number, "ok")

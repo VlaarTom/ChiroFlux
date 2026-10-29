@@ -33,6 +33,7 @@ def test_documented_entry_points_are_importable():
         ("permeant_index", "permeant_index"),
         ("cv_histograms", "histograms"),
         ("membrane_spatial", "membrane_spatial"),
+        ("membrane_compare", "membrane_compare"),
         ("neighbours", "neighbours"),
         ("sasa", "sasa"),
         ("sasa_compare", "sasa_compare"),
@@ -47,6 +48,7 @@ def test_documented_entry_points_are_importable():
         ("prepare_deeptda_data", "prepare_deeptda_data_ld"),
         ("train_deeptda", "train_deeptda"),
         ("chiral_interface_analysis", "chiral_extract"),
+        ("chiral_interface_analysis", "chiral_merge_cache"),
         ("chiral_interface_analysis", "chiral_compare"),
         ("chiral_plot", "chiral_plot"),
     ]:
@@ -63,6 +65,7 @@ def test_cli_registry_covers_every_entry_point():
         ("permeant_index", "permeant_index"),
         ("cv_histograms", "histograms"),
         ("membrane_spatial", "membrane_spatial"),
+        ("membrane_compare", "membrane_compare"),
         ("neighbours", "neighbours"),
         ("sasa", "sasa"),
         ("sasa_compare", "sasa_compare"),
@@ -77,6 +80,7 @@ def test_cli_registry_covers_every_entry_point():
         ("prepare_deeptda_data", "prepare_deeptda_data_ld"),
         ("train_deeptda", "train_deeptda"),
         ("chiral_interface_analysis", "chiral_extract"),
+        ("chiral_interface_analysis", "chiral_merge_cache"),
         ("chiral_interface_analysis", "chiral_compare"),
         ("chiral_plot", "chiral_plot"),
     }
@@ -241,6 +245,7 @@ PANELLED_COMMANDS = [
     ("permeant_index", "permeant_index"),
     ("cv_histograms", "histograms"),
     ("membrane_spatial", "membrane_spatial"),
+    ("membrane_compare", "membrane_compare"),
     ("neighbours", "neighbours"),
     ("sasa", "sasa"),
     ("sasa_compare", "sasa_compare"),
@@ -255,6 +260,7 @@ PANELLED_COMMANDS = [
     ("prepare_deeptda_data", "prepare_deeptda_data_ld"),
     ("train_deeptda", "train_deeptda"),
     ("chiral_interface_analysis", "chiral_extract"),
+    ("chiral_interface_analysis", "chiral_merge_cache"),
     ("chiral_interface_analysis", "chiral_compare"),
     ("chiral_plot", "chiral_plot"),
 ]
