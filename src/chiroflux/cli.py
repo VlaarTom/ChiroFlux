@@ -53,6 +53,11 @@ _COMMANDS = {
         "membrane_spatial",
         "Spatial membrane maps: radial/z structure and curvature around the permeant.",
     ),
+    "membrane-compare": _Command(
+        "membrane_compare",
+        "membrane_compare",
+        "Depth-matched membrane distortion of two path classes (reactive vs not).",
+    ),
     "neighbours": _Command(
         "neighbours",
         "neighbours",
@@ -122,6 +127,11 @@ _COMMANDS = {
         "chiral_interface_analysis",
         "chiral_extract",
         "Cache per-frame stereocentre-contact features per xtc, for chiral-compare.",
+    ),
+    "chiral-merge-cache": _Command(
+        "chiral_interface_analysis",
+        "chiral_merge_cache",
+        "Merge chiral-extract caches of one stage extracted in several places.",
     ),
     "chiral-compare": _Command(
         "chiral_interface_analysis",

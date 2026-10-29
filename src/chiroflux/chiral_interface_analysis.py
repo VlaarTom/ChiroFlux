@@ -647,6 +647,70 @@ def _update_chunk(path, new, permeant, overwrite):
         _write_chunk(path, entries, permeant)
 
 
+def merge_caches(sources, out_dir):
+    """
+    Merge the cache folders `sources` into `out_dir`, e.g. one stage extracted
+    in two places (some trajectories on one disk, the rest on another).
+    Chunks of the same name hold different paths of the same chunk range, so
+    their entries are combined; a chunk only one folder has is copied as is.
+    Chunks of different names coexist, whatever -paths-per-file made them:
+    compare finds a path in any chunk of the folder.  `out_dir` may be one of
+    the sources, and chunks it already holds are merged in, never dropped.
+
+    A path in two chunks of the same name must carry the same signature
+    (traj.txt); otherwise one of them is stale and nothing is written.
+    Chunks of an older cache version are skipped.  Returns {chunk name:
+    number of paths} of every chunk written.
+    """
+    import shutil
+    out_dir = os.path.abspath(out_dir)
+    folders = list(dict.fromkeys(os.path.abspath(s) for s in sources))
+    if os.path.isdir(out_dir) and out_dir not in folders:
+        folders.append(out_dir)
+    by_name, permeants = {}, set()
+    for folder in folders:
+        if not os.path.isdir(folder):
+            raise ValueError(f"{folder} is not a folder")
+        for path in sorted(glob.glob(os.path.join(folder, f"*{CHUNK_SUFFIX}"))):
+            info = _chunk_index(path)
+            if info is None or info[0] != CACHE_VERSION:
+                print(f"  [!] skipped {path}: unreadable or not cache version {CACHE_VERSION}")
+                continue
+            permeants.add(info[1])
+            by_name.setdefault(os.path.basename(path), []).append((path, info[2]))
+    if len(permeants) > 1:
+        raise ValueError(f"the caches were extracted for different permeants: {sorted(permeants)}")
+
+    # Check every clash before writing anything, so a refused merge leaves
+    # `out_dir` as it was.
+    clashes = []
+    for name, chunks in by_name.items():
+        seen = {}
+        for path, index in chunks:
+            for key, sig in index.items():
+                if seen.setdefault(key, (path, sig))[1] != sig:
+                    clashes.append(f"  path {key}: {seen[key][0]} and {path}")
+    if clashes:
+        raise ValueError("paths extracted from different traj.txt files:\n"
+                         + "\n".join(clashes[:10]) + ("\n  ..." if len(clashes) > 10 else ""))
+
+    os.makedirs(out_dir, exist_ok=True)
+    written = {}
+    for name, chunks in sorted(by_name.items()):
+        target = os.path.join(out_dir, name)
+        keys = set().union(*(index for _, index in chunks))
+        if len(chunks) == 1:
+            if chunks[0][0] != target:
+                shutil.copy2(chunks[0][0], target)
+        else:
+            entries = {}
+            for path, _ in chunks:
+                entries.update(_chunk_entries(load_chunk(path)))
+            _write_chunk(target, entries, next(iter(permeants)))
+        written[name] = len(keys)
+    return written
+
+
 _TOPO: _Topology | None = None
 
 
@@ -3773,6 +3837,32 @@ def chiral_extract(
     errors = extract_many(units, tpr, permeant, cache, tag, workers, overw, paths_per_file)
     if errors:
         raise typer.Exit(code=1)
+
+
+def chiral_merge_cache(
+    # ── Input data ────────────────────────────────────────────────────────
+    caches: Annotated[Optional[str], typer.Option("-in", help="Cache folders of ONE stage to merge, comma-separated (e.g. the chiral_cache folders of two places the same stage was extracted). Required", rich_help_panel=panels.INPUT)] = None,
+
+    # ── Output ────────────────────────────────────────────────────────────
+    out: Annotated[Optional[str], typer.Option("-out", help="Merged cache folder; may be one of -in. Point chiral-compare's -cache-l/-cache-d at it. Required", rich_help_panel=panels.OUTPUT)] = None,
+):
+    """Merge chiral-extract caches of the same stage into one folder.
+
+    Chunk files of the same name (same run-directory tag and path range) hold
+    different paths when the stage was extracted in parts, so their entries
+    are combined. Other chunks are copied unchanged; chunks written with a
+    different -paths-per-file can share the folder, since chiral-compare
+    finds each path in whichever chunk holds it. A path cached twice from
+    different traj.txt files stops the merge before anything is written.
+    """
+    folders = _split(caches)
+    if not folders or out is None:
+        raise typer.BadParameter("-in and -out are required.")
+    try:
+        written = merge_caches(folders, out)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc))
+    print(f"  {sum(written.values())} paths in {len(written)} chunk file(s) in {out}")
 
 
 def chiral_compare(
