@@ -1744,6 +1744,50 @@ def load_path_weights(weights_file='path_weights.txt'):
     return weights
 
 
+#: WHAM's list of the [0-] paths, written next to path_weights.txt.
+MINUS_WEIGHTS_FILE = 'pathweights_0_min.txt'
+
+
+def load_minus_paths(weights_file):
+    """The [0-] path numbers WHAM lists next to `weights_file`, or None.
+
+    WHAM writes pathweights_0_min.txt and pathweights_0_plus.txt beside
+    path_weights.txt, from infretis_data.txt's own ensemble labels. That is
+    the authority on which paths are [0-]: the ensemble stored in a path
+    file is wrong for swapped paths in files written before path_ensemble
+    read the full order.txt.
+    """
+    f = os.path.join(os.path.dirname(weights_file) or '.', MINUS_WEIGHTS_FILE)
+    if not os.path.isfile(f):
+        return None
+    # Newer WHAM output heads the file with a path-type summary, one line of
+    # it without '#' ("Sum of path count:719"), so only "<path> <weight>"
+    # lines are read.
+    minus = set()
+    with open(f) as fh:
+        for line in fh:
+            parts = line.split()
+            if len(parts) < 2 or not parts[0].isdigit():
+                continue
+            try:
+                float(parts[1])
+            except ValueError:
+                continue
+            minus.add(int(parts[0]))
+    return minus
+
+
+def describe_minus_source(weights_file, minus):
+    """One line saying where the [0-] membership comes from."""
+    if minus is not None:
+        f = os.path.join(os.path.dirname(weights_file) or '.', MINUS_WEIGHTS_FILE)
+        return f"[0-] paths: the {len(minus)} that {f} lists"
+    return (f"WARNING: no {MINUS_WEIGHTS_FILE} next to {weights_file}; [0-] "
+            "paths taken from the ensemble stored in the path files, which "
+            "files written before 2026-11-18 have wrong for paths made by a "
+            "[0-]/[0+] swap (they count as unreactive)")
+
+
 def read_toml(toml_file):
     if os.path.isfile(toml_file):
         with open(toml_file, mode="rb") as fh:
@@ -1821,6 +1865,28 @@ def align_order_with_plan(order, plan, g96_index):
             + '; they must line up for the order parameter to index the frames.'
         )
     return order, None
+
+
+def path_ensemble(order, lambda_minus_one, lambda_A):
+    """'plus' or 'minus' from the endpoints of the path's full order.txt.
+
+    A [0+] path starts or ends between lambda_-1 and lambda_A; a [0-] path
+    ends beyond lambda_A or below lambda_-1 on both sides.
+
+    `order` must be order.txt as read, before align_order_with_plan drops the
+    .g96 row. A path made by a [0-]/[0+] swap starts or ends on that .g96
+    phase point, and the frame next to it lies on the other side of lambda_A.
+    Reading the endpoints after the drop therefore made a swapped [0-] path
+    look like a [0+] path (stored as unreactive), and made a swapped reactive
+    [0+] path, which then has no endpoint below lambda_A, look like [0-].
+    neighbours and generate-cvs always read the full file.
+    """
+    order = np.atleast_2d(order)
+    first, last = order[0, 1], order[-1, 1]
+    if (lambda_minus_one < first < lambda_A) or \
+       (lambda_minus_one < last < lambda_A):
+        return "plus"
+    return "minus"
 
 
 def remove_first_last_frames(ensemble, lambda_minus_one, lambda_A, first, last):
@@ -2148,17 +2214,25 @@ def read_path_meta(path):
                 if name.startswith('meta__') and name != 'meta__version'}
 
 
-def path_class_of(meta):
+def path_class_of(meta, is_minus=None):
     """'minus', 'reactive' or 'unreactive' from a path's metadata, else None.
 
     'reactive' is what get_reactive_paths stored: the path's largest order
     parameter is beyond lambda_B. A [0-] path never gets there, but counting
     it as unreactive would mix a different ensemble into that class, so it
     is a class of its own - the same split chiral-compare makes.
+
+    `is_minus` is whether WHAM lists the path as [0-] (load_minus_paths).
+    Given, it decides the ensemble instead of the one stored in the file,
+    which older files have wrong for swapped paths (see path_ensemble).
     """
-    if 'ensemble' not in meta or 'reactive' not in meta:
+    if 'reactive' not in meta:
         return None
-    if meta['ensemble'] == 'minus':
+    if is_minus is None:
+        if 'ensemble' not in meta:
+            return None
+        is_minus = meta['ensemble'] == 'minus'
+    if is_minus:
         return 'minus'
     return 'reactive' if bool(meta['reactive']) else 'unreactive'
 
@@ -2175,14 +2249,16 @@ def parse_path_subsets(text):
     return subsets
 
 
-def select_paths(weights, path_start, path_end, subset, out_dir=None):
+def select_paths(weights, path_start, path_end, subset, out_dir=None,
+                 minus=None):
     """`weights` restricted to the paths of one class.
 
     The aggregation already leaves out every path without a positive weight,
     so a subset needs no change to it: the paths of the other classes simply
     have none. 'all' returns the weights unchanged. Paths whose file carries
     no class (written before the metadata existed) are left out of every
-    subset and counted.
+    subset and counted. `minus`: WHAM's [0-] path numbers (load_minus_paths),
+    which decide the ensemble; None uses the one stored in each file.
     """
     if subset == 'all':
         return weights
@@ -2192,7 +2268,8 @@ def select_paths(weights, path_start, path_end, subset, out_dir=None):
         w = weights.get(pn, 0.0)
         if not w > 0.0:
             continue
-        cls = path_class_of(read_path_meta(path_output_file(pn, out_dir)))
+        cls = path_class_of(read_path_meta(path_output_file(pn, out_dir)),
+                            None if minus is None else pn in minus)
         if cls is None:
             unknown += 1
             continue
@@ -3607,18 +3684,17 @@ def process_single_path(
         # second *column* of the only row.
         order = np.loadtxt(f"../load/{path_number}/order.txt",
                            comments=("#", "@"))
+        full_order = np.atleast_2d(order)
 
         plan, g96_index = read_traj_plan(f"../load/{path_number}/traj.txt")
         order, problem = align_order_with_plan(order, plan, g96_index)
         if problem:
             return (path_number, 'skipped', problem)
 
+        # The ensemble from the whole path, the .g96 row included; the frame
+        # trimming below from the frames that exist. See path_ensemble.
+        ensemble = path_ensemble(full_order, lambda_minus_one, lambda_A)
         first, last = order[0, 1], order[-1, 1]
-
-        ensemble = "plus" \
-            if (lambda_minus_one < first < lambda_A) or \
-               (lambda_minus_one < last  < lambda_A) \
-            else "minus"
 
         reactive = get_reactive_paths(path_number, infretis_data_file, lambda_B)
         if reactive is None:
@@ -5567,11 +5643,15 @@ def membrane_spatial(
 
     if args.plot:
         all_weights = load_path_weights(args.weights)
+        minus = load_minus_paths(args.weights)
+        if any(s != 'all' for s in subsets):
+            print(describe_minus_source(args.weights, minus))
         for subset in subsets:
             plot_out = (PLOT_OUT if subset == 'all'
                         else os.path.join(PLOT_OUT, subset))
             print(f"\n══ {subset} paths -> {plot_out} ══")
-            weights = select_paths(all_weights, args.start, end, subset)
+            weights = select_paths(all_weights, args.start, end, subset,
+                                   minus=minus)
             if not weights:
                 print(f"  no weighted {subset} paths; nothing to aggregate")
                 continue
