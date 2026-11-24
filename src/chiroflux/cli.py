@@ -56,7 +56,7 @@ _COMMANDS = {
     "membrane-compare": _Command(
         "membrane_compare",
         "membrane_compare",
-        "Depth-matched membrane distortion of two path classes (reactive vs not).",
+        "Depth-matched membrane distortion: two path classes, or two runs (L vs D).",
     ),
     "neighbours": _Command(
         "neighbours",
@@ -142,6 +142,16 @@ _COMMANDS = {
         "chiral_plot",
         "chiral_plot",
         "Redraw the figures of a chiral-compare result from its tables.",
+    ),
+    "cv-compare": _Command(
+        "cv_compare",
+        "cv_compare",
+        "Every CV of two simulations (or reactive vs not) compared along the OP.",
+    ),
+    "cv-plot": _Command(
+        "cv_plot",
+        "cv_plot",
+        "Redraw the figures of a cv-compare result from its tables.",
     ),
 }
 

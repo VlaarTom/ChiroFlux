@@ -33,10 +33,41 @@ The many bins and observables make some bins significant by chance: about
 ``alpha`` of the usable bins, which the ranking reports beside each count.
 Neighbouring bins are correlated, so an isolated significant bin means less
 than a run of them.
+
+Two simulations (``-run-b``):
+
+The same comparison between two runs - the L and the D enantiomer - instead
+of two classes of one run. Each run is given by its run directory
+(``-run-a``, ``-run-b``), and ``-dir`` and ``-weights`` name the per-path
+folder and the weights file inside every run, so they are given once. Each
+run keeps its own weights, path numbers and MC-time blocks. The runs share no Monte-Carlo chain, so their means are
+independent and the error of the difference is sqrt(err_A² + err_B²), each
+from its own run's block jackknife. The t threshold uses min(K_A, K_B) - 1
+degrees of freedom, the conservative end of the Welch range.
+
+The depth axis and the leaflet names are in the lab frame, so a run that
+entered from the other face covers the opposite depths with its leaflets
+named the other way round. ``-rotate-b`` puts B in A's frame by the 180°
+rotation about x, (x, y, z) -> (x, -y, -z). A rotation and not the mirror
+z -> -z, because a mirror would turn the chiral lipids into their
+enantiomers; the rotation only relabels coordinates. Under it
+
+* the permeant depth, and the water height in ``water_z_depth``, change sign,
+* upper and lower swap, in every observable that names a leaflet,
+* the phosphate z-displacements (``def_*``) change sign,
+* the azimuth φ, measured from +y, becomes 180° - φ,
+* the maps' depth bins and y axis reverse,
+
+and everything else - P2, tilt θ against each leaflet's own inward normal,
+thicknesses, |H|, diffusion, water counts - is unchanged. The Gaussian
+curvature is stored for the upper leaflet only, so B's rotated K has no
+counterpart in A and is left out. See ``rotated_observable``.
 """
 
 import fnmatch
 import os
+from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Annotated, Optional
 
 import matplotlib
@@ -75,27 +106,254 @@ _COLOR_B = "#8a1a0d"
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Where a path's data comes from, and in which frame
+# ═════════════════════════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class PathFile:
+    """One per-path file, and whether it is read rotated into the other run's
+    frame (-rotate-b)."""
+    path: str
+    rotate: bool = False
+
+
+def _source(key, where):
+    """The PathFile of path `key`.
+
+    `where` is either the folder of a single run, with `key` its path number,
+    or a {key: PathFile} map over two runs, whose keys are (label, number).
+    """
+    if isinstance(where, Mapping):
+        return where[key]
+    return PathFile(str(ms.path_output_file(key, where)))
+
+
+def _path_number(key):
+    return key[1] if isinstance(key, tuple) else key
+
+
+#: Leaflet tokens the rotation swaps.
+_LEAFLET_SWAP = {"upper": "lower", "lower": "upper"}
+
+
+def rotated_observable(name):
+    """Where observable `name` of run B lands in A's frame under -rotate-b.
+
+    Returns (new name, offset, scale), the value becoming offset + scale *
+    value, or None when the rotated quantity has no counterpart in A's files.
+    The rotation is (x, y, z) -> (x, -y, -z); the module docstring says why.
+    Names are '_'-separated tokens, and a leaflet is always its own token
+    ('upper_sn2_p2_chain', 'H_upper', 'def_upper_r3.00', 'thickness_DOPC_lower').
+    """
+    parts = ms.split_bin_column(name)
+    if parts and parts[0] == "water_z" and parts[1] == "z":
+        # height above the midplane: the column of -z holds this column's data
+        return ms.bin_column("water_z", "z", -parts[2]), 0.0, 1.0
+    tokens = name.split("_")
+    leaflet = any(t in _LEAFLET_SWAP for t in tokens)
+    # K exists for the upper leaflet only; H_radial is the upper leaflet's
+    # signed H. Rotated, both describe the lower leaflet, which A lacks.
+    if ("K" in tokens and leaflet) or tokens[:2] == ["H", "radial"]:
+        return None
+    new = "_".join(_LEAFLET_SWAP.get(t, t) for t in tokens)
+    if tokens[0] == "def":
+        return new, 0.0, -1.0       # lab-frame z-displacement of the phosphates
+    if "phi" in tokens:
+        return new, 180.0, -1.0     # arccos of the in-plane vector against +y
+    return new, 0.0, 1.0
+
+
+def _rotate_table(df):
+    """A per-path table of run B in A's frame: depth negated, observables
+    renamed and transformed as rotated_observable says."""
+    axis = df.columns[0]
+    out = {axis: -df[axis].to_numpy(dtype=float) + 0.0}
+    for col in df.columns[1:]:
+        if not col.endswith("_wsum") or f"{col[:-5]}_wtot" not in df:
+            continue
+        rot = rotated_observable(col[:-5])
+        if rot is None:
+            continue
+        new, off, scale = rot
+        ws = df[col].to_numpy(dtype=float)
+        wt = df[f"{col[:-5]}_wtot"].to_numpy(dtype=float)
+        # the stored sums are Σ w·v and Σ w, so v -> off + scale·v is linear
+        out[f"{new}_wsum"] = off * wt + scale * ws
+        out[f"{new}_wtot"] = wt
+    return pd.DataFrame(out)
+
+
+def _is_mirror_symmetric(values, atol):
+    v = np.asarray(values, dtype=float)
+    return np.allclose(v, -v[::-1], atol=atol)
+
+
+def _rotate_spatial(sp):
+    """A path's maps in the other run's frame: depth bins and the y axis
+    reversed, observables renamed and transformed as rotated_observable says.
+
+    Needs a depth grid and a y grid symmetric about zero, so that a reversed
+    bin is again a bin; membrane-spatial's defaults are.
+    """
+    if not (_is_mirror_symmetric(sp["depth_edges"], 1e-6)
+            and _is_mirror_symmetric(sp["y_coords"], 0.01)):
+        raise ValueError(
+            "-rotate-b needs the maps' depth bins and lateral grid to be "
+            "symmetric about zero; these are depth edges "
+            f"{np.round(sp['depth_edges'], 2).tolist()} and y "
+            f"{np.round(sp['y_coords'], 2).tolist()}.")
+    nx, ny = len(sp["x_coords"]), len(sp["y_coords"])
+    names, ws, wc = [], [], []
+    for i, n in enumerate(sp["names"]):
+        rot = rotated_observable(n)
+        if rot is None:
+            continue
+        new, off, scale = rot
+        count = np.asarray(sp["wcount"][i], dtype=float)
+        names.append(new)
+        ws.append(off * count + scale * np.asarray(sp["wsum"][i], dtype=float))
+        wc.append(count)
+
+    def flip(stack):
+        a = np.asarray(stack)
+        n_obs, n_depth, m = a.shape
+        # cells are x-major (indexing 'ij'), so y is the last grid axis
+        return (a.reshape(n_obs, n_depth, nx, ny)[:, ::-1, :, ::-1]
+                .reshape(n_obs, n_depth, m))
+
+    return {**sp, "names": names, "wsum": flip(ws), "wcount": flip(wc)}
+
+
+def _read_table(key, where, kind):
+    src = _source(key, where)
+    df = ms.read_path_tables(src.path, (kind,)).get(kind)
+    return _rotate_table(df) if df is not None and src.rotate else df
+
+
+def _read_spatial(key, where):
+    src = _source(key, where)
+    sp = ms.read_path_spatial(src.path)
+    return _rotate_spatial(sp) if sp is not None and src.rotate else sp
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Which paths
 # ═════════════════════════════════════════════════════════════════════════════
 
-def classify_paths(path_start, path_end, weights, classes, out_dir):
-    """{path: class} for the weighted paths in `classes`, and the skip counts.
+#: Where membrane-spatial's per-path files and the WHAM path weights sit
+#: inside a run directory (membrane-spatial runs from <run>/analysis).
+DEFAULT_DATA_DIR = os.path.join("analysis", ms.ORDER_OUT)
+DEFAULT_WEIGHTS = os.path.join("wham", "path_weights.txt")
 
-    Same rule as the aggregation: a path without a positive weight is not in
-    the ensemble. A path whose file has no class is counted, not guessed.
+
+def resolve_run(run, data_dir, weights):
+    """(data folder, weights file) inside run directory `run`.
+
+    -dir and -weights name one folder and one file relative to every run, so
+    two runs laid out alike need them once. An absolute path is refused: it
+    would point both runs at the same data.
     """
+    for flag, rel in (("-dir", data_dir), ("-weights", weights)):
+        if os.path.isabs(rel):
+            raise typer.BadParameter(
+                f"{flag} {rel!r}: give it relative to the run directory "
+                "(-run-a, -run-b), not as an absolute path.")
+    if not os.path.isdir(run):
+        raise typer.BadParameter(f"{run}: no such run directory.")
+    folder, wfile = os.path.join(run, data_dir), os.path.join(run, weights)
+    if not os.path.isfile(wfile):
+        raise typer.BadParameter(
+            f"{wfile}: no such weights file (-weights {weights!r} in {run}).")
+    return folder, wfile
+
+
+def path_files_in(data_dir):
+    """Sorted numbers of the per-path files <n>.npz in `data_dir`.
+
+    Only that name counts: a .tmp of a write in progress, and the old
+    <n>_spatial.npz layout that membrane-spatial no longer reads, are not
+    path files.
+    """
+    if not os.path.isdir(data_dir):
+        raise typer.BadParameter(f"{data_dir}: no such folder of "
+                                 "membrane-spatial path files.")
+    pns = []
+    for entry in os.scandir(data_dir):
+        stem, ext = os.path.splitext(entry.name)
+        if ext == ".npz" and stem.isdigit() and entry.is_file():
+            pns.append(int(stem))
+    return sorted(pns)
+
+
+def classify_paths(weights, classes, out_dir, minus=None):
+    """{path: class} for every path file in `out_dir` with a positive weight
+    and a class in `classes`, and a summary of what was left out.
+
+    Every file in the folder is considered: there is no path range. Same rule
+    as the aggregation: a path without a positive weight (burn-in, or not in
+    the weights file) is not in the ensemble. A path whose file has no class
+    (an older membrane-spatial) is counted, not guessed. Weighted paths that
+    have no file are counted too, since they are data the comparison lacks.
+
+    `minus`: WHAM's [0-] path numbers (ms.load_minus_paths), which decide
+    the ensemble; None uses the one stored in each file. The summary counts
+    the paths whose class this changes ("relabelled").
+    """
+    files = path_files_in(out_dir)
     cls_of = {}
-    no_weight = unknown = 0
-    for pn in range(path_start, path_end + 1):
+    no_weight = unknown = relabelled = 0
+    for pn in files:
         if not weights.get(pn, 0.0) > 0.0:
             no_weight += 1
             continue
-        cls = ms.path_class_of(ms.read_path_meta(ms.path_output_file(pn, out_dir)))
+        meta = ms.read_path_meta(ms.path_output_file(pn, out_dir))
+        cls = ms.path_class_of(meta, None if minus is None else pn in minus)
+        if minus is not None and cls != ms.path_class_of(meta):
+            relabelled += 1
         if cls is None:
             unknown += 1
         elif cls in classes:
             cls_of[pn] = cls
-    return cls_of, no_weight, unknown
+    have = set(files)
+    no_file = sum(1 for pn, w in weights.items() if w > 0.0 and pn not in have)
+    return cls_of, {"files": len(files), "no_weight": no_weight,
+                    "unknown": unknown, "no_file": no_file,
+                    "relabelled": relabelled}
+
+
+def _report_selection(head, info):
+    """Print what classify_paths took and left out."""
+    print(f"{head}  ({info['files']} path files; {info['no_weight']} without a "
+          "positive weight left out)")
+    if info.get("relabelled"):
+        print(f"  {info['relabelled']} weighted path(s) classed differently "
+              "from their file: WHAM's [0-] list decides (the file's stored "
+              "ensemble is wrong for swapped paths written before 2026-11-18)")
+    if info["unknown"]:
+        print(f"  {info['unknown']} weighted path(s) have no class in their "
+              "file (not written by the current membrane-spatial); left out")
+    if info["no_file"]:
+        print(f"  {info['no_file']} weighted path(s) have no file in the "
+              "folder (not yet run through membrane-spatial)")
+
+
+def collect_run(label, data_dir, weights, classes, rotate=False, minus=None):
+    """One run of a two-run comparison, every path of it labelled `label`.
+
+    The weighted paths of `classes` among the files in `data_dir`, keyed
+    (label, path number) because the two runs' path numbers overlap; `minus`
+    as in classify_paths. Returns {key: label}, {key: weight},
+    {key: PathFile} and a summary dict.
+    """
+    cls_of, info = classify_paths(weights, classes, data_dir, minus)
+    keys = [(label, pn) for pn in sorted(cls_of)]
+    info["per_class"] = {c: sum(1 for v in cls_of.values() if v == c)
+                         for c in classes}
+    return ({k: label for k in keys},
+            {k: weights[k[1]] for k in keys},
+            {k: PathFile(str(ms.path_output_file(k[1], data_dir)), rotate)
+             for k in keys},
+            info)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -107,19 +365,29 @@ def _scan(pns, kind, out_dir):
 
     Reads names and axes only, like ms._scan_tables. The column set is the
     union over paths, so one file from before a schema change cannot drop
-    columns from the comparison.
+    columns from the comparison. `out_dir` is a folder or a {key: PathFile}
+    map (see _source); a rotated file is reported in the other run's frame.
     """
     centers, cols, axis_name = set(), set(), None
     for pn in pns:
-        path = ms.path_output_file(pn, out_dir)
-        names = ms.read_path_columns(path, kind)
-        axis = ms.read_path_axis(path, kind)
+        src = _source(pn, out_dir)
+        names = ms.read_path_columns(src.path, kind)
+        axis = ms.read_path_axis(src.path, kind)
         if not names or axis is None:
             continue
         axis_name = names[0]
-        cols.update(c[:-len("_wsum")] for c in names if c.endswith("_wsum"))
+        obs = [c[:-len("_wsum")] for c in names if c.endswith("_wsum")]
+        if src.rotate:
+            axis = -np.asarray(axis, dtype=float) + 0.0
+            obs = [r[0] for r in map(rotated_observable, obs) if r is not None]
+        cols.update(obs)
         centers.update(np.round(axis, 6).tolist())
     return np.array(sorted(centers)), axis_name, sorted(cols)
+
+
+def _blocks_per_class(K, labels):
+    """K as {class: blocks}: one shared count, or each run's own."""
+    return dict(K) if isinstance(K, Mapping) else {c: K for c in labels}
 
 
 def _block_sums(pns, block_of, K, cls_of, w_of, labels, kind, centers, obs,
@@ -127,16 +395,18 @@ def _block_sums(pns, block_of, K, cls_of, w_of, labels, kind, centers, obs,
     """Per class: (K, n_bins, n_obs) block sums of wsum and wtot, and Σwtot².
 
     Each path's stored sums are multiplied by its weight here, as in the
-    aggregation. Σ(w·wtot)² over paths is what the Kish n_eff needs.
+    aggregation. Σ(w·wtot)² over paths is what the Kish n_eff needs. K is one
+    count for both classes, or {class: K} when each has its own blocks.
     """
     n, C = len(centers), len(obs)
-    S = {c: np.zeros((K, n, C)) for c in labels}
-    T = {c: np.zeros((K, n, C)) for c in labels}
+    Ks = _blocks_per_class(K, labels)
+    S = {c: np.zeros((Ks[c], n, C)) for c in labels}
+    T = {c: np.zeros((Ks[c], n, C)) for c in labels}
     Q = {c: np.zeros((n, C)) for c in labels}
     ws_cols = [f"{o}_wsum" for o in obs]
     wt_cols = [f"{o}_wtot" for o in obs]
     for pn, k in zip(pns, block_of):
-        df = ms.read_path_tables(ms.path_output_file(pn, out_dir), (kind,)).get(kind)
+        df = _read_table(pn, out_dir, kind)
         if df is None:
             continue
         rows = np.searchsorted(centers, np.round(df.iloc[:, 0].to_numpy(), 6))
@@ -174,12 +444,18 @@ def _jackknife_err(reps):
                         np.nan)
 
 
-def compare_sums(S, T, Q, a, b, min_neff, t_crit):
-    """Class means, their difference b - a, and the joint jackknife on it.
+def compare_sums(S, T, Q, a, b, min_neff, t_crit, independent=False):
+    """Class means, their difference b - a, and the jackknife error on it.
 
     Works on any trailing shape: (K, n_bins, n_obs) for the profiles,
     (K, n_obs, n_depth, M) for the maps. Returns a dict of arrays of that
     shape without the K axis.
+
+    Default: a and b are classes of one MC chain, blocked alike, and the
+    error is the joint jackknife of the difference, covariance included.
+    `independent`: a and b are separate runs, each with its own blocks (K may
+    differ between them); the means are independent and the error is
+    sqrt(err_a² + err_b²).
     """
     out = {}
     reps = {}
@@ -198,7 +474,10 @@ def compare_sums(S, T, Q, a, b, min_neff, t_crit):
 
     usable = np.isfinite(out[f"mean_{a}"]) & np.isfinite(out[f"mean_{b}"])
     delta = np.where(usable, out[f"mean_{b}"] - out[f"mean_{a}"], np.nan)
-    err = _jackknife_err(reps[b] - reps[a])
+    if independent:
+        err = np.hypot(out[f"err_{a}"], out[f"err_{b}"])
+    else:
+        err = _jackknife_err(reps[b] - reps[a])
     enough = (out[f"blocks_{a}"] > 1) & (out[f"blocks_{b}"] > 1)
     err = np.where(usable & enough, err, np.nan)
     with np.errstate(invalid="ignore", divide="ignore"):
@@ -365,13 +644,22 @@ DEFAULT_MAP_OBS = tuple(
 def spatial_names(pns, out_dir):
     """The map observables the files hold and their (n_depth, M) shape.
 
-    Read from the first path that has maps; ([], None) if none has.
+    Read from the first path that has maps; ([], None) if none has. Over two
+    runs, the first path of each: the names both runs have, in A's frame.
     """
+    found = {}
     for pn in pns:
-        sp = ms.read_path_spatial(ms.path_output_file(pn, out_dir))
+        run = pn[0] if isinstance(pn, tuple) else None
+        if run in found:
+            continue
+        sp = _read_spatial(pn, out_dir)
         if sp is not None:
-            return sp["names"], sp["wsum"].shape[1:]
-    return [], None
+            found[run] = (sp["names"], sp["wsum"].shape[1:])
+    if not found:
+        return [], None
+    first, shape = next(iter(found.values()))
+    common = [n for n in first if all(n in names for names, _ in found.values())]
+    return common, shape
 
 
 def select_map_names(spec, available):
@@ -416,16 +704,17 @@ def map_block_sums(pns, block_of, K, cls_of, w_of, labels, names, out_dir):
     """
     ref = S = T = Q = None
     skipped = 0
+    Ks = _blocks_per_class(K, labels)
     for pn, k in zip(pns, block_of):
-        sp = ms.read_path_spatial(ms.path_output_file(pn, out_dir))
+        sp = _read_spatial(pn, out_dir)
         if sp is None:
             continue
         if ref is None:
             ref = sp
             present = [n for n in names if n in sp["names"]]
             shape = (len(present),) + sp["wsum"].shape[1:]
-            S = {c: np.zeros((K,) + shape) for c in labels}
-            T = {c: np.zeros((K,) + shape) for c in labels}
+            S = {c: np.zeros((Ks[c],) + shape) for c in labels}
+            T = {c: np.zeros((Ks[c],) + shape) for c in labels}
             Q = {c: np.zeros(shape) for c in labels}
         same = (sp["wsum"].shape[1:] == ref["wsum"].shape[1:]
                 and np.allclose(sp["x_coords"], ref["x_coords"], atol=0.01)
@@ -565,24 +854,60 @@ def plot_depth_binned_compare(depth, obs, res, name, label, xlabel, cmap,
 # One weighting, start to finish
 # ═════════════════════════════════════════════════════════════════════════════
 
+def assign_blocks(pns, cls_of, a, b, n_blocks, independent):
+    """MC-time blocks: (block_of aligned with pns, K, degrees of freedom).
+
+    One chain: blocks shared by both classes, K an int. Two runs: each run
+    blocked along its own path numbers, K a {class: K} map, and the
+    conservative min(K_a, K_b) - 1 degrees of freedom.
+    """
+    if not independent:
+        block_of, K = ms._assign_blocks(pns, n_blocks)
+        return block_of, K, K - 1
+    block_of, K = np.zeros(len(pns), dtype=int), {}
+    for c in (a, b):
+        idx = [i for i, p in enumerate(pns) if cls_of[p] == c]
+        blk, K[c] = ms._assign_blocks([_path_number(pns[i]) for i in idx],
+                                      n_blocks)
+        block_of[idx] = blk
+    return block_of, K, min(K.values()) - 1
+
+
+def _depth_reached(centers, res, c):
+    """The depth range where class `c` has any data, as text."""
+    rows = (res[f"neff_{c}"] > 0).any(axis=tuple(range(1, res[f"neff_{c}"].ndim)))
+    if not rows.any():
+        return "nowhere"
+    return f"{centers[rows].min():.1f}…{centers[rows].max():.1f} Å"
+
+
 def run_comparison(cls_of, w_of, a, b, n_blocks, min_neff, alpha, map_obs,
-                   map_memory, data_dir, out_dir, overw):
+                   map_memory, data_dir, out_dir, overw, independent=False):
     """Every table, the ranking and the maps for one set of path weights.
 
     `map_obs` is the list of map observables to compare (empty: no maps).
+    `independent`: a and b are two runs (see compare_sums), and `data_dir`
+    the {key: PathFile} map over both.
     """
     os.makedirs(out_dir, exist_ok=True)
     pns = sorted(cls_of)
-    block_of, K = ms._assign_blocks(pns, n_blocks)
-    t_crit = float(stats.t.ppf(1.0 - alpha / 2.0, max(K - 1, 1)))
-    print(f"  {K} MC-time blocks; |t| > {t_crit:.2f} counts as a difference "
+    block_of, K, dof = assign_blocks(pns, cls_of, a, b, n_blocks, independent)
+    t_crit = float(stats.t.ppf(1.0 - alpha / 2.0, max(dof, 1)))
+    blocks = (f"{K[a]} MC-time blocks in {a}, {K[b]} in {b}" if independent
+              else f"{K} MC-time blocks")
+    print(f"  {blocks}; |t| > {t_crit:.2f} counts as a difference "
           f"(two-sided alpha = {alpha:g})")
 
     paths_csv = os.path.join(out_dir, "paths.csv")
     _check_overwrite(paths_csv, overw)
-    pd.DataFrame({"path": pns, "class": [cls_of[p] for p in pns],
-                  "weight": [w_of[p] for p in pns],
-                  "block": block_of}).to_csv(paths_csv, index=False)
+    listing = {"path": [_path_number(p) for p in pns],
+               "class": [cls_of[p] for p in pns],
+               "weight": [w_of[p] for p in pns],
+               "block": block_of}
+    if isinstance(data_dir, Mapping):
+        listing["file"] = [data_dir[p].path for p in pns]
+        listing["rotated"] = [data_dir[p].rotate for p in pns]
+    pd.DataFrame(listing).to_csv(paths_csv, index=False)
 
     ranking, results, available = [], {}, {}
     for kind in DEPTH_TABLES:
@@ -592,7 +917,12 @@ def run_comparison(cls_of, w_of, a, b, n_blocks, min_neff, alpha, map_obs,
             continue
         S, T, Q = _block_sums(pns, block_of, K, cls_of, w_of, (a, b), kind,
                               centers, obs, data_dir)
-        res = compare_sums(S, T, Q, a, b, min_neff, t_crit)
+        res = compare_sums(S, T, Q, a, b, min_neff, t_crit, independent)
+        if independent and kind == SLAB_TABLES[0]:
+            # Two runs need not overlap at all; say where each one is before
+            # an empty ranking leaves the reader guessing.
+            print(f"  depth reached: {a} {_depth_reached(centers, res, a)}, "
+                  f"{b} {_depth_reached(centers, res, b)}")
         results[kind] = (centers, obs, res)
         available[kind] = set(obs)
         out = os.path.join(out_dir, f"{kind}_compare.csv")
@@ -640,18 +970,21 @@ def run_comparison(cls_of, w_of, a, b, n_blocks, min_neff, alpha, map_obs,
 
     if map_obs:
         _compare_maps(pns, block_of, K, cls_of, w_of, a, b, min_neff, t_crit,
-                      alpha, map_obs, map_memory, data_dir, out_dir, overw)
+                      alpha, map_obs, map_memory, data_dir, out_dir, overw,
+                      independent)
     return rank
 
 
 def _compare_maps(pns, block_of, K, cls_of, w_of, a, b, min_neff, t_crit,
-                  alpha, names, memory_gb, data_dir, out_dir, overw):
+                  alpha, names, memory_gb, data_dir, out_dir, overw,
+                  independent=False):
     """The selected map observables, a memory-sized chunk at a time."""
     _, shape = spatial_names(pns, data_dir)
     if shape is None:
         print("  [maps] no spatial maps in the path files; skipped")
         return
-    chunks = map_chunks(names, shape, K, memory_gb)
+    K_max = max(K.values()) if isinstance(K, Mapping) else K
+    chunks = map_chunks(names, shape, K_max, memory_gb)
     if len(chunks) > 1:
         print(f"  [maps] {len(names)} observables in {len(chunks)} passes "
               f"over the path files (-map-memory {memory_gb:g} GB)")
@@ -664,7 +997,7 @@ def _compare_maps(pns, block_of, K, cls_of, w_of, a, b, min_neff, t_crit,
             continue
         skipped = sums["skipped"]
         res = compare_sums(sums["S"], sums["T"], sums["Q"], a, b, min_neff,
-                           t_crit)
+                           t_crit, independent)
         nx, ny = len(sums["x"]), len(sums["y"])
         arrays.update({"x_coords": sums["x"], "y_coords": sums["y"],
                        "depth_edges": sums["depth_edges"]})
@@ -699,9 +1032,12 @@ def _compare_maps(pns, block_of, K, cls_of, w_of, a, b, min_neff, t_crit,
     print(f"  -> spatial_compare.npz, map_ranking.csv, {drawn} map figures")
 
 
-def _print_top(rank, n=12):
+def _print_top(rank, two_runs=False, n=12):
     if rank.empty:
         print("  nothing has a usable bin in both classes")
+        if two_runs:
+            print("  (two runs that entered from opposite faces share no depth "
+                  "bins until one is rotated: see -rotate-b)")
         return
     print(f"  {'observable':<34} {'table':<13} {'sig/usable':>11} "
           f"{'max|t|':>7} {'at z':>7} {'delta':>11}")
@@ -716,69 +1052,140 @@ def _print_top(rank, n=12):
 # CLI
 # ═════════════════════════════════════════════════════════════════════════════
 
-def membrane_compare(
-    # ── Input data ────────────────────────────────────────────────────────
-    weights: Annotated[str, typer.Option("-weights", help="WHAM path weights, the same file membrane-spatial -plot uses.", rich_help_panel=panels.INPUT)] = "path_weights.txt",
-    data_dir: Annotated[str, typer.Option("-dir", help="Folder of per-path files that membrane-spatial wrote.", rich_help_panel=panels.INPUT)] = ms.ORDER_OUT,
-    a: Annotated[str, typer.Option("-a", help="Reference path class: reactive, unreactive or minus.", rich_help_panel=panels.INPUT)] = "unreactive",
-    b: Annotated[str, typer.Option("-b", help="Path class compared against -a. The difference reported is B minus A.", rich_help_panel=panels.INPUT)] = "reactive",
-
-    # ── Dataset construction ──────────────────────────────────────────────
-    start: Annotated[int, typer.Option("-start", help="REQUIRED. First path number.", rich_help_panel=panels.DATASET)] = ...,
-    end: Annotated[Optional[int], typer.Option("-end", help="Last path number (default: -start).", rich_help_panel=panels.DATASET)] = None,
-
-    # ── Model and training ────────────────────────────────────────────────
-    n_blocks: Annotated[int, typer.Option("-n-blocks", help="Contiguous MC-time blocks for the joint jackknife, shared by both classes. Blocks must be longer than the path decorrelation time; a class present in only a few blocks gets a noisy error, and in fewer than two none at all.", rich_help_panel=panels.MODEL)] = 20,
-    min_neff: Annotated[float, typer.Option("-min-neff", help="Leave out depth bins (and map cells) where either class rests on fewer than this effective number of paths (Kish n_eff).", rich_help_panel=panels.MODEL)] = ms.MIN_NEFF,
-    alpha: Annotated[float, typer.Option("-alpha", help="Two-sided significance level per bin; the threshold is Student's t with n_blocks - 1 degrees of freedom.", rich_help_panel=panels.MODEL)] = 0.05,
-    unweighted: Annotated[bool, typer.Option("-unweighted", help="Also run the comparison with every path weighted equally, into <out-dir>/unweighted. Same paths; a difference that appears only with the WHAM weights rests on a few heavy paths.", rich_help_panel=panels.MODEL)] = False,
-    map_memory: Annotated[float, typer.Option("-map-memory", help="Roughly how many GB the map comparison may hold at once. A selection that needs more is compared in chunks of observables, each one more pass over the path files - slower, not less exact.", rich_help_panel=panels.MODEL)] = 2.0,
-
-    # ── Output ────────────────────────────────────────────────────────────
-    out_dir: Annotated[Optional[str], typer.Option("-out-dir", help="Output folder (default: <membrane-spatial plot folder>/compare_<b>_vs_<a>).", rich_help_panel=panels.OUTPUT)] = None,
-    map_obs: Annotated[str, typer.Option("-map-obs", help="Which permeant-centred 2-D maps to compare per depth bin. 'default': chain order (P2) and tilt of both chains, thickness and curvature H, all lipids, each leaflet and both. 'all': every map the files hold, i.e. also per bond, per species and phi. Otherwise comma-separated shell patterns on the map names <obs>[_<SPECIES>][_<leaflet>], e.g. 'thickness*,p2_sn2_bond_*_DOPC'. 'none' skips the maps. map_ranking.csv ranks whatever is selected.", rich_help_panel=panels.OUTPUT)] = "default",
-    overw: Annotated[bool, typer.Option("-O", help="Overwrite existing files.", rich_help_panel=panels.OUTPUT)] = False,
-):
-    """Depth-matched membrane distortion of two path classes, and where they differ.
-
-    Reads the per-path files membrane-spatial wrote, so no trajectory is
-    re-read. Every observable of the depth-resolved tables (order, tilt,
-    thickness, curvature, core water, permeant diffusion, and the radial
-    phosphate deformation and water profiles per depth bin) is compared bin
-    by bin on the permeant-depth axis, with a block-jackknife error on the
-    difference itself. distortion_ranking.csv lists what differs most;
-    overview_t.png shows it against depth.
-    """
+def _one_run(weights, data_dir, a, b):
+    """Two classes of one run, from every path file in `data_dir`:
+    ({pn: class}, {pn: weight}, a, b)."""
+    a = a or "unreactive"
+    b = b or "reactive"
     for flag, cls in (("-a", a), ("-b", b)):
         if cls not in ms.PATH_CLASSES:
             raise typer.BadParameter(
                 f"{flag}: {cls!r} is not one of {', '.join(ms.PATH_CLASSES)}.")
     if a == b:
         raise typer.BadParameter("-a and -b name the same class.")
-    end = end if end is not None else start
-    out_dir = out_dir or os.path.join(ms.PLOT_OUT, f"compare_{b}_vs_{a}")
 
     w_all = ms.load_path_weights(weights)
-    cls_of, no_weight, unknown = classify_paths(start, end, w_all, (a, b),
-                                                data_dir)
+    minus = ms.load_minus_paths(weights)
+    print(ms.describe_minus_source(weights, minus))
+    cls_of, info = classify_paths(w_all, (a, b), data_dir, minus)
     counts = {c: sum(1 for v in cls_of.values() if v == c) for c in (a, b)}
-    print(f"paths {start}–{end} in {data_dir}: "
-          + ", ".join(f"{c} {n}" for c, n in counts.items())
-          + f"  ({no_weight} without a positive weight left out)")
-    if unknown:
-        print(f"  {unknown} weighted path(s) have no class in their file (not "
-              "written by the current membrane-spatial); left out")
+    _report_selection(f"{data_dir}: "
+                      + ", ".join(f"{c} {n}" for c, n in counts.items()), info)
     for c, n in counts.items():
         if n == 0:
             raise typer.BadParameter(
-                f"No weighted {c} paths with a membrane-spatial file between "
-                f"{start} and {end}.")
+                f"No weighted {c} paths with a membrane-spatial file in "
+                f"{data_dir}.")
+    return cls_of, {p: w_all[p] for p in cls_of}, a, b
+
+
+def _two_runs(runs, paths):
+    """Two runs, every selected path of each labelled with its run.
+
+    runs: (label, folder, weights file, rotate) for A and B; every path file
+    in the folder is considered. Returns ({key: label}, {key: weight},
+    {key: PathFile}).
+    """
+    subsets = ms.parse_path_subsets(paths)
+    classes = ms.PATH_CLASSES if "all" in subsets else subsets
+    cls_of, w_of, where = {}, {}, {}
+    for label, folder, wfile, rotate in runs:
+        w = ms.load_path_weights(wfile)
+        if not any(v > 0.0 for v in w.values()):
+            raise typer.BadParameter(f"{wfile}: no path has a positive weight.")
+        minus = ms.load_minus_paths(wfile)
+        print(f"{label}: " + ms.describe_minus_source(wfile, minus))
+        c, ww, src, info = collect_run(label, folder, w, classes, rotate, minus)
+        _report_selection(
+            f"{label}: {folder}"
+            + (" (rotated into A's frame)" if rotate else "") + ": "
+            + ", ".join(f"{k} {n}" for k, n in info["per_class"].items()),
+            info)
+        if not c:
+            raise typer.BadParameter(
+                f"{label}: no weighted {'/'.join(classes)} paths with a "
+                f"membrane-spatial file in {folder}.")
+        cls_of.update(c)
+        w_of.update(ww)
+        where.update(src)
+    return cls_of, w_of, where
+
+
+def membrane_compare(
+    # ── Input data ────────────────────────────────────────────────────────
+    run_a: Annotated[str, typer.Option("-run-a", help="REQUIRED. Run directory of one stage, e.g. L_PRO_neutral/infinit_entry; -dir and -weights are looked up inside it.", rich_help_panel=panels.INPUT)] = ...,
+    run_b: Annotated[Optional[str], typer.Option("-run-b", help="Run directory of the same stage of a second simulation, e.g. the other enantiomer, laid out like -run-a. Compares run B against run A instead of two classes of one run; the runs are independent, so the error of the difference is sqrt(err_A² + err_B²) from each run's own block jackknife. Compare like with like: the same stage (entry, internal, escape) of both.", rich_help_panel=panels.INPUT)] = None,
+    data_dir: Annotated[str, typer.Option("-dir", help="Folder of the per-path files that membrane-spatial wrote, relative to the run directory (each run's, with -run-b). Every <n>.npz in it whose path has a positive weight is used; there is no path range.", rich_help_panel=panels.INPUT)] = DEFAULT_DATA_DIR,
+    weights: Annotated[str, typer.Option("-weights", help="WHAM path weights, the file membrane-spatial -plot uses, relative to the run directory (each run's, with -run-b).", rich_help_panel=panels.INPUT)] = DEFAULT_WEIGHTS,
+    a: Annotated[Optional[str], typer.Option("-a", help="Reference path class: reactive, unreactive or minus (default unreactive). One run only; with -run-b, -paths picks the classes.", rich_help_panel=panels.INPUT)] = None,
+    b: Annotated[Optional[str], typer.Option("-b", help="Path class compared against -a (default reactive). The difference reported is B minus A.", rich_help_panel=panels.INPUT)] = None,
+    label_a: Annotated[str, typer.Option("-label-a", help="Name of run A in tables and figures, e.g. L (with -run-b).", rich_help_panel=panels.INPUT)] = "A",
+    label_b: Annotated[str, typer.Option("-label-b", help="Name of run B in tables and figures, e.g. D (with -run-b).", rich_help_panel=panels.INPUT)] = "B",
+
+    # ── Dataset construction ──────────────────────────────────────────────
+    paths: Annotated[str, typer.Option("-paths", help="With -run-b: the path classes pooled in each run, comma-separated from all, reactive, unreactive, minus. 'all' is every classified weighted path, as membrane-spatial -paths all.", rich_help_panel=panels.DATASET)] = "all",
+
+    # ── Symmetry ──────────────────────────────────────────────────────────
+    rotate_b: Annotated[bool, typer.Option("-rotate-b", help="Run B entered from the other face: read it rotated 180° about x, (x, y, z) -> (x, -y, -z). Its depth and water heights change sign, upper and lower leaflet swap, phosphate z-displacements change sign, phi becomes 180 - phi, and the maps' depth bins and y axis reverse. Without it, two runs that entered from opposite faces share no depth bins.", rich_help_panel=panels.SYMMETRY)] = False,
+
+    # ── Model and training ────────────────────────────────────────────────
+    n_blocks: Annotated[int, typer.Option("-n-blocks", help="Contiguous MC-time blocks for the jackknife: shared by both classes of one run, or per run with -run-b. Blocks must be longer than the path decorrelation time; a class present in only a few blocks gets a noisy error, and in fewer than two none at all.", rich_help_panel=panels.MODEL)] = 20,
+    min_neff: Annotated[float, typer.Option("-min-neff", help="Leave out depth bins (and map cells) where either class rests on fewer than this effective number of paths (Kish n_eff).", rich_help_panel=panels.MODEL)] = ms.MIN_NEFF,
+    alpha: Annotated[float, typer.Option("-alpha", help="Two-sided significance level per bin; the threshold is Student's t with n_blocks - 1 degrees of freedom (the smaller run's, with -run-b).", rich_help_panel=panels.MODEL)] = 0.05,
+    unweighted: Annotated[bool, typer.Option("-unweighted", help="Also run the comparison with every path weighted equally, into <out-dir>/unweighted. Same paths; a difference that appears only with the WHAM weights rests on a few heavy paths.", rich_help_panel=panels.MODEL)] = False,
+    map_memory: Annotated[float, typer.Option("-map-memory", help="Roughly how many GB the map comparison may hold at once. A selection that needs more is compared in chunks of observables, each one more pass over the path files - slower, not less exact.", rich_help_panel=panels.MODEL)] = 2.0,
+
+    # ── Output ────────────────────────────────────────────────────────────
+    out_dir: Annotated[Optional[str], typer.Option("-out-dir", help="Output folder (default: <membrane-spatial plot folder>/compare_<b>_vs_<a>, with the run labels for -run-b).", rich_help_panel=panels.OUTPUT)] = None,
+    map_obs: Annotated[str, typer.Option("-map-obs", help="Which permeant-centred 2-D maps to compare per depth bin. 'default': chain order (P2) and tilt of both chains, thickness and curvature H, all lipids, each leaflet and both. 'all': every map the files hold, i.e. also per bond, per species and phi. Otherwise comma-separated shell patterns on the map names <obs>[_<SPECIES>][_<leaflet>], e.g. 'thickness*,p2_sn2_bond_*_DOPC'. 'none' skips the maps. map_ranking.csv ranks whatever is selected.", rich_help_panel=panels.OUTPUT)] = "default",
+    overw: Annotated[bool, typer.Option("-O", help="Overwrite existing files.", rich_help_panel=panels.OUTPUT)] = False,
+):
+    """Depth-matched membrane distortion of two path classes, or of two
+    simulations (-run-b), and where they differ.
+
+    Reads the per-path files membrane-spatial wrote, so no trajectory is
+    re-read: every <n>.npz in <run>/-dir whose path has a positive weight in
+    <run>/-weights, with no path range to set. Every observable of the depth-resolved tables (order, tilt,
+    thickness, curvature, core water, permeant diffusion, and the radial
+    phosphate deformation and water profiles per depth bin) is compared bin
+    by bin on the permeant-depth axis, with a block-jackknife error on the
+    difference itself. distortion_ranking.csv lists what differs most;
+    overview_t.png shows it against depth.
+    """
+    two_runs = run_b is not None
+    if two_runs:
+        if a is not None or b is not None:
+            raise typer.BadParameter(
+                "-a/-b pick two classes of one run; with -run-b the runs are "
+                "compared, and -paths picks the classes pooled in each.")
+        if not label_a or not label_b or label_a == label_b:
+            raise typer.BadParameter("-label-a and -label-b must be two "
+                                     "different, non-empty names.")
+        if any(os.sep in lab for lab in (label_a, label_b)):
+            raise typer.BadParameter("-label-a/-label-b name files; leave "
+                                     f"out {os.sep!r}.")
+        a, b = label_a, label_b
+        dir_a, w_a = resolve_run(run_a, data_dir, weights)
+        dir_b, w_b = resolve_run(run_b, data_dir, weights)
+        cls_of, w_of, where = _two_runs(
+            [(a, dir_a, w_a, False), (b, dir_b, w_b, rotate_b)], paths)
+    else:
+        given = [flag for flag, v in (("-rotate-b", rotate_b or None),
+                                      ("-paths", None if paths == "all" else paths))
+                 if v is not None]
+        if given:
+            raise typer.BadParameter(f"{', '.join(given)} only apply with "
+                                     "-run-b, a second simulation.")
+        dir_a, w_a = resolve_run(run_a, data_dir, weights)
+        cls_of, w_of, a, b = _one_run(w_a, dir_a, a, b)
+        where = dir_a
+    out_dir = out_dir or os.path.join(ms.PLOT_OUT, f"compare_{b}_vs_{a}")
 
     # Resolved before any work, so a pattern that matches nothing fails here
     # rather than after the profiles have been written.
     names = []
     if map_obs.strip() != "none":
-        available, _ = spatial_names(sorted(cls_of), data_dir)
+        available, _ = spatial_names(sorted(cls_of), where)
         names = select_map_names(map_obs, available)
         if available and not names:
             raise typer.BadParameter(
@@ -788,18 +1195,17 @@ def membrane_compare(
             print(f"maps: {len(names)} of {len(available)} observables")
 
     print("\n══ WHAM-weighted ══")
-    rank = run_comparison(cls_of, {p: w_all[p] for p in cls_of}, a, b,
-                          n_blocks, min_neff, alpha, names, map_memory,
-                          data_dir, out_dir, overw)
+    rank = run_comparison(cls_of, w_of, a, b, n_blocks, min_neff, alpha, names,
+                          map_memory, where, out_dir, overw, two_runs)
     print("\nlargest differences:")
-    _print_top(rank)
+    _print_top(rank, two_runs)
 
     if unweighted:
         sub = os.path.join(out_dir, "unweighted")
         print(f"\n══ unweighted (every path equal; written to {sub}) ══")
         rank_u = run_comparison(cls_of, {p: 1.0 for p in cls_of}, a, b,
                                 n_blocks, min_neff, alpha, names, map_memory,
-                                data_dir, sub, overw)
+                                where, sub, overw, two_runs)
         print("\nlargest differences, unweighted:")
-        _print_top(rank_u)
+        _print_top(rank_u, two_runs)
     print("\nDone!")
