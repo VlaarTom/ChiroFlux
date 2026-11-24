@@ -196,6 +196,52 @@ hidden `.xtc_offsets.npz`/`.lock` files. A rerun only extracts paths that are
 not cached yet or whose `traj.txt` changed. `chiral-compare` reads only the cache
 and each path's `traj.txt`/`order.txt`, not the trajectories.
 
+#### Permeant conformation, two-donor contacts and lipid torsions
+
+**Cache version 5 added these. Older caches are ignored, so every stage has to
+be re-extracted.** `chiral-extract` lists, once, any feature the topology lacks
+the atoms for; that feature is NaN.
+
+What extraction stores:
+
+- **The permeant's conformation:**
+  - the pucker torsion χ1;
+  - the side of the N–H (H–N–CA–C);
+  - the O=C–X–H torsion: the COOH for `pro`, the amide for `pro_yne`;
+  - the H···acceptor distances of the intramolecular N–H···O=C and X–H···N
+    bonds.
+
+  The torsions are stored in L's sign convention (D's negated), so one
+  definition holds for both enantiomers.
+- **Choline N⁺ next to a permeant acceptor**, within 4.5 Å.
+- **The contacted lipid's sn-2 and sn-1 carbonyl orientations**, with their
+  mean over all lipids.
+- **Eight more lipid torsions**, for the contacted lipid and for all lipids:
+  - rotation about C2–O21 and the start of the sn-2 chain;
+  - the same two for sn-1;
+  - the glycerol–phosphate–choline link.
+
+What `chiral-compare` adds:
+
+| output | what it tests |
+| --- | --- |
+| `depth_profiles.csv`, new rows | populations of `endo` (Cγ-endo), `nh_cis` (N–H on the carboxyl side), `co_anti`, `ihb_nh_o`, `ihb_xh_n` and `bidentate` (both donors on one lipid), plus `n_chol_acc`, `co2_n`/`co1_n` (contacted lipid) and their `_bulk` means |
+| `bidentate_pairs.csv` | frames with both donors H-bonded to the same lipid, by acceptor pair (e.g. `PO4+CO_sn2`), per contact depth |
+| `ddG_by_bidentate_state.csv` | which two-donor state carries the free-energy difference |
+| `conformers_by_contact.csv` | each conformer's population given each donor's H-bond partner |
+| `lipid_conformers.csv`, `lipid_torsions.csv`/`.npz` | g−/t/g+ populations and 30° distributions of the new lipid torsions, contacted vs bulk, and the contact-induced shift |
+
+These conformer labels are the same in both mirror images, so L − D is the test.
+
+The blocking analysis follows `Cg-endo` and `two donors on one lipid`. It
+reports `O=C-X-H anti` without letting it choose the block: the COOH turns anti
+so rarely that paths inherit the state rather than sample it. Its rows
+(`co_anti`, `ihb_xh_n`) therefore have error bars that are too small, and
+`block_choice.csv` says what block they would need.
+
+Each cache chunk is roughly twice as large in memory as before. If memory runs
+short, lower `-workers`.
+
 ### `chiral_plot`
 
 **Command:** `chiral-plot`
@@ -303,7 +349,7 @@ chiroflux cv-compare  <-runs-a/-runs-b/... as above> \
 | `PRO_sign_vol`, `PRO_dih_*`, `PRO_hCN_*`, `PRO_nCos_*` | chirality-odd; hCN/nCos use the molecule's own frame, so the face does not matter | `-mirror-b` |
 | `PRO_CP_phi2` | puckering phase; the mirror image is half a cycle away | `-phase-shift-b` |
 | `PRO_r_plane`, `PRO_r_plane_arccos` | PCA ring normal with an arbitrary sign | compare as cos² |
-| `PRO_azim_*` | odd under the enantiomer *and* under the face flip, so the two cancel | none |
+| `PRO_azim_*`, `Mem_*_swirl*` | odd under the enantiomer *and* under the face flip, so the two cancel | none |
 
 Patterns are substrings; `'_tilt$'` is anchored to the end of the name so
 it leaves the `Mem_*_tiltN` counts alone (quote it in the shell). They are
@@ -324,9 +370,18 @@ chiroflux cv-compare  <-runs-a/-runs-b/... and the corrections above> \
 ```
 
 A test is `COL>v`, `COL>=v`, `COL<v`, `COL<=v` or `lo<COL<hi` (`<=` allowed),
-with `abs(COL)` for |COL|. It acts on the CV in its file units, never on the
-cos of `-angle-cols`, after B's corrections of that CV. So write it in A's
-convention:
+with `abs(COL)` for |COL|.
+
+- **Joint states.** Tests joined by `&` must all hold, e.g.
+  `endo_cis=PRO_dih_chi1>0&abs(PRO_dih_NH)<90`. Two enantiomers can agree on
+  every state on its own and still differ in how often the states combine.
+- **Switching rates.** `NAME=flip(TEST)` is 1 at each frame where that state
+  changes before the next frame. Its mean per bin is the switching rate per
+  frame step, by where along the path it happens; divide by the frame spacing
+  for a rate in time. Switches faster than the frame spacing are missed.
+
+Each test acts on its CV in the file's units, never on the cos of
+`-angle-cols`, after B's corrections of that CV. So write it in A's convention:
 
 - With `-mirror-b PRO_dih_`, D's χ1 is negated first, and `PRO_dih_chi1>0` is
   Cγ-endo for both enantiomers.
@@ -372,7 +427,43 @@ mirror images, while the torsions change sign. That is why the χ columns take
 `PRO_CP_phi2` carries the same information as a phase. Which of its values is
 endo depends on the twist of the ring, so label puckers with χ1.
 
-These two columns are the last ones in the file. CV files written before they
+**Ring nitrogen, intramolecular H-bonds, choline contacts.**
+
+- `PRO_dih_NH` (H01–N–CA–C) says which side of the ring the N–H points to.
+  |τ| < 90° is the carboxyl's side. The ring nitrogen inverts, so this is a
+  real two-state coordinate, not just a vibration.
+- `PRO_rHB_NH_O`, `PRO_rHB_NH_O01` and `PRO_rHB_OH_N` are the H···acceptor
+  distances (nm) of the intramolecular N–H···O=C, N–H···O(H) and O–H···N
+  H-bonds. Below about 0.25 nm the bond is made; O–H···N needs the anti COOH.
+- `PRO_chol_O` and `PRO_chol_N` count the choline N⁺ within 0.45 nm of the
+  carboxyl oxygens and of the ring N. These are cation–dipole contacts, which
+  H-bond counts cannot see, because the lipids have no donors.
+
+**Swirl of the lipids around the permeant.**
+
+- `Mem_{u,l}_swirlPN` and `Mem_{u,l}_swirlPC` are the mean (r̂ × t̂)·ẑ over the
+  lipids within 1 nm in the plane, where t is each lipid's P→N (headgroup) or
+  P→C2 (glycerol) vector. +1 means every one points anticlockwise about the
+  permeant seen from +z, −1 clockwise, and 0 is no net turn.
+- A chiral permeant could twist its neighbourhood one way, so this is a
+  membrane-side chirality test.
+- It is a pseudoscalar about lab +z, like `PRO_azim_*`. It needs `-mirror-*`
+  between enantiomers that entered from the same face, and no correction
+  between opposite faces.
+- An intrinsic swirl of the R-lipid leaflet also enters, with opposite signs
+  in the two leaflets, so compare it against the far leaflet's column.
+- For each phosphorus of a leaflet's P group (`ZCOM_index.ndx` groups 3 and
+  4), the tip is that same lipid's N or glycerol C2, found by residue. A lipid
+  without exactly one such atom leaves the column at 0, with a warning. The
+  ZCOM "C2" groups (9, 10) cannot serve as tips: they hold C21–C23, three per
+  lipid. So `z_C2_T`/`z_C2_B` are the height of the sn-2 ester, not of the
+  glycerol C2.
+- With about 4 lipids per leaflet within 1 nm, one frame is noisy. In the
+  PRO_neutral reference frames, random points give an SD of about 0.3 (P→N)
+  and 0.18 (P→C2) around a mean of 0, so only averages over many frames mean
+  anything.
+
+All these columns are the last ones in the file. CV files written before they
 existed lack them; `cv-compare` lists those paths per stage, with the numbers
 to rerun `generate-cvs -O` on.
 
@@ -1228,7 +1319,7 @@ faces, the face flip (+z becomes −z):
 | CVs | kind | same face | opposite faces |
 | --- | --- | --- | --- |
 | `PRO_hCN_*`, `PRO_hCN_*_s1..s3`, `PRO_nCos_*`, `PRO_sign_vol`, `PRO_dih_*` | signed **pseudoscalar** in the molecule's own frame: odd under the enantiomer, blind to the face | `-mirror-*` | `-mirror-*` |
-| `PRO_azim_u_P`, `PRO_azim_l_P` | signed azimuth **about lab +z**: odd under the enantiomer *and* under the face flip | `-mirror-*` | **none** (the two cancel) |
+| `PRO_azim_u_P`, `PRO_azim_l_P`, `Mem_*_swirlPN`, `Mem_*_swirlPC` | signed azimuth or swirl **about lab +z**: odd under the enantiomer *and* under the face flip | `-mirror-*` | **none** (the two cancel) |
 | `Mem_u_tilt`, `Mem_l_tilt`, `PRO_mode_ring`, `PRO_mode_O`, `PRO_mode_N` | cosine of a **true vector** against +z: blind to the enantiomer, odd under the face flip | none | `-mirror-*` with `'_tilt$'` (negation; `-flip-*` would compute 180 − cos on a column that is already a cosine) |
 | `PRO_rMin_*`, `Mem_u_tiltN`, `Mem_l_tiltN`, `Mem_u_nP`, `Mem_l_nP`, `Water_wire`, `Water_cluster` | true scalar (a distance, a count, a flag) | none | none (leaflet names still swapped) |
 
@@ -1393,6 +1484,13 @@ has nothing to do with chirality.
 **The fix is [`chiroflux leaflet-index`](#leaflet_index)**, which assigns each
 lipid to a leaflet by its own headgroup. Regenerate both simulations' index
 files with it and re-run `generate-cvs`.
+
+### `PRO_N_hb` is not an H-bond count
+
+`PRO_N_hb` counts N–H and O–H "H-bonds" to the choline nitrogen. A quaternary
+ammonium nitrogen has no lone pair and cannot accept one, so the column is
+really a proximity count of a donor next to N⁺. For contacts with choline use
+`PRO_chol_O` and `PRO_chol_N`, which count the permeant's acceptors next to N⁺.
 
 ### `PRO_ang_OH` measures the wrong angle
 
