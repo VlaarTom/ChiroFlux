@@ -120,13 +120,23 @@ between them, and it is no mean at all on a periodic axis (anti at +179 and
     -indicators 'PRO_anti=abs(PRO_dih_OH)>90,PRO_endo=PRO_dih_chi1>0'
 
 whose mean per OP bin is the population of the state, so profiles.csv gives
-it along the path with CI and q like any CV.  Each reads its CV again in the
+it along the path with CI and q like any CV.  Each test reads its CV in the
 file's own units (never the cos of -angle-cols) and takes that CV's B
-corrections before the test, so one test holds for both sides: with
--mirror-b PRO_dih_, D's chi1 is negated first and chi1 > 0 is Cg-endo in both
-(see generate-cvs, PRO_dih_chi1).  The blocking analysis covers indicators
-too; a slow state (one the paths inherit rather than sample, such as the
-anti COOH) then rightly sets a large block.
+corrections first, so one test holds for both sides: with -mirror-b PRO_dih_,
+D's chi1 is negated first and chi1 > 0 is Cg-endo in both (see generate-cvs,
+PRO_dih_chi1).
+
+Tests joined by & must all hold: a joint state, e.g. Cg-endo with the N-H on
+the carboxyl side, 'endo_cis=PRO_dih_chi1>0&abs(PRO_dih_NH)<90'.  Two
+enantiomers can agree on every state alone and still differ in how often
+they combine.  flip(...) turns a state into the frames at which it changes
+before the next frame: its mean is the switching rate per frame step (divide
+by the frame spacing for a rate in time), resolved by where along the path
+it happens.  Switches faster than the frame spacing are missed.
+
+The blocking analysis covers indicators too; a slow state (one the paths
+inherit rather than sample, such as the anti COOH) then rightly sets a large
+block.
 
 Usage
 -----
@@ -147,7 +157,7 @@ import os
 import re
 import warnings
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Annotated, Optional
 
 import numpy as np
@@ -196,31 +206,28 @@ def family(name):
 
 
 _NUM = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
-_TERM = r"(?:abs\(\s*(?P<abs>[^\s()<>=]+)\s*\)|(?P<col>[^\s()<>=]+))"
+_TERM = r"(?:abs\(\s*(?P<abs>[^\s()<>=&]+)\s*\)|(?P<col>[^\s()<>=&]+))"
 _ONE_SIDED = re.compile(rf"^\s*{_TERM}\s*(?P<op>[<>]=?)\s*(?P<v>{_NUM})\s*$")
 _TWO_SIDED = re.compile(rf"^\s*(?P<lo>{_NUM})\s*(?P<op1><=?)\s*{_TERM}\s*(?P<op2><=?)\s*"
                         rf"(?P<hi>{_NUM})\s*$")
+_FLIP = re.compile(r"^\s*flip\((?P<inner>.*)\)\s*$")
 _INDICATOR_NAME = re.compile(r"^[A-Za-z_][\w.\-]*$")
-INDICATOR_FORMS = "NAME=COL>v, NAME=COL<=v, NAME=lo<COL<hi, with abs(COL) for |COL|"
+INDICATOR_FORMS = ("NAME=TEST, TEST being COL>v, COL<=v (etc.) or lo<COL<hi, abs(COL) for "
+                   "|COL|; several TESTs joined by & must all hold; NAME=flip(...) counts "
+                   "the frames at which that state changes")
 
 
 @dataclass(frozen=True)
-class Indicator:
-    """
-    A 0/1 column made from one CV: 1 where the value (|value| if `absolute`)
-    lies inside the bounds, 0 where it does not, NaN where the CV has none.
-    Its weighted mean in an OP bin is the population of that state there,
-    so the profiles give a population along the path with its CI.  A bound
-    of None is open-ended; *_incl makes it inclusive.
-    """
-    name: str
+class Clause:
+    """One test of an indicator: the value of `column` (|value| if
+    `absolute`) inside the bounds.  A bound of None is open-ended; *_incl
+    makes it inclusive."""
     column: str
     absolute: bool = False
     lo: float | None = None
     lo_incl: bool = False
     hi: float | None = None
     hi_incl: bool = False
-    text: str = ""
 
     def __call__(self, x):
         x = np.asarray(x, dtype=float)
@@ -234,31 +241,77 @@ class Indicator:
         return np.where(np.isfinite(x), inside.astype(float), np.nan)
 
 
-def parse_indicator(spec):
-    """One -indicators entry, NAME=TEST (see INDICATOR_FORMS), as an
-    Indicator; ValueError if it is not one of those forms."""
-    name, sep, test = spec.partition("=")
-    name = name.strip()
-    if not sep or not _INDICATOR_NAME.match(name) or not test.strip():
-        raise ValueError(f"{spec!r}: write it as {INDICATOR_FORMS}")
-    m = _TWO_SIDED.match(test)
+@dataclass(frozen=True)
+class Indicator:
+    """
+    A 0/1 column made from one or more CVs: 1 in the frames where every
+    clause holds (a joint state when there are several), 0 where one does
+    not, NaN where a clause's CV has no value.  Its weighted mean in an OP
+    bin is the population of that state there, so the profiles give a
+    population along the path with its CI.
+
+    With `flip`, the column is instead 1 at a frame where the state differs
+    from the next frame's and 0 where it does not (NaN at the last frame of
+    the path): its mean is the number of changes per frame step, i.e. the
+    rate of entering or leaving the state, by where along the path it
+    happens.  Frames must be in path order, as generate-cvs writes them.
+    """
+    name: str
+    clauses: tuple
+    flip: bool = False
+    text: str = ""
+
+    @property
+    def columns(self):
+        return tuple(c.column for c in self.clauses)
+
+    def __call__(self, values):
+        """`values`: one array per clause, in clause order."""
+        out = None
+        for clause, x in zip(self.clauses, values):
+            v = clause(x)
+            out = v if out is None else out * v
+        if self.flip:
+            change = np.abs(np.diff(out))
+            out = np.r_[change, np.nan] if out.size else out
+        return out
+
+
+def _parse_clause(text, spec):
+    m = _TWO_SIDED.match(text)
     if m:
         lo, hi = float(m["lo"]), float(m["hi"])
         if lo >= hi:
             raise ValueError(f"{spec!r}: the range {lo:g} to {hi:g} is empty")
         bounds = dict(lo=lo, lo_incl=m["op1"] == "<=", hi=hi, hi_incl=m["op2"] == "<=")
     else:
-        m = _ONE_SIDED.match(test)
+        m = _ONE_SIDED.match(text)
         if not m:
-            raise ValueError(f"{spec!r}: write it as {INDICATOR_FORMS}")
+            raise ValueError(f"{spec!r}: {text.strip()!r} is not a test; {INDICATOR_FORMS}")
         v, op = float(m["v"]), m["op"]
         bounds = (dict(lo=v, lo_incl=op == ">=") if op.startswith(">")
                   else dict(hi=v, hi_incl=op == "<="))
     column = m["abs"] or m["col"]
     if re.fullmatch(_NUM, column):
         raise ValueError(f"{spec!r}: {column!r} is a number, not a CV")
-    return Indicator(name=name, column=column, absolute=bool(m["abs"]), text=spec.strip(),
-                     **bounds)
+    return Clause(column=column, absolute=bool(m["abs"]), **bounds)
+
+
+def parse_indicator(spec):
+    """One -indicators entry (see INDICATOR_FORMS) as an Indicator;
+    ValueError if it is not one of those forms."""
+    name, sep, test = spec.partition("=")
+    name = name.strip()
+    if not sep or not _INDICATOR_NAME.match(name) or not test.strip():
+        raise ValueError(f"{spec!r}: write it as {INDICATOR_FORMS}")
+    m = _FLIP.match(test)
+    flip = m is not None
+    body = m["inner"] if flip else test
+    parts = body.split("&")
+    if not all(p.strip() for p in parts):
+        raise ValueError(f"{spec!r}: an empty test; {INDICATOR_FORMS}")
+    clauses = tuple(_parse_clause(p, spec) for p in parts)
+    return Indicator(name=name, clauses=clauses, flip=flip, text=spec.strip())
 
 
 @dataclass
@@ -266,8 +319,12 @@ class ColumnPlan:
     """The compared CVs.  `names` are as reported (A's naming, cos(...) for
     converted angles); `src_a`/`src_b` the file columns they come from;
     `angle` '', 'cos' or 'cos2'; `sym_b` the corrections applied to B only;
-    `mirror_null` the CVs tested as A + B (see -mirror-null); `indicator`
-    the Indicator of a -indicators column, None for a CV as it is."""
+    `mirror_null` the CVs tested as A + B (see -mirror-null).
+
+    A -indicators column is computed, not read: its `indicator` entry is
+    (Indicator, positions of its clauses' CVs in the aux columns), None for
+    a CV as it is.  `aux_a`/`aux_b` are the file columns the clauses read,
+    each once, and `aux_sym` B's corrections of each (those of that CV)."""
     names: list
     src_a: list
     src_b: list
@@ -275,6 +332,9 @@ class ColumnPlan:
     sym_b: list
     mirror_null: np.ndarray
     indicator: list = None
+    aux_a: list = field(default_factory=list)
+    aux_b: list = field(default_factory=list)
+    aux_sym: list = field(default_factory=list)
 
     def __post_init__(self):
         if self.indicator is None:
@@ -399,9 +459,10 @@ def plan_columns(cols_a, cols_b=None, cv_cols=None, exclude=None, angle_cols=(),
     (-cos t = cos(180 - t)).
 
     `indicators` (Indicator) are appended after the CVs, whatever -cv-cols
-    and -exclude leave.  Each reads its CV again, in the file's own units
-    (no cos conversion), and takes that CV's corrections in B before its
-    test, so one test written in A's convention holds for both sides.
+    and -exclude leave.  Their clauses read their CVs as aux columns, in the
+    file's own units (no cos conversion), each with that CV's corrections in
+    B before the test, so one test written in A's convention holds for both
+    sides.
     """
     if cols_b is None:
         base, src_b = list(cols_a), list(cols_a)
@@ -445,32 +506,43 @@ def plan_columns(cols_a, cols_b=None, cv_cols=None, exclude=None, angle_cols=(),
     src_a_out, src_b_out = [base[i] for i in keep], [src_b[i] for i in keep]
     null = [_matches_any(base[i], mirror_null) for i in keep]
     ind = [None] * len(keep)
+    aux_a, aux_b, aux_sym = [], [], []
     for k in indicators:
         if k.name in names or k.name in base:
             raise typer.BadParameter(f"-indicators: {k.name!r} is already the name of a CV "
                                      f"or of another indicator")
-        if k.column not in base:
-            raise typer.BadParameter(f"-indicators {k.text!r}: {k.column!r} is not a column "
-                                     f"of both sides")
+        idx = []
+        for c in k.columns:
+            if c not in base:
+                raise typer.BadParameter(f"-indicators {k.text!r}: {c!r} is not a column "
+                                         f"of both sides")
+            if c not in aux_a:
+                aux_a.append(c)
+                aux_b.append(src_b[base.index(c)])
+                aux_sym.append(corrections(c))
+            idx.append(aux_a.index(c))
         names.append(k.name)
         angle.append("")
-        sym.append(corrections(k.column))
-        src_a_out.append(k.column)
-        src_b_out.append(src_b[base.index(k.column)])
+        sym.append(())
+        # Nothing is read into the indicator's own column; it is computed.
+        src_a_out.append(None)
+        src_b_out.append(None)
         null.append(False)
-        ind.append(k)
+        ind.append((k, tuple(idx)))
     # -angle-cols defaults to histograms' angle list, not all of which every
     # run has; an explicit -sym-angle-cols that misses is a typo.
     unknown = [c for c in sym_angle_cols if c not in base]
     if unknown:
         print(f"  [!] -sym-angle-cols: no such column: {', '.join(unknown)}")
     return ColumnPlan(names=names, src_a=src_a_out, src_b=src_b_out, angle=angle, sym_b=sym,
-                      mirror_null=np.array(null, bool), indicator=ind)
+                      mirror_null=np.array(null, bool), indicator=ind,
+                      aux_a=aux_a, aux_b=aux_b, aux_sym=aux_sym)
 
 
-def transform(X, angle, sym=None, indicator=None):
-    """Angle conversions, then (for B) the symmetry corrections, then the
-    -indicators tests, in place."""
+def transform(X, angle, sym=None, indicator=None, aux=None, aux_sym=None):
+    """Angle conversions, then (for B) the symmetry corrections, in place.
+    Then each -indicators column is computed from `aux` (frames, aux
+    columns, in path order), after B's corrections `aux_sym` of those."""
     for j, kind in enumerate(angle):
         if kind == "cos":
             X[:, j] = np.cos(np.deg2rad(X[:, j]))
@@ -485,9 +557,12 @@ def transform(X, angle, sym=None, indicator=None):
             elif op == "phase":
                 s = (X[:, j] + 180.0) % 360.0
                 X[:, j] = np.where(s > 180.0, s - 360.0, s)
-    for j, test in enumerate(indicator or ()):
-        if test is not None:
-            X[:, j] = test(X[:, j])
+    if aux is not None and aux.shape[1]:
+        aux = transform(np.array(aux, dtype=float), [""] * aux.shape[1], aux_sym)
+    for j, spec in enumerate(indicator or ()):
+        if spec is not None:
+            test, idx = spec
+            X[:, j] = test([aux[:, i] for i in idx])
     return X
 
 
@@ -509,7 +584,7 @@ def read_cv_file(path, op_col, src):
     n = len(df)
     X = np.empty((n, len(src)))
     for j, c in enumerate(src):
-        X[:, j] = df[c].to_numpy(float) if c in df else np.nan
+        X[:, j] = df[c].to_numpy(float) if c is not None and c in df else np.nan
     return cls, df[op_col].to_numpy(float), X
 
 
@@ -661,6 +736,8 @@ class SideConfig:
     correlations: bool
     direction: str = "all"
     indicator: list = None
+    aux: list = field(default_factory=list)
+    aux_sym: list = None
 
 
 def _groups(keys):
@@ -789,8 +866,10 @@ def _reduce_job(item):
     maps, corr = {}, {}
     for i, unit, path in members:
         try:
-            cls, op, X = read_cv_file(path, cfg.op_col, cfg.src)
-            transform(X, cfg.angle, cfg.sym, cfg.indicator)
+            cls, op, X = read_cv_file(path, cfg.op_col, list(cfg.src) + list(cfg.aux))
+            n = len(cfg.src)
+            X, aux = X[:, :n], X[:, n:]
+            transform(X, cfg.angle, cfg.sym, cfg.indicator, aux, cfg.aux_sym)
             red = reduce_path(X, op, unit, cfg)
         except Exception as exc:
             meta.append({"index": i, "uid": unit.uid, "stage": unit.stage,
@@ -958,25 +1037,28 @@ def reduce_side(label, units, factor_model, cfg, cv_file, workers, per_job):
 
 
 def sample_frames(units, cv_file, cfg_angle, cfg_sym, src, op_col, n_paths,
-                  frames_per_path=200, workers=8, indicator=None):
+                  frames_per_path=200, workers=8, indicator=None, aux=(), aux_sym=None):
     """Frames of up to n_paths evenly spaced paths, for the value ranges."""
     pick = [u for u in units if os.path.isfile(cv_file(u))]
     if len(pick) > n_paths:
         pick = [pick[i] for i in np.linspace(0, len(pick) - 1, n_paths).round().astype(int)]
-    items = [(cv_file(u), op_col, src, cfg_angle, cfg_sym, frames_per_path, indicator)
-             for u in pick]
+    items = [(cv_file(u), op_col, src, cfg_angle, cfg_sym, frames_per_path, indicator,
+              list(aux), aux_sym) for u in pick]
     with ProcessPoolExecutor(max_workers=workers, initializer=_one_blas_thread) as ex:
         return [x for x in ex.map(_sample_job, items, chunksize=8) if x is not None]
 
 
 def _sample_job(item):
-    path, op_col, src, angle, sym, n, indicator = item
+    path, op_col, src, angle, sym, n, indicator, aux, aux_sym = item
     try:
-        _, _, X = read_cv_file(path, op_col, src)
+        _, _, X = read_cv_file(path, op_col, list(src) + aux)
     except Exception:
         return None
+    k = len(src)
+    X, A = X[:, :k], X[:, k:]
+    transform(X, angle, sym, indicator, A, aux_sym)   # whole path: flips need it
     step = max(1, len(X) // n)
-    return transform(X[::step], angle, sym, indicator)
+    return X[::step]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1699,7 +1781,7 @@ def cv_compare(
     # ── Representation ────────────────────────────────────────────────────
     angle_cols: Annotated[str, typer.Option("-angle-cols", help="Exact names of angle CVs (degrees) compared as cos(theta), on which an isotropic orientation is flat; '' for none", rich_help_panel=panels.REPR)] = ",".join(sorted(SPHERICAL_ANGLE_COLS)),
     sym_angle_cols: Annotated[Optional[str], typer.Option("-sym-angle-cols", help="Exact names of head-tail symmetric angle CVs compared as cos^2(theta)", rich_help_panel=panels.REPR)] = None,
-    indicators: Annotated[Optional[str], typer.Option("-indicators", help="Extra 0/1 columns, comma-separated NAME=TEST, whose mean per OP bin is the population of a state there, with CI and q like any CV. TEST is COL>v, COL>=v, COL<v, COL<=v or lo<COL<hi (<= allowed), on the CV in its file units, abs(COL) for |COL|; B's corrections of COL (-mirror-b, -flip-b, -phase-shift-b) are applied first, so write it in A's convention. Added whatever -cv-cols/-exclude leave. E.g. 'PRO_anti=abs(PRO_dih_OH)>90,PRO_endo=PRO_dih_chi1>0'", rich_help_panel=panels.REPR)] = None,
+    indicators: Annotated[Optional[str], typer.Option("-indicators", help="Extra 0/1 columns, comma-separated NAME=TEST, whose mean per OP bin is the population of a state there, with CI and q like any CV. TEST is COL>v, COL>=v, COL<v, COL<=v or lo<COL<hi (<= allowed), on the CV in its file units, abs(COL) for |COL|; join TESTs with & for a joint state; NAME=flip(TEST) is 1 at each frame where that state changes before the next frame (a rate per frame step). B's corrections of each COL (-mirror-b, -flip-b, -phase-shift-b) are applied first, so write it in A's convention. Added whatever -cv-cols/-exclude leave. E.g. 'PRO_anti=abs(PRO_dih_OH)>90,PRO_endo_bound=PRO_dih_chi1>0&PRO_CO_hb>=1,PRO_pucker_flips=flip(PRO_dih_chi1>0)'", rich_help_panel=panels.REPR)] = None,
     hist_bins: Annotated[int, typer.Option("-hist-bins", help="Value bins per continuous CV; integer-valued CVs get one bin per value", rich_help_panel=panels.REPR)] = 24,
     ranges: Annotated[Optional[str], typer.Option("-ranges", help="Optional TOML with fixed value ranges, [ranges] name = [min, max, n_bins] (the histograms format); other CVs get theirs from the data", rich_help_panel=panels.REPR)] = None,
     range_sample: Annotated[int, typer.Option("-range-sample", help="Paths per side read first to set the automatic value ranges", rich_help_panel=panels.REPR)] = 400,
@@ -1818,10 +1900,13 @@ def cv_compare(
                         _split(mirror_null), tests)
     print(f"  {plan.n} CVs compared" + (f"; tested as A + B: "
           + ", ".join(np.array(plan.names)[plan.mirror_null]) if plan.mirror_null.any() else ""))
-    for k, ops in zip(plan.indicator, plan.sym_b):
-        if k is not None:
-            print(f"  indicator {k.text}" + (f" (B's {k.column} gets {', '.join(ops)} first)"
-                                            if two and ops else ""))
+    for spec in plan.indicator:
+        if spec is not None:
+            k, idx = spec
+            fixes = [f"{plan.aux_a[i]}: {', '.join(plan.aux_sym[i])}" for i in idx
+                     if plan.aux_sym[i]]
+            print(f"  indicator {k.text}" + (f"  (B corrected first: {'; '.join(fixes)})"
+                                            if two and fixes else ""))
     if plot:
         from .cv_plot import figure_names
 
@@ -1854,17 +1939,32 @@ def cv_compare(
         sym = None if key == "a" else plan.sym_b
         samples += sample_frames([u for u in units if u.weight > 0], _cv_file, plan.angle,
                                  sym, src, op_col, range_sample, workers=workers,
-                                 indicator=plan.indicator)
+                                 indicator=plan.indicator,
+                                 aux=plan.aux_a if key == "a" else plan.aux_b,
+                                 aux_sym=None if key == "a" else plan.aux_sym)
     vbins = value_bins(samples, plan, hist_bins, overrides)
     del samples
+    def _cols(src, aux):
+        return [s if spec is None else "&".join(aux[i] for i in spec[1])
+                for s, spec in zip(src, plan.indicator)]
+
+    def _fixes(spec, ops):
+        if spec is None:
+            return ",".join(ops)
+        return ";".join(f"{plan.aux_a[i]}:{','.join(plan.aux_sym[i])}" for i in spec[1]
+                        if plan.aux_sym[i])
+
     pd.DataFrame({
-        "cv": plan.names, "family": plan.families(), "column_A": plan.src_a,
-        "column_B": plan.src_b if two else plan.src_a, "angle": plan.angle,
-        "corrections_B": [",".join(s) for s in plan.sym_b] if two else "",
+        "cv": plan.names, "family": plan.families(),
+        "column_A": _cols(plan.src_a, plan.aux_a),
+        "column_B": _cols(plan.src_b, plan.aux_b) if two else _cols(plan.src_a, plan.aux_a),
+        "angle": plan.angle,
+        "corrections_B": ([_fixes(spec, ops) for spec, ops in zip(plan.indicator, plan.sym_b)]
+                          if two else ""),
         "tested": np.where(plan.mirror_null, "A+B", "A-B"), "discrete": vbins.discrete,
         "value_min": [e[0] for e in vbins.edges], "value_max": [e[-1] for e in vbins.edges],
         "value_bins": [len(e) - 1 for e in vbins.edges],
-        "indicator": [k.text if k is not None else "" for k in plan.indicator],
+        "indicator": [spec[0].text if spec is not None else "" for spec in plan.indicator],
     }).to_csv(os.path.join(_mk(out_dir), "columns.csv"), index=False)
 
     data = {}
@@ -1872,7 +1972,9 @@ def cv_compare(
         cfg = SideConfig(op_col=op_col, src=plan.src_a if key == "a" else plan.src_b,
                          angle=plan.angle, sym=None if key == "a" else plan.sym_b,
                          op_sign=sign, grid=grid, vbins=vbins, correlations=correlations,
-                         direction=direction, indicator=plan.indicator)
+                         direction=direction, indicator=plan.indicator,
+                         aux=plan.aux_a if key == "a" else plan.aux_b,
+                         aux_sym=None if key == "a" else plan.aux_sym)
         label = labels[0] if (key == "a" and two) else labels[1] if key == "b" else label_a
         print(f"\n  Reducing {label} ...")
         side, table = reduce_side(label, [u for u in units if u.weight > 0 or u.weight_uniform > 0],

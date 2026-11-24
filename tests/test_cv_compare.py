@@ -489,18 +489,40 @@ def test_workers_run_one_blas_thread_each():
 
 def test_indicator_forms_and_their_bounds():
     anti = cc.parse_indicator("PRO_anti=abs(PRO_dih_OH)>90")
-    assert (anti.name, anti.column, anti.absolute, anti.lo, anti.hi) == \
-        ("PRO_anti", "PRO_dih_OH", True, 90.0, None)
-    np.testing.assert_array_equal(anti(np.array([0.0, 120.0, -170.0, 90.0, np.nan])),
+    (c,) = anti.clauses
+    assert (anti.name, c.column, c.absolute, c.lo, c.hi, anti.flip) == \
+        ("PRO_anti", "PRO_dih_OH", True, 90.0, None, False)
+    np.testing.assert_array_equal(anti([np.array([0.0, 120.0, -170.0, 90.0, np.nan])]),
                                   [0.0, 1.0, 1.0, 0.0, np.nan])
     basin = cc.parse_indicator("basin = -107 < PRO_CP_phi2 <= 41")
-    assert (basin.lo, basin.lo_incl, basin.hi, basin.hi_incl) == (-107.0, False, 41.0, True)
-    np.testing.assert_array_equal(basin(np.array([-107.0, -30.0, 41.0, 60.0])), [0, 1, 1, 0])
+    (c,) = basin.clauses
+    assert (c.lo, c.lo_incl, c.hi, c.hi_incl) == (-107.0, False, 41.0, True)
+    np.testing.assert_array_equal(basin([np.array([-107.0, -30.0, 41.0, 60.0])]), [0, 1, 1, 0])
     low = cc.parse_indicator("low=x<=1e-3")
-    assert (low.lo, low.hi, low.hi_incl) == (None, 1e-3, True)
-    for bad in ("abs(x)>90", "a=x", "a=x>>1", "a=5<x<2", "a=3>2", "1a=x>0"):
+    assert (low.clauses[0].lo, low.clauses[0].hi, low.clauses[0].hi_incl) == (None, 1e-3, True)
+    for bad in ("abs(x)>90", "a=x", "a=x>>1", "a=5<x<2", "a=3>2", "1a=x>0", "a=x>0&",
+                "a=flip()", "a=x>0&&y<1"):
         with pytest.raises(ValueError):
             cc.parse_indicator(bad)
+
+
+def test_a_joint_state_needs_every_test_and_is_unknown_without_a_value():
+    both = cc.parse_indicator("endo_cis=PRO_dih_chi1>0&abs(PRO_dih_NH)<90")
+    assert both.columns == ("PRO_dih_chi1", "PRO_dih_NH") and not both.flip
+    chi = np.array([30.0, 30.0, -30.0, -30.0, 30.0])
+    nh = np.array([40.0, 150.0, 40.0, -150.0, np.nan])
+    np.testing.assert_array_equal(both([chi, nh]), [1.0, 0.0, 0.0, 0.0, np.nan])
+
+
+def test_flip_counts_the_frames_where_the_state_changes():
+    flips = cc.parse_indicator("pucker_flips = flip(PRO_dih_chi1>0)")
+    assert flips.flip and flips.columns == ("PRO_dih_chi1",)
+    chi = np.array([30.0, 25.0, -20.0, -35.0, 28.0, 31.0])
+    np.testing.assert_array_equal(flips([chi]), [0.0, 1.0, 0.0, 1.0, 0.0, np.nan])
+    assert np.nanmean(flips([chi])) == pytest.approx(2 / 5)       # per frame step
+    joint = cc.parse_indicator("f=flip(x>0&y>0)")
+    np.testing.assert_array_equal(joint([np.array([1.0, 1.0, 1.0]), np.array([1.0, -1.0, -1.0])]),
+                                  [1.0, 0.0, np.nan])
 
 
 def test_indicator_takes_its_cvs_corrections_and_comes_after_the_cvs():
@@ -508,25 +530,35 @@ def test_indicator_takes_its_cvs_corrections_and_comes_after_the_cvs():
     b = ["PRO_dih_chi1", "Mem_l_def", "noise"]
     endo = cc.parse_indicator("PRO_endo=PRO_dih_chi1>0")
     up = cc.parse_indicator("up=Mem_u_def>0")
+    both = cc.parse_indicator("endo_up=PRO_dih_chi1>0&Mem_u_def>0")
     plan = cc.plan_columns(a, b, exclude=["PRO_dih_"], swap_b=True,
-                           mirror_b=["PRO_dih_", "_def"], indicators=[endo, up])
-    assert plan.names == ["Mem_u_def", "noise", "PRO_endo", "up"]
-    assert plan.src_a == ["Mem_u_def", "noise", "PRO_dih_chi1", "Mem_u_def"]
-    assert plan.src_b == ["Mem_l_def", "noise", "PRO_dih_chi1", "Mem_l_def"]
-    assert plan.sym_b == [("mirror",), (), ("mirror",), ("mirror",)]
-    assert plan.angle[2:] == ["", ""] and plan.indicator[:2] == [None, None]
-    # B's chi1 is negated before the test, so chi1 > 0 means the same in both
-    X = np.array([[0.1, 0.0, -40.0, 0.1], [0.1, 0.0, 40.0, -0.1], [0.1, 0.0, np.nan, 0.1]])
-    cc.transform(X, plan.angle, plan.sym_b, plan.indicator)
+                           mirror_b=["PRO_dih_", "_def"], indicators=[endo, up, both])
+    assert plan.names == ["Mem_u_def", "noise", "PRO_endo", "up", "endo_up"]
+    assert plan.src_a[:2] == ["Mem_u_def", "noise"] and plan.src_a[2:] == [None] * 3
+    # every CV a clause needs is read once, with its own B corrections
+    assert plan.aux_a == ["PRO_dih_chi1", "Mem_u_def"]
+    assert plan.aux_b == ["PRO_dih_chi1", "Mem_l_def"]
+    assert plan.aux_sym == [("mirror",), ("mirror",)]
+    assert [s[1] for s in plan.indicator[2:]] == [(0,), (1,), (0, 1)]
+    assert plan.sym_b[2:] == [(), (), ()]
+    # B's chi1 and def are negated before the tests, so they mean the same in both
+    X = np.zeros((3, 5))
+    aux = np.array([[-40.0, 0.1], [40.0, -0.1], [np.nan, 0.1]])
+    cc.transform(X, plan.angle, plan.sym_b, plan.indicator, aux, plan.aux_sym)
     np.testing.assert_array_equal(X[:, 2], [1.0, 0.0, np.nan])
     np.testing.assert_array_equal(X[:, 3], [0.0, 1.0, 0.0])
+    np.testing.assert_array_equal(X[:, 4], [0.0, 0.0, np.nan])
+    # side A: no corrections
+    XA = np.zeros((3, 5))
+    cc.transform(XA, plan.angle, None, plan.indicator, aux, None)
+    np.testing.assert_array_equal(XA[:, 2], [0.0, 1.0, np.nan])
     # -cv-cols may list the indicator; it is added either way
     only = cc.plan_columns(a, cv_cols=["noise", "PRO_endo"], indicators=[endo])
     assert only.names == ["noise", "PRO_endo"]
     with pytest.raises(Exception, match="already the name"):
         cc.plan_columns(a, indicators=[cc.parse_indicator("noise=noise>0")])
     with pytest.raises(Exception, match="not a column"):
-        cc.plan_columns(a, indicators=[cc.parse_indicator("x=nothere>0")])
+        cc.plan_columns(a, indicators=[cc.parse_indicator("x=noise>0&nothere>0")])
 
 
 def test_indicator_bins_are_zero_and_one_whatever_the_ranges_say():
@@ -542,15 +574,21 @@ def test_indicator_bins_are_zero_and_one_whatever_the_ranges_say():
 def test_indicator_population_along_the_path(two_sims):
     """B's Mem_u_def is lifted by 0.8 past LAM_MID, so P(Mem_u_def > 0.4)
     goes from ~0.09 to ~0.91 there; PRO_hCN_u_P is +0.3 in A and -0.3 in B,
-    so with -mirror-b its sign is the same state on both sides."""
+    so with -mirror-b its sign is the same state on both sides.  The noise
+    column is drawn afresh every frame, so its state flips at about
+    2 p (1 - p) of the frame steps, the same on both sides."""
     root, _ = two_sims
     out = _run(root, "cmp_ind", runs_a=str(root / "A" / "infinit_entry"),
                runs_b=str(root / "B" / "infinit_entry"), label_a="L", label_b="D",
-               mirror_b="hCN", indicators="lifted=Mem_u_def>0.4,pos=PRO_hCN_u_P>0",
+               mirror_b="hCN",
+               indicators="lifted=Mem_u_def>0.4,pos=PRO_hCN_u_P>0,"
+                          "lifted_pos=Mem_u_def>0.4&PRO_hCN_u_P>0,hops=flip(noise>5)",
                unweighted=False)
     cols = pd.read_csv(out / "columns.csv").set_index("cv")
     assert cols.loc["lifted", "indicator"] == "lifted=Mem_u_def>0.4"
-    assert cols.loc["pos", "corrections_B"] == "mirror" and cols.loc["pos", "discrete"]
+    assert cols.loc["pos", "corrections_B"] == "PRO_hCN_u_P:mirror"
+    assert cols.loc["lifted_pos", "column_A"] == "Mem_u_def&PRO_hCN_u_P"
+    assert cols.loc["pos", "discrete"]
     prof = pd.read_csv(out / "profiles.csv")
     lifted = prof[(prof["cv"] == "lifted") & prof["q_bh"].notna()]
     past = lifted[lifted["op_lo"] >= LAM_MID]
@@ -560,3 +598,13 @@ def test_indicator_population_along_the_path(two_sims):
     np.testing.assert_allclose(lifted.loc[lifted["op_hi"] <= LAM_MID, "diff"], 0.0, atol=0.06)
     pos = prof[(prof["cv"] == "pos") & prof["p_boot"].notna()]
     np.testing.assert_allclose(pos[["A", "B"]].to_numpy(), 1.0, atol=1e-9)
+    joint = prof[(prof["cv"] == "lifted_pos") & prof["q_bh"].notna()]
+    np.testing.assert_allclose(joint[["A", "B"]].to_numpy(),
+                               lifted.set_index("op_lo").loc[joint["op_lo"], ["A", "B"]]
+                               .to_numpy(), atol=1e-9)
+    hops = prof[(prof["cv"] == "hops") & prof["p_boot"].notna()]
+    for side in ("A", "B"):
+        assert np.average(hops[side], weights=hops[f"frames_{side}"]) == \
+            pytest.approx(0.5, abs=0.03)
+    dense = hops[(hops["frames_A"] >= 250) & (hops["frames_B"] >= 250)]
+    assert len(dense) >= 2 and not (dense["q_bh"] < 0.05).any()
