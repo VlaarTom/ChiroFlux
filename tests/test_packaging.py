@@ -51,6 +51,8 @@ def test_documented_entry_points_are_importable():
         ("chiral_interface_analysis", "chiral_merge_cache"),
         ("chiral_interface_analysis", "chiral_compare"),
         ("chiral_plot", "chiral_plot"),
+        ("cv_compare", "cv_compare"),
+        ("cv_plot", "cv_plot"),
     ]:
         module = import_module(f"chiroflux.{module_name}")
         assert callable(getattr(module, function_name)), function_name
@@ -83,6 +85,8 @@ def test_cli_registry_covers_every_entry_point():
         ("chiral_interface_analysis", "chiral_merge_cache"),
         ("chiral_interface_analysis", "chiral_compare"),
         ("chiral_plot", "chiral_plot"),
+        ("cv_compare", "cv_compare"),
+        ("cv_plot", "cv_plot"),
     }
 
 

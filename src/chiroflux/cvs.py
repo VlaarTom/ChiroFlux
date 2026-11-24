@@ -21,7 +21,7 @@ import warnings
 
 import numpy as np
 
-from .pathdata import _matches_exclude
+from .pathdata import _matches_any, _matches_exclude
 
 
 def _apply_angle_transforms(cv_array, cv_names, cos_cols=None, cos2_cols=None):
@@ -170,7 +170,7 @@ def _apply_cv_mirror(cv_array, cv_names, mirror_substrings):
         return cv_array, cv_names
     cv_array = cv_array.copy()
     for i, name in enumerate(cv_names):
-        if any(sub in name for sub in mirror_substrings):
+        if _matches_any(name, mirror_substrings):
             cv_array[:, i, :] *= -1.0
     return cv_array, cv_names
 
@@ -216,7 +216,7 @@ def _apply_cv_flip(cv_array, cv_names, entry_flip_substrings):
         return cv_array, cv_names
     cv_array = cv_array.copy()
     for i, name in enumerate(cv_names):
-        if not any(sub in name for sub in entry_flip_substrings):
+        if not _matches_any(name, entry_flip_substrings):
             continue
         if name.startswith(("cos(", "cos2(")):
             warnings.warn(
@@ -240,8 +240,10 @@ def _apply_cv_phase_shift(cv_array, cv_names, phase_shift_substrings):
     The Cremer-Pople puckering phase phi2 is the case this exists for. Its
     ring normal is built intrinsically from R1 x R2, so it is a pseudovector:
     under reflection every z_j changes sign and the phase maps to phi2 + 180,
-    not to -phi2 - the mirror image of a C3-endo pucker is C3-exo, half a
-    pseudorotation cycle away. The correct null comparison is therefore
+    not to -phi2. The pucker itself is the same in the mirror image (endo/exo
+    is defined against a substituent, and endo stays endo); only its phase on
+    this atom-ordered normal moves half a pseudorotation cycle. The correct
+    null comparison is therefore
     P_L(phi2) against P_D(phi2 + 180).
 
     The result is wrapped back into (-180, 180], the interval ``arctan2``
@@ -267,7 +269,7 @@ def _apply_cv_phase_shift(cv_array, cv_names, phase_shift_substrings):
         return cv_array, cv_names
     cv_array = cv_array.copy()
     for i, name in enumerate(cv_names):
-        if not any(sub in name for sub in phase_shift_substrings):
+        if not _matches_any(name, phase_shift_substrings):
             continue
         col = cv_array[:, i, :]
         finite = col[np.isfinite(col)]
