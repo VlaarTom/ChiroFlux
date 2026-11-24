@@ -811,6 +811,13 @@ def compute_signed_azimuth(coords_tetra, coords_lipid, box):
     Signed azimuthal angle about the membrane normal between the proline
     molecular axis (N -> C) and the vector from the stereocenter to the
     nearest lipid phosphorus, both projected into the membrane plane.
+
+    The sense of rotation is taken about lab +z, so the sign is odd under
+    two operations: the mirror image (the other enantiomer) and a run that
+    entered from the other face (a 180-degree turn about x sends +z to -z).
+    Between enantiomers that entered from the SAME face, negate one of them;
+    between enantiomers that entered from OPPOSITE faces the two sign changes
+    cancel, and the leaflet-swapped columns compare as they are.
     """
     ca, _, axis = compute_body_frame(coords_tetra, box)
 
@@ -1350,6 +1357,7 @@ def _init_system(gromacs_input="../gromacs_input"):
     global tetrahedral_index_file, CN_DOPC_index_file, CN_POPC_index_file, ZCOM_index_file, lipid_per_leaflet
     global atom_per_lipid_dopc, atom_per_lipid_popc, IDX_BACKBONE, IDX_HEAVY, IDX_C_CG
     global IDX_ANG_OH, IDX_RING5, IDX_RING6, IDX_DIH_CHIRAL, IDX_DIH_OH
+    global IDX_CHI1, IDX_CHI2
     global IDX_TETRA5, CN_DOPC_GROUPS, CN_POPC_GROUPS, IDX_CN_REF, IDX_CN_REF_COMBINED
     global ZCOM_GROUPS, ZCOM_SCALAR_GROUPS, _ref_u, IDX_ORP_ALL, IDX_ORP_N
     global IDX_ORP_H01, IDX_ORP_O01, IDX_ORP_H02, IDX_PHOSPHATE, IDX_CARBONYL
@@ -1429,6 +1437,18 @@ def _init_system(gromacs_input="../gromacs_input"):
     IDX_ORP_H01  = _ref_u.select_atoms("resname ORP and name H01").indices[0]
     IDX_ORP_O01  = _ref_u.select_atoms("resname ORP and name O01").indices[0]
     IDX_ORP_H02  = _ref_u.select_atoms("resname ORP and name H02").indices[0]
+    # The pyrrolidine torsions chi1 = N-CA-CB-CG and chi2 = CA-CB-CG-CD (see
+    # PRO_dih_chi1 below), by atom NAME as well, so they do not depend on the
+    # order the ring .ndx happens to list its atoms in.
+    ring = {}
+    for name in ("N", "CA", "CB", "CG", "CD"):
+        found = _ref_u.select_atoms(f"resname ORP and name {name}").indices
+        if len(found) != 1:
+            raise ValueError(f"{topol_file}: expected one ORP atom named {name} for the "
+                             f"ring torsions, found {len(found)}")
+        ring[name] = found[0]
+    IDX_CHI1 = np.array([ring[n] for n in ("N", "CA", "CB", "CG")])
+    IDX_CHI2 = np.array([ring[n] for n in ("CA", "CB", "CG", "CD")])
     IDX_PHOSPHATE = _ref_u.select_atoms("resname DOPC POPC and name O11 O12 O13 O14").indices
     IDX_CARBONYL  = _ref_u.select_atoms("resname DOPC POPC and name O21 O22 O31 O32").indices
     IDX_NITROGEN  = _ref_u.select_atoms("resname DOPC POPC and name N").indices
@@ -1527,7 +1547,7 @@ def gather_path_arrays(plan, path_folder):
     """
     small_keys = (['backbone', 'heavy', 'c_cg', 'ang_oh', 'ring5', 'ring6',
                    'dih_chiral', 'dih_oh', 'tetra5', 'orp_all', 'lipPu', 'lipPl',
-                   'cn_ref']
+                   'cn_ref', 'chi1', 'chi2']
                   + [f'dopc_{i}' for i in _SEL_IDX_DOPC]
                   + [f'popc_{i}' for i in _SEL_IDX_POPC])
 
@@ -1536,7 +1556,7 @@ def gather_path_arrays(plan, path_folder):
         'ang_oh': IDX_ANG_OH, 'ring5': IDX_RING5, 'ring6': IDX_RING6,
         'dih_chiral': IDX_DIH_CHIRAL, 'dih_oh': IDX_DIH_OH, 'tetra5': IDX_TETRA5,
         'orp_all': IDX_ORP_ALL, 'lipPu': ZCOM_GROUPS[3], 'lipPl': ZCOM_GROUPS[4],
-        'cn_ref': IDX_CN_REF_COMBINED,
+        'cn_ref': IDX_CN_REF_COMBINED, 'chi1': IDX_CHI1, 'chi2': IDX_CHI2,
     }
     for i in _SEL_IDX_DOPC:
         small_idx[f'dopc_{i}'] = CN_DOPC_GROUPS[i]
@@ -1980,9 +2000,11 @@ def process_single_path(path_number, overwrite, lambda_A, lambda_B, lambda_minus
         params['Mem_l_tilt'] = np.squeeze(tilt_l)
         # Diagnostics: how many glycerols were in the local patch, so the
         # frames where the whole-leaflet tilt was substituted stay identifiable.
-        # Named "tiltN" rather than "tilt_N" so that a "_tilt" pattern selects
-        # only the two cosines - these counts are true scalars and must never
-        # be caught by a -flip-*/-mirror-* aimed at the tilt itself.
+        # These counts are true scalars and must never be caught by a
+        # -flip-*/-mirror-* aimed at the tilt itself. The naming does NOT
+        # guarantee that: patterns match substrings, and "_tilt" is a
+        # substring of "Mem_u_tiltN". Anchor the pattern to the end of the
+        # name instead ('_tilt$'), or exclude tiltN.
         params['Mem_u_tiltN'] = np.squeeze(ntilt_u)
         params['Mem_l_tiltN'] = np.squeeze(ntilt_l)
         params['PRO_mode_ring'] = np.squeeze(mode_ring)
@@ -2002,6 +2024,23 @@ def process_single_path(path_number, overwrite, lambda_A, lambda_B, lambda_minus
         params['Mem_l_curvH'] = np.squeeze(curvH_l)
         params['Water_wire'] = np.squeeze(scalars['wire'])
         params['Water_cluster'] = np.squeeze(scalars['wire_n'])
+
+        # ── Ring pucker as torsions (appended) ─────────────────────────────
+        # chi1 = N-CA-CB-CG and chi2 = CA-CB-CG-CD, the proline side-chain
+        # torsions, IUPAC sign. Their sign names the pucker directly, which
+        # PRO_CP_phi2 does not: for L-proline (S) chi1 > 0, chi2 < 0 is
+        # Cg-endo (CG on the same side of the plane through CA, CB, CD and N
+        # as the carboxyl carbon C) and chi1 < 0, chi2 > 0 is Cg-exo. The
+        # three-atom plane CD-N-CA gives the opposite answer for the twisted
+        # CB/CG forms, so it is not the definition; tests/test_cv_chirality
+        # pins this down. Endo/exo is defined against the
+        # carboxyl, so it is the same in both mirror images, but the torsions
+        # change sign: for D-proline chi1 < 0 is Cg-endo. Named PRO_dih_* so
+        # the -mirror-* pattern for the other torsions catches them; once D is
+        # mirrored, chi1 > 0 means Cg-endo for both (cv-compare -indicators
+        # 'PRO_endo=PRO_dih_chi1>0').
+        params['PRO_dih_chi1'] = np.squeeze(compute_dihedral_series(small['chi1'].reshape(n_frames, -1), pbc_box))
+        params['PRO_dih_chi2'] = np.squeeze(compute_dihedral_series(small['chi2'].reshape(n_frames, -1), pbc_box))
 
         write_ML_txt(path_number, reactive, ensemble, lambda_A, lambda_minus_one, **params)
         return (path_number, "ok")

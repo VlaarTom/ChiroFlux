@@ -16,6 +16,7 @@ import pytest
 
 from chiroflux.cv_generation import (
     HCN_SHELL_EDGES,
+    compute_dihedral_series,
     compute_group_orientations,
     compute_handed_cn,
     compute_local_chain_tilt,
@@ -266,3 +267,63 @@ class TestGroupOrientations:
         # All ring atoms sit at z = +0.2 relative to CA, so the centroid is
         # squarely along +z; a wrapped x coordinate must not tilt it.
         assert cos_ring[0] == pytest.approx(1.0)
+
+
+# ── Ring pucker: what the sign of PRO_dih_chi1 means ────────────────────────
+
+#: L-proline (S) in a Cg-exo pucker, one frame of the L run (nm).
+_L_EXO = {"CA": (4.750, 5.813, 2.087), "C": (4.904, 5.846, 2.099),
+          "CB": (4.690, 5.714, 2.182), "CG": (4.547, 5.703, 2.133),
+          "CD": (4.559, 5.718, 1.983), "N": (4.697, 5.760, 1.953),
+          "HA": (4.697, 5.907, 2.111)}
+
+
+def _mirror(atoms):
+    return {k: np.asarray(v, float) * np.array([1.0, 1.0, -1.0]) for k, v in atoms.items()}
+
+
+def _invert_ca(atoms):
+    """Swap the carboxyl carbon and HA: the other configuration at CA with
+    the ring left as it is."""
+    out = dict(atoms)
+    out["C"], out["HA"] = atoms["HA"], atoms["C"]
+    return out
+
+
+def _cip(atoms):
+    """'S' or 'R' at CA (priorities N > C > CB > HA)."""
+    a = {k: np.asarray(v, float) for k, v in atoms.items()}
+    v = (a["N"] - a["CA"]) @ np.cross(a["C"] - a["CA"], a["CB"] - a["CA"])
+    return "S" if v > 0 else "R"
+
+
+def _pucker(atoms):
+    """The textbook definition: CG on the same side of the plane through the
+    other four ring atoms as the carboxyl carbon is Cg-endo."""
+    a = {k: np.asarray(v, float) for k, v in atoms.items()}
+    P = np.array([a[k] for k in ("CA", "CB", "CD", "N")])
+    c = P.mean(axis=0)
+    n = np.linalg.svd(P - c)[2][2]
+    return "endo" if ((a["CG"] - c) @ n) * ((a["C"] - c) @ n) > 0 else "exo"
+
+
+def _chi(atoms, names):
+    xyz = np.concatenate([np.asarray(atoms[k], float) for k in names])[None, :]
+    return compute_dihedral_series(xyz, BOX)[0]
+
+
+def test_chi1_sign_is_the_pucker_and_flips_with_the_enantiomer():
+    """For L chi1 > 0 is Cg-endo; the mirror image keeps endo/exo (it is
+    defined against the carboxyl) but negates chi1 and chi2, so for D chi1 < 0
+    is Cg-endo. L-endo is built as the mirror image of L-exo with CA inverted
+    back: the mirror-image ring on the same stereocentre."""
+    l_endo = _invert_ca(_mirror(_L_EXO))
+    cases = [(_L_EXO, "S", "exo", -1), (l_endo, "S", "endo", +1),
+             (_mirror(_L_EXO), "R", "exo", +1), (_mirror(l_endo), "R", "endo", -1)]
+    for atoms, cip, pucker, sign in cases:
+        assert _cip(atoms) == cip
+        assert _pucker(atoms) == pucker
+        chi1 = _chi(atoms, ("N", "CA", "CB", "CG"))
+        chi2 = _chi(atoms, ("CA", "CB", "CG", "CD"))
+        assert np.sign(chi1) == sign and abs(chi1) > 20
+        assert np.sign(chi2) == -sign and abs(chi2) > 20
