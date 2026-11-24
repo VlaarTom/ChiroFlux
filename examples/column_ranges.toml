@@ -114,24 +114,105 @@
 "O_CC2_l_POPC" = [0, 5, 50]
 "O_CC3_u_POPC" = [0, 5, 50]
 "O_CC3_l_POPC" = [0, 5, 50]
-"PRO_hCN_C2u_DOPC" = [-2, 2, 40]
-"PRO_hCN_C2l_DOPC" = [-2, 2, 40]
-"PRO_hCN_O22u_DOPC" = [-2, 2, 40]
-"PRO_hCN_O22l_DOPC" = [-2, 2, 40]
-"PRO_hCN_C2u_POPC" = [-2, 2, 40]
-"PRO_hCN_C2l_POPC" = [-2, 2, 40]
-"PRO_hCN_Pu" = [-2, 2, 40]
-"PRO_hCN_Pl" = [-2, 2, 40]
-"PRO_nCos_C2u_DOPC" = [-1.1, 1.1, 22]
-"PRO_nCos_C2l_DOPC" = [-1.1, 1.1, 22]
-"PRO_azim_P" = [-180, 180, 360]
+
+# Handed coordination numbers. Leaflet-marked columns spell the leaflet as a
+# medial field, _u_ / _l_ (PRO_hCN_u_C2_DOPC, not PRO_hCN_C2u_DOPC): that is
+# what -swap-leaflets and the -flip / -mirror patterns match on.
+"PRO_hCN_u_C2_DOPC" = [-2, 2, 40]
+"PRO_hCN_l_C2_DOPC" = [-2, 2, 40]
+"PRO_hCN_u_O22_DOPC" = [-2, 2, 40]
+"PRO_hCN_l_O22_DOPC" = [-2, 2, 40]
+"PRO_hCN_u_C2_POPC" = [-2, 2, 40]
+"PRO_hCN_l_C2_POPC" = [-2, 2, 40]
+"PRO_hCN_u_P" = [-2, 2, 40]
+"PRO_hCN_l_P" = [-2, 2, 40]
+"PRO_azim_u_P" = [-180, 180, 360]
+"PRO_azim_l_P" = [-180, 180, 360]
 "PRO_CP_phi2" = [-180, 180, 360]
 "PRO_CP_q2" = [0, 1, 20]
-"Mem_def_u" = [-1.5, 1.5, 30]
-"Mem_def_l" = [-1.5, 1.5, 30]
+
+# Local membrane response (nm): mean phosphate z-displacement within 1 nm of
+# the permeant per leaflet, and the local P-P thickness.
+"Mem_u_def" = [-1, 1, 40]
+"Mem_l_def" = [-1, 1, 40]
 "Mem_thick_loc" = [2, 6, 40]
 "Water_06" = [0, 80, 80]
 "Water_10" = [0, 300, 250]
+
+# Nearest-partner distance (nm) and mutual orientation (cosine) per hCN target.
+"PRO_rMin_u_C2_DOPC" = [0, 5, 100]
+"PRO_rMin_l_C2_DOPC" = [0, 5, 100]
+"PRO_rMin_u_O22_DOPC" = [0, 5, 100]
+"PRO_rMin_l_O22_DOPC" = [0, 5, 100]
+"PRO_rMin_u_C2_POPC" = [0, 5, 100]
+"PRO_rMin_l_C2_POPC" = [0, 5, 100]
+"PRO_rMin_u_P" = [0, 5, 100]
+"PRO_rMin_l_P" = [0, 5, 100]
+"PRO_nCos_u_C2_DOPC" = [-1.1, 1.1, 22]
+"PRO_nCos_l_C2_DOPC" = [-1.1, 1.1, 22]
+"PRO_nCos_u_O22_DOPC" = [-1.1, 1.1, 22]
+"PRO_nCos_l_O22_DOPC" = [-1.1, 1.1, 22]
+"PRO_nCos_u_C2_POPC" = [-1.1, 1.1, 22]
+"PRO_nCos_l_C2_POPC" = [-1.1, 1.1, 22]
+"PRO_nCos_u_P" = [-1.1, 1.1, 22]
+"PRO_nCos_l_P" = [-1.1, 1.1, 22]
+
+# hCN resolved into distance shells s1 < s2 < s3; outer shells hold more
+# partners, so their range widens (same 0.1 bin width throughout).
+"PRO_hCN_u_C2_DOPC_s1" = [-2, 2, 40]
+"PRO_hCN_u_C2_DOPC_s2" = [-3.5, 3.5, 70]
+"PRO_hCN_u_C2_DOPC_s3" = [-5, 5, 100]
+"PRO_hCN_l_C2_DOPC_s1" = [-2, 2, 40]
+"PRO_hCN_l_C2_DOPC_s2" = [-3.5, 3.5, 70]
+"PRO_hCN_l_C2_DOPC_s3" = [-5, 5, 100]
+"PRO_hCN_u_O22_DOPC_s1" = [-2, 2, 40]
+"PRO_hCN_u_O22_DOPC_s2" = [-3.5, 3.5, 70]
+"PRO_hCN_u_O22_DOPC_s3" = [-5, 5, 100]
+"PRO_hCN_l_O22_DOPC_s1" = [-2, 2, 40]
+"PRO_hCN_l_O22_DOPC_s2" = [-3.5, 3.5, 70]
+"PRO_hCN_l_O22_DOPC_s3" = [-5, 5, 100]
+"PRO_hCN_u_C2_POPC_s1" = [-2, 2, 40]
+"PRO_hCN_u_C2_POPC_s2" = [-3.5, 3.5, 70]
+"PRO_hCN_u_C2_POPC_s3" = [-5, 5, 100]
+"PRO_hCN_l_C2_POPC_s1" = [-2, 2, 40]
+"PRO_hCN_l_C2_POPC_s2" = [-3.5, 3.5, 70]
+"PRO_hCN_l_C2_POPC_s3" = [-5, 5, 100]
+"PRO_hCN_u_P_s1" = [-2, 2, 40]
+"PRO_hCN_u_P_s2" = [-3.5, 3.5, 70]
+"PRO_hCN_u_P_s3" = [-5, 5, 100]
+"PRO_hCN_l_P_s1" = [-2, 2, 40]
+"PRO_hCN_l_P_s2" = [-3.5, 3.5, 70]
+"PRO_hCN_l_P_s3" = [-5, 5, 100]
+
+# Local chain tilt: cosine against +z, so the upper leaflet sits near -1 and
+# the lower near +1. tiltN is the number of glycerols in the patch, an integer:
+# the half-integer edges put one bin on each count.
+"Mem_u_tilt" = [-1, 1, 40]
+"Mem_l_tilt" = [-1, 1, 40]
+"Mem_u_tiltN" = [-0.5, 12.5, 13]
+"Mem_l_tiltN" = [-0.5, 12.5, 13]
+"PRO_mode_ring" = [-1, 1, 40]
+"PRO_mode_O" = [-1, 1, 40]
+"PRO_mode_N" = [-1, 1, 40]
+
+# Membrane distortion and water defect around the permeant.
+#   nP       phosphates inside the 1 nm disc behind Mem_*_def (integer)
+#   defDeep  z-displacement (nm) of the deepest phosphates in the patch
+#   curvH    mean curvature H (1/nm) of the leaflet's phosphate surface
+#   wire     1 if the permeant's water reaches water outside the core, else 0
+#   cluster  core waters connected to the permeant (integer). Rare frames hold
+#            more than 60; they are reported as out of range, not dropped
+#            silently, and the tail matters less than the bulk here.
+"Mem_u_nP" = [-0.5, 12.5, 13]
+"Mem_l_nP" = [-0.5, 12.5, 13]
+"Mem_u_defDeep" = [-1.25, 1.25, 50]
+"Mem_l_defDeep" = [-1.25, 1.25, 50]
+"Mem_u_curvH" = [-2.5, 2.5, 50]
+"Mem_l_curvH" = [-2.5, 2.5, 50]
+"Water_wire" = [-0.5, 1.5, 2]
+"Water_cluster" = [-0.5, 60.5, 61]
+"PRO_dih_chi1" = [-60, 60, 120]
+"PRO_dih_chi2" = [-60, 60, 120]
 
 # Overrides applied only to the ("non-reactive", "minus") group, which samples a
 # different OP window from the plus ensembles. Anything not listed here falls

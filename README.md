@@ -9,13 +9,27 @@ variables actually decide the outcome*: which CVs separate reactive from
 non-reactive paths, or one simulation from another (e.g. two enantiomers).
 
 Every analysis is WHAM-weighted, so paths sampled in different TIS ensembles are
-combined without bias, and everything is resolved **per interface**
+combined without bias, and everything is resolved **per interface**.
 
-## Install
+**Contents**
+
+1. [Installation](#installation)
+2. [Modules](#modules), in alphabetical order, each with the commands it provides
+3. [Conventions shared by the commands](#conventions-shared-by-the-commands)
+4. [Using ChiroFlux from Python](#using-chiroflux-from-python)
+5. [Known issues](#known-issues)
+
+---
+
+## Installation
+
+### Base install
 
 ```bash
 pip install -e .
 ```
+
+### Optional extras
 
 `chiroflux train-deeptda` additionally needs torch, lightning and [mlcolvar](https://mlcolvar.readthedocs.io/en/stable/),
 which are kept out of the base install because they are large:
@@ -25,168 +39,15 @@ pip install -e '.[deeptda]'      # add the DeepTDA stack
 pip install -e '.[dev]'          # pytest + ruff
 ```
 
-`generate-cvs` is the only command that reads MD trajectories; everything else
-works from the `.txt` files it produces. It needs the trajectories, the
-topology and the `.ndx` index files alongside them.
+chiroflux never imports infretis - it only reads its output files - so an
+environment for the analysis does not need infretis unless you also run
+simulations from it.
 
-## Input layout
+### GPU acceleration
 
-Most commands expect the standard infretis output plus a folder of per-path CV
-trajectories (`-cv-dir`, default `ML/`), one `<path_nr>.txt` per path:
-
-```
-line 1: # reactive          |  # non-reactive
-line 2: # <ensemble info>
-line 3: # <duplicate/edit info>
-line 4: <column names>            (no leading '#')
-line 5+: <data>
-```
-
-One column is the order parameter (`-op-col`, default `OP_Lamb`); the rest are
-treated as CVs unless narrowed with `-cv-cols` / `-exclude`.
-
-## Commands
-
-```bash
-chiroflux --help
-chiroflux COMMAND --help
-```
-
-| Command | What it does |
-| --- | --- |
-| `generate-cvs` | Computes the per-frame CVs from the MD trajectories and writes the per-path `.txt` files every other command reads. |
-| `permeant-index` | Writes the permeant-side `.ndx` files, checking each group's atoms are bonded the way its CV assumes. |
-| `leaflet-index` | Writes the `CN_*.ndx` leaflet groups, assigning each lipid to a leaflet by its own headgroup rather than by each atom's height. |
-| `histograms` | Weighted CV histograms, statistics and 2D maps over a path ensemble, optionally merging a second simulation onto a common OP axis. Requires a `-ranges` file (see below). |
-| `sasa` | Weighted solvent-accessible surface area profile across the membrane, from a Shrake–Rupley construction on the trajectories. Requires a `-runs` file (see below). |
-| `membrane-spatial` | Spatial membrane structure around the permeant: radial/z maps, curvature, local thickness and bonded metrics. |
-| `permeation` | Permeability from the inhomogeneous solubility-diffusion model: free energy and local diffusion combined into a resistance integral. |
-| `preference-compare` | Difference the DOPC/POPC contact preference of two simulations along the OP, with a bootstrapped CI on the difference. |
-| `neighbours` | Lipid neighbour composition around the permeant per membrane slab, with bootstrap enrichment statistics against bulk composition. |
-| `shap-ml` | Fits WHAM-weighted classifiers (random forest, logistic regression, gradient boosting, LightGBM, SVM) per interface and explains them with SHAP. |
-| `shap-enantiomer` | Same, but the label is *which of two simulations* a path came from. |
-| `statistics` | Model-free weighted effect sizes (Cohen's d, Spearman ρ, KS distance) per interface — a cheap sanity check on the SHAP rankings. |
-| `dynamics` | Time-resolved CV features in a window around each crossing: fluctuation amplitude, autocorrelation time, and lead/lag event ordering against the order parameter. Optional FFT features, with a built-in redundancy check against them. `-align event` anchors on the outcome instead (reactive: crossing `-event-op`; unreactive: turning point) and writes class-averaged traces around it. |
-| `pca` | Weighted PCA of the CV space, optionally on a joint basis fitted across two simulations so they can be compared in the same coordinates. |
-| `prepare-deeptda-data` | Builds a frame-level, weighted DeepTDA training set labelled reactive/non-reactive. |
-| `prepare-deeptda-data-ld` | Same, but labelled by which of two simulations each frame came from. |
-| `train-deeptda` | Trains a 2-state DeepTDA CV on either dataset and reports the input correlations that show which CVs drive it. |
-| `chiral-extract` | Reads each trajectory once and caches per-frame features at the lipid stereocentres (depth, pose in the glycerol body frame, H-bond partners, glycerol dihedrals) for `chiral-compare`. |
-| `chiral-compare` | L vs D comparison built on the diastereomeric-contact mechanism of Hu et al. (Nat. Chem. 2021): ddG and observables by depth, the implied ln(P_L/P_D), sn-2 vs sn-1 H-bonding, pose maps, contact lifetimes and glycerol response, with block-bootstrap errors over paths. |
-
-A typical single-simulation run:
-
-```bash
-chiroflux shap-ml    -toml infretis.toml -data infretis_data.txt -cv-dir ML
-```
-
-Comparing two simulations (e.g. L and D enantiomers). These commands take a
-*root directory* per simulation and expect the `.toml`, the data file and the
-CV folder inside it:
-
-```bash
-chiroflux shap-enantiomer          -dir-l /path/to/L/folder/ -dir-d /path/to/D/folder/
-chiroflux prepare-deeptda-data-ld  -dir-l /path/to/L/folder/ -dir-d /path/to/D/folder/
-chiroflux train-deeptda -npz deeptda_ld_dataset.npz -class-names L,D
-```
-
-`chiral-extract` and `chiral-compare` work from the raw trajectories rather than
-the CV files. Extract once per stage, then compare all stages in chain order
-(entry, internal, escape), so that the stages combine into one equilibrium
-ensemble:
-
-```bash
-for stage in infinit_entry infinit_internal infinit_escape; do
-  chiroflux chiral-extract -tpr L/$stage/gromacs_input/topol.tpr -permeant pro_yne \
-                           -load-dir L/$stage/load -workers 32
-done   # same for D
-chiroflux chiral-compare -runs-l L/infinit_entry,L/infinit_internal,L/infinit_escape \
-                         -runs-d D/infinit_entry,D/infinit_internal,D/infinit_escape \
-                         -data-l post/infretis_data.txt -data-d post/infretis_data.txt
-```
-
-Each stage's cache goes to `chiral_cache/` inside its run directory, where
-`chiral-compare` finds it, so the stages can be extracted separately and from
-anywhere. The cache is kept small in inodes: `-paths-per-file` paths (default
-500) share one `.npz`, and the trajectories are read without MDAnalysis's usual
-hidden `.xtc_offsets.npz`/`.lock` files. A rerun only extracts paths that are
-not cached yet or whose `traj.txt` changed. `chiral-compare` reads only the cache
-and each path's `traj.txt`/`order.txt`, not the trajectories.
-
-`pca` instead takes the second simulation as a parallel set of options
-(`-toml2`, `-data2`, `-cv-dir2`) and fits one joint basis over both:
-
-```bash
-chiroflux pca -toml L/infretis.toml -cv-dir L/ML \
-              -toml2 D/infretis.toml -cv-dir2 D/ML -label1 L -label2 D
-```
-
-### Unweighted runs: the `-no-reweight` flag
-
-`shap-ml`, `shap-enantiomer`, `statistics`, `pca`, `prepare-deeptda-data(-ld)`
-and `train-deeptda` weight every path by its WHAM weight by default. Pass
-`-no-reweight` to give every path weight 1 instead, e.g. to check how much a
-ranking depends on the reweighting. In the DeepTDA commands the proximity ramp
-(`-lambda-low`/`-lambda-high`) still applies. `train-deeptda -no-reweight`
-drops the path weights from a dataset that was built weighted, and gives the
-same result as building it with `-no-reweight`. It reads the `w_prox` column
-for this, which datasets built before this flag existed don't have; for those
-it falls back to uniform weights and drops the ramp too.
-
-### GPU SHAP: the `-shap-device` flag
-
-Explaining, not fitting, dominates `shap-ml` and `shap-enantiomer`. On a
-300-tree forest, fitting took ~1 s while `TreeExplainer` took ~177 s for a
-test fold — **99.4% of the time**. shap ships a CUDA implementation of the same
-Tree SHAP algorithm, and `-shap-device` selects it:
-
-| value | behaviour |
-| --- | --- |
-| `auto` (default) | use the GPU when one is usable, fall back to the CPU explainer with a warning otherwise |
-| `gpu` | fail rather than fall back — use when you want to know the GPU is really being used |
-| `cpu` | force the multi-core CPU path |
-
-Measured on an RTX 2000 Ada, 300 trees, 600 test rows × 40 CVs:
-
-```
-device=cpu (all 22 cores) : 13.58 s
-device=gpu                :  3.56 s     x3.8
-attributions agree        : True, max|diff| 2.2e-06
-```
-
-The difference is float32 on the GPU against float64 on the CPU, so rankings
-are unaffected — there is a test asserting the two agree.
-
-The GPU *replaces* the process fan-out rather than adding to it: `-n-jobs`
-workers all competing for one card would only contend for it and its VRAM.
-Batches are capped at 2000 rows to bound VRAM rather than host RAM.
-
-This applies to `rf` and `gbm`. LightGBM is handed a `DataFrame`, and shap's
-GPU TreeSHAP warns that categorical features are unsupported there, so that
-model stays on the CPU — it explains in milliseconds either way. `logreg` uses
-`LinearExplainer` and `svm` uses permutation importance, so neither is affected.
-
-Note this accelerates *explaining*. Fitting is the other 0.6% — for the SVM,
-which is not a tree model and is dominated by permutation importance instead,
-see `-svm-device` below.
-
-### GPU SVM: the `-svm-device` flag
-
-`-models svm` spends ~75% of its time in `permutation_importance`, which is
-`predict`-bound rather than fit-bound. cuML's SVC accelerates exactly that:
-
-```
-                fit        permutation_importance      total
-sklearn CPU    1.59 s            192.15 s            193.74 s
-cuML GPU       2.73 s              2.44 s              5.17 s     x37.5 overall
-ranking agreement (Spearman): 0.9998, identical top-3 CVs
-```
-
-`-svm-device` takes `auto` (default), `gpu` or `cpu`, mirroring `-shap-device`.
-It needs cuML installed; without it, `auto` falls back to scikit-learn with a
-warning and the package behaves exactly as before.
-
-#### Installing the GPU paths
+Two flags move the slowest steps of `shap-ml` and `shap-enantiomer` to the GPU:
+`-shap-device` and `-svm-device` (what they do and how much they gain is under
+[`shap_analysis`](#shap_analysis)). Both need extra packages.
 
 **A new environment** needs no special sequence. `shap`'s GPU TreeSHAP lives in
 the CUDA build of the conda package (the PyPI wheels carry no CUDA extension),
@@ -206,9 +67,6 @@ python -c "import importlib.util as u; print(u.find_spec('shap._cext_gpu') is no
 python -c "import cuml, torch; print(cuml.__version__, torch.cuda.is_available())"          # -svm-device gpu
 pytest
 ```
-
-chiroflux never imports infretis - it only reads its output files - so this
-environment does not need infretis unless you also run simulations from it.
 
 **Migrating an existing environment** is harder, and only because pip will not
 renegotiate an already-installed torch. If yours is a cu128 build, pip keeps it
@@ -240,7 +98,292 @@ while cuML starts. Run `pytest` and a `torch.cuda.is_available()` check before
 trusting a migrated environment - and prefer the fresh environment above, which
 needs none of this.
 
-### Histogram binning: the `-ranges` file
+### Development
+
+```bash
+pytest          # packaging/CLI wiring, shared helpers, weighting maths
+ruff check .
+```
+
+### Running a command
+
+```bash
+chiroflux --help
+chiroflux COMMAND --help
+```
+
+Options use a single dash (`-toml`, `-cv-dir`); see
+[Option spelling](#option-spelling).
+
+---
+
+## Modules
+
+Every analysis lives in its own module under `src/chiroflux/`. The commands a
+module provides are listed with it; modules without a command are support code
+the others are built on.
+
+| Module | Command(s) | What it does |
+| --- | --- | --- |
+| [`chiral_interface_analysis`](#chiral_interface_analysis) | `chiral-extract`, `chiral-merge-cache`, `chiral-compare` | L vs D at the lipid stereocentres: per-frame contact features cached from the trajectories, then compared by depth. |
+| [`chiral_plot`](#chiral_plot) | `chiral-plot` | Redraws the figures of a `chiral-compare` result from its tables. |
+| [`cli`](#cli) | `chiroflux` | The command-line entry point; loads each command's module lazily. |
+| [`cv_compare`](#cv_compare) | `cv-compare` | Every per-path CV compared between two simulations, or reactive vs unreactive paths, along the order parameter. |
+| [`cv_generation`](#cv_generation) | `generate-cvs` | Computes the per-frame CVs from the MD trajectories into per-path `.txt` files. |
+| [`cv_histograms`](#cv_histograms) | `histograms` | Weighted CV histograms, statistics and 2D maps over a path ensemble. |
+| [`cv_plot`](#cv_plot) | `cv-plot` | Redraws the figures of a `cv-compare` result from its tables. |
+| [`cvs`](#cvs) | — | Transforms on a loaded CV matrix: angle folding, z re-referencing, symmetry corrections, renames. |
+| [`dynamics`](#dynamics) | `dynamics` | Time-resolved CV features in a window around each crossing. |
+| [`leaflet_index`](#leaflet_index) | `leaflet-index` | Writes the `CN_*.ndx` leaflet groups, assigned per lipid rather than per atom height. |
+| [`membrane_compare`](#membrane_compare) | `membrane-compare` | The `membrane-spatial` output of two path classes, or two runs, compared bin by bin in permeant depth. |
+| [`membrane_spatial`](#membrane_spatial) | `membrane-spatial` | Membrane structure around the permeant: order, tilt, thickness, curvature, deformation, water, diffusion, 2-D maps. |
+| [`neighbours`](#neighbours) | `neighbours` | Lipid neighbour composition around the permeant per slab, with enrichment statistics. |
+| [`panels`](#panels) | — | The section titles that group options in every command's `--help`. |
+| [`pathdata`](#pathdata) | — | Reads a simulation: `.toml`, path table, per-path CV files, WHAM path weights. |
+| [`permeant_index`](#permeant_index) | `permeant-index` | Writes the permeant-side `.ndx` files, checked against the topology's bonds. |
+| [`permeation_process`](#permeation_process) | `permeation` | Permeability from the solubility-diffusion resistance integral. |
+| [`plotting`](#plotting) | — | The plots shared between analyses. |
+| [`preference_compare`](#preference_compare) | `preference-compare` | Differences the DOPC/POPC contact preference of two simulations along the OP. |
+| [`prepare_deeptda_data`](#prepare_deeptda_data) | `prepare-deeptda-data`, `prepare-deeptda-data-ld` | Builds weighted frame-level DeepTDA training sets. |
+| [`principal_component_analysis`](#principal_component_analysis) | `pca` | Weighted PCA of the CV space, optionally on a joint two-simulation basis. |
+| [`sasa`](#sasa) | `sasa` | Weighted solvent-accessible surface area profile across the membrane. |
+| [`sasa_compare`](#sasa_compare) | `sasa-compare` | Compares two SASA profiles with a bootstrapped difference. |
+| [`shap_analysis`](#shap_analysis) | `shap-ml` | WHAM-weighted classifiers per interface, explained with SHAP: which CVs decide reactivity. |
+| [`shap_analysis_ld`](#shap_analysis_ld) | `shap-enantiomer` | The same, with *which simulation* a path came from as the label. |
+| [`statistical_analysis`](#statistical_analysis) | `statistics` | Model-free weighted effect sizes per interface. |
+| [`train_deeptda`](#train_deeptda) | `train-deeptda` | Trains a 2-state DeepTDA CV on a `prepare-deeptda-data` dataset. |
+
+### `chiral_interface_analysis`
+
+**Commands:** `chiral-extract`, `chiral-merge-cache`, `chiral-compare`
+
+L vs D comparison built on the diastereomeric-contact mechanism of Hu et al.
+(Nat. Chem. 2021): ddG and observables by depth, the implied ln(P_L/P_D), sn-2
+vs sn-1 H-bonding, pose maps, contact lifetimes and glycerol response, with
+block-bootstrap errors over paths.
+
+- `chiral-extract` reads each trajectory once and caches per-frame features at
+  the lipid stereocentres (depth, pose in the glycerol body frame, H-bond
+  partners, glycerol dihedrals) for `chiral-compare`.
+- `chiral-merge-cache` merges the caches of one stage that was extracted in
+  several places. Chunk files of the same name hold different paths when a
+  stage was extracted in parts, so their entries are combined; a path cached
+  twice from different `traj.txt` files stops the merge before anything is
+  written.
+- `chiral-compare` runs the comparison. Its figures can be redrawn with
+  [`chiral-plot`](#chiral_plot).
+
+`chiral-extract` and `chiral-compare` work from the raw trajectories rather than
+the CV files. Extract once per stage, then compare all stages in chain order
+(entry, internal, escape), so that the stages combine into one equilibrium
+ensemble:
+
+```bash
+for stage in infinit_entry infinit_internal infinit_escape; do
+  chiroflux chiral-extract -tpr L/$stage/gromacs_input/topol.tpr -permeant pro_yne \
+                           -load-dir L/$stage/load -workers 32
+done   # same for D
+chiroflux chiral-compare -runs-l L/infinit_entry,L/infinit_internal,L/infinit_escape \
+                         -runs-d D/infinit_entry,D/infinit_internal,D/infinit_escape \
+                         -data-l post/infretis_data.txt -data-d post/infretis_data.txt
+```
+
+Each stage's cache goes to `chiral_cache/` inside its run directory, where
+`chiral-compare` finds it, so the stages can be extracted separately and from
+anywhere. The cache is kept small in inodes: `-paths-per-file` paths (default
+500) share one `.npz`, and the trajectories are read without MDAnalysis's usual
+hidden `.xtc_offsets.npz`/`.lock` files. A rerun only extracts paths that are
+not cached yet or whose `traj.txt` changed. `chiral-compare` reads only the cache
+and each path's `traj.txt`/`order.txt`, not the trajectories.
+
+### `chiral_plot`
+
+**Command:** `chiral-plot`
+
+Redraws the figures of a `chiral-compare` result from its tables, so they can
+be remade anywhere the CSVs are, without the cache or the runs: the free
+energy and ddG by depth, every depth profile, contact and H-bond lifetimes and
+survival curves, H-bond partner fractions, the pose maps around the lipid
+stereocentre, and the split-half, blocking and drift checks. The reactive and
+unreactive subfolders and the unweighted repeat that `chiral-compare` writes
+get the same figures.
+
+L is blue and D orange, a filled marker means q_bh < 0.05 (BH within its own
+table), a hollow one means not significant or too few frames to test, and bands
+are 95% bootstrap intervals.
+
+### `cli`
+
+**Command:** `chiroflux`
+
+The command-line interface. Each subcommand's module is imported only when that
+command runs: the full analysis stack (shap, scikit-learn, lightgbm, pandas,
+matplotlib) costs a couple of seconds to import, and `chiroflux --help` imports
+nothing beyond typer. The short help strings are therefore kept in `cli.py`
+rather than read from the functions.
+
+### `cv_compare`
+
+**Command:** `cv-compare`
+
+Every CV of the per-path files compared between two simulations (or the
+reactive and unreactive paths of one) along the signed order parameter, all
+stages combined with `chiral-compare`'s weights: mean, SD and effect size d per
+OP bin, the distributions per OP window (shift vs spread vs tails), a ranking of
+the CVs, and their CV × CV correlations, with block-bootstrap errors and BH q.
+[`cv-plot`](#cv_plot) redraws its figures.
+
+`cv-compare` takes the run directories of each stage, like `chiral-compare`, but
+reads the CV files (`ML_mda/` inside each run) instead of a cache, plus
+`load/<path>/order.txt` and `wham/`. With `-runs-b` it compares two simulations;
+without it, the reactive and unreactive paths of `-runs-a`:
+
+```bash
+chiroflux cv-compare -runs-a L/infinit_entry,L/infinit_internal,L/infinit_escape \
+                     -runs-b D/infinit_entry,D/infinit_internal,D/infinit_escape \
+                     -label-a L -label-b D -exclude z_,Box -workers 16
+chiroflux cv-plot -in-dir cv_compare -top 30 -O     # redraw, e.g. after copying the folder
+```
+
+Start from `cv_overview.png` (the CVs that differ most, along the path) and
+`ranking.csv`; `profiles/` and `distributions/` show each CV in detail.
+
+#### Inbound and outbound frames
+
+`-direction inbound` keeps only the frames at which the OP is increasing along
+the path (the way a crossing goes), `-direction outbound` those at which it is
+decreasing (back toward the entry side); the default `all` keeps every frame.
+The direction is the sign of each path's own OP gradient (central differences
+over the phase points in path order). Write each direction to its own
+`-out-dir`:
+
+```bash
+chiroflux cv-compare -runs-a L/infinit_entry,L/infinit_internal,L/infinit_escape \
+                     -direction inbound  -out-dir cv_compare_L_classes_in
+chiroflux cv-compare -runs-a L/infinit_entry,L/infinit_internal,L/infinit_escape \
+                     -direction outbound -out-dir cv_compare_L_classes_out
+```
+
+An unreactive path starts and ends at λA, so its time reverse is in the
+ensemble with the same weight, and reversing a path swaps its inbound and
+outbound frames. For the unreactive paths the two directions therefore have the
+same distribution of every configurational CV: a difference between them is
+sampling noise, which makes it a convergence check. Reactive paths have no
+reversed partner; their inbound frames are the crossing and their outbound
+frames its recrossings. A folder where one side has paths but no frames in the
+chosen direction is skipped with a message.
+
+#### Two runs that entered from opposite faces
+
+The OP column is each run's own infretis order parameter, so the stages of
+both runs already line up on the axis (entry at −25 → −13.5) whichever face
+they entered from. **Do not use `-flip-op-b` for that case.** It bins B on −OP,
+so B's entry stage lands on A's escape and the per-stage folders share no
+frames. What does need correcting is the lab frame: B's entry leaflet is A's
+exit leaflet, and anything signed along z changes sign. For the L/D proline
+runs (L entered from below, D from above):
+
+```bash
+chiroflux cv-compare  <-runs-a/-runs-b/... as above> \
+  -swap-leaflets-b \
+  -exclude z_,tiltN \
+  -angle-cols PRO_ang_C_CG,PRO_r_plane_chiral,PRO_cen_vec \
+  -sym-angle-cols PRO_r_plane,PRO_r_plane_arccos \
+  -flip-b PRO_ang_C_CG,PRO_r_plane_chiral,PRO_cen_vec \
+  -mirror-b PRO_sign_vol,PRO_dih_,PRO_hCN_,PRO_nCos_,_def,curvH,'_tilt$',PRO_mode_ \
+  -phase-shift-b PRO_CP_phi2
+```
+
+| CVs | why | correction |
+| --- | --- | --- |
+| every `_u_`/`_l_` column | B's entry leaflet is the other one | `-swap-leaflets-b` |
+| `z_*` | raw lab z positions; no sign change makes them comparable | exclude |
+| `PRO_ang_C_CG`, `PRO_r_plane_chiral`, `PRO_cen_vec` | angle of a true vector against +z | `-flip-b` |
+| `Mem_*_def`, `*_defDeep`, `*_curvH`, `Mem_*_tilt`, `PRO_mode_*` | signed along lab z (the last two are already cosines, so `-flip-b`, which would give 180 − cos, is wrong for them) | `-mirror-b` |
+| `PRO_sign_vol`, `PRO_dih_*`, `PRO_hCN_*`, `PRO_nCos_*` | chirality-odd; hCN/nCos use the molecule's own frame, so the face does not matter | `-mirror-b` |
+| `PRO_CP_phi2` | puckering phase; the mirror image is half a cycle away | `-phase-shift-b` |
+| `PRO_r_plane`, `PRO_r_plane_arccos` | PCA ring normal with an arbitrary sign | compare as cos² |
+| `PRO_azim_*` | odd under the enantiomer *and* under the face flip, so the two cancel | none |
+
+Patterns are substrings; `'_tilt$'` is anchored to the end of the name so
+it leaves the `Mem_*_tiltN` counts alone (quote it in the shell). They are
+excluded here anyway, since excluding them is the only option in older
+versions.
+
+#### Populations of a state: `-indicators`
+
+The mean of an angle with two states does not tell how the frames split
+between them, and on a periodic axis it is no mean at all (anti at +179° and
+−179° average to syn). `-indicators` adds a 0/1 column per state. Its mean in
+an OP bin is the population of that state there, so `profiles.csv` gives the
+population along the path with CI and q like any other CV:
+
+```bash
+chiroflux cv-compare  <-runs-a/-runs-b/... and the corrections above> \
+  -indicators 'PRO_anti=abs(PRO_dih_OH)>90,PRO_endo=PRO_dih_chi1>0'
+```
+
+A test is `COL>v`, `COL>=v`, `COL<v`, `COL<=v` or `lo<COL<hi` (`<=` allowed),
+with `abs(COL)` for |COL|. It acts on the CV in its file units, never on the
+cos of `-angle-cols`, after B's corrections of that CV. So write it in A's
+convention:
+
+- With `-mirror-b PRO_dih_`, D's χ1 is negated first, and `PRO_dih_chi1>0` is
+  Cγ-endo for both enantiomers.
+- syn/anti (|τ| ≷ 90°) does not change under the mirror anyway.
+
+Indicators are added whatever `-cv-cols` and `-exclude` leave, and
+`columns.csv` records each one's test.
+
+The blocking analysis includes the indicators. A slow state that the paths
+inherit rather than sample, such as the anti COOH, then sets a large block,
+and the CIs widen to match.
+
+### `cv_generation`
+
+**Command:** `generate-cvs`
+
+Computes the per-frame CVs from the MD trajectories and writes the per-path
+`.txt` files (see [Input layout](#input-layout)) that most other commands read.
+It needs the trajectories, the topology and the `.ndx` index files alongside
+them; write those with [`permeant-index`](#permeant_index) and
+[`leaflet-index`](#leaflet_index). Besides `generate-cvs`, only
+`membrane-spatial`, `neighbours`, `sasa` and `chiral-extract` read
+trajectories; everything else works from the CV files or from those commands'
+output.
+
+Which symmetry correction each of its chirality CVs needs when two simulations
+are compared is tabulated under
+[`shap_analysis_ld`](#which-correction-the-geometry-resolved-chirality-cvs-need).
+
+**Ring pucker.** `PRO_dih_chi1` (N–CA–CB–CG) and `PRO_dih_chi2` (CA–CB–CG–CD)
+are the pyrrolidine torsions. Their signs name the pucker:
+
+| enantiomer | Cγ-endo | Cγ-exo |
+| --- | --- | --- |
+| L (S) | χ1 > 0, χ2 < 0 | χ1 < 0, χ2 > 0 |
+| D (R) | χ1 < 0, χ2 > 0 | χ1 > 0, χ2 < 0 |
+
+Cγ-endo means CG is on the carboxyl carbon's side of the plane through CA, CB,
+CD and N. Endo/exo is defined against the carboxyl, so it is the same in both
+mirror images, while the torsions change sign. That is why the χ columns take
+`-mirror-*` like the other `PRO_dih_*`.
+
+`PRO_CP_phi2` carries the same information as a phase. Which of its values is
+endo depends on the twist of the ring, so label puckers with χ1.
+
+These two columns are the last ones in the file. CV files written before they
+existed lack them; `cv-compare` lists those paths per stage, with the numbers
+to rerun `generate-cvs -O` on.
+
+### `cv_histograms`
+
+**Command:** `histograms`
+
+Weighted CV histograms, statistics and 2D maps over a path ensemble, optionally
+merging a second simulation onto a common OP axis. Requires a `-ranges` file.
+
+#### Histogram binning: the `-ranges` file
 
 `chiroflux histograms` requires `-ranges`, a TOML file giving the binning for
 every CV:
@@ -254,8 +397,9 @@ every CV:
 "OP_Lamb" = [-36, -24, 120]
 ```
 
-Start from [`examples/column_ranges.toml`](examples/column_ranges.toml) (120
-columns, the values the original script carried) and copy it per simulation:
+Start from [`examples/column_ranges.toml`](examples/column_ranges.toml) (every
+one of the 174 columns `generate-cvs` writes, binned to cover the L and D
+proline runs) and copy it per simulation:
 
 ```bash
 cp examples/column_ranges.toml L/ranges.toml    # then edit the OP window
@@ -270,355 +414,55 @@ the binning determines every histogram in the output, so a plausible-but-wrong
 fallback would be worse than refusing to run. Malformed entries (wrong length,
 `max <= min`, zero bins) are rejected with the offending column named.
 
-### Comparing two SASA profiles
+### `cv_plot`
 
-`sasa` combines the runs in its `-runs` file into one profile; `sasa-compare`
-takes two such profiles and reports where they differ:
+**Command:** `cv-plot`
 
-```bash
-chiroflux sasa -runs L_runs.toml -out-dir sasa_L
-chiroflux sasa -runs D_runs.toml -out-dir sasa_D
-chiroflux sasa-compare -a sasa_L -b sasa_D -label-a L -label-b D
-```
+Redraws the figures of a [`cv-compare`](#cv_compare) result from its tables, so
+they can be remade anywhere the tables are: the effect map of the CVs that
+differ most along the order parameter, the ranking, shift-vs-spread per OP
+window, the CV × CV correlations, the blocking check, every CV's profile per
+family, and per-CV distribution maps. A is blue and solid, B orange and dashed;
+filled markers are q < 0.05.
 
-It recomputes both profiles from the cached per-path arrays, so no trajectory
-is re-read and the comparison can be re-run freely while adjusting it.
+Each `distributions/<cv>.png` draws the histogram of every OP window from the
+entry stage's λA to the escape stage's λB: one row for OP < 0 and one for
+OP > 0 (the midplane, OP 0, is always a window edge), each in OP order, so with
+the default `-window-step 5` and stages at ±13.5 and ±25 that is −25/−20,
+−20/−15, −15/−13.5, −13.5/−10, −10/−5, −5/0 and the same on the positive side.
+A window keeps its column in every folder: one without frames (outside a stage
+folder's stage) is drawn empty, one with too few frames to test is marked
+"not tested". A side with more than six windows wraps onto a second row.
 
-If the two permeants traverse the membrane in **opposite directions**, their
-depth axes run opposite ways and the profiles are not comparable bin for bin.
-`-mirror-b` reflects B through the membrane centre (z → −z) first:
+### `cvs`
 
-```bash
-chiroflux sasa-compare -a sasa_L -b sasa_D -label-a L -label-b D -mirror-b
-```
+**Support module, no command.** Transforms on an already-loaded CV matrix:
+angle→cos folding, z re-referencing, enantiomer mirrors / entry flips / renames,
+frame subsampling. Depends on numpy only. These are what the
+[symmetry corrections](#aligning-angle-conventions-between-two-simulations) of
+the two-simulation commands apply.
 
-On a test profile peaking at z = −20 against one peaking at z = +20, this took
-the bins flagged as different from 24/40 down to 3/40 — the rest were an
-artefact of the misaligned axis. The reflection also swaps the phosphate-plane
-landmarks, since the upper leaflet becomes the lower one.
+### `dynamics`
 
-Two guards: it requires a z range symmetric about zero (reversing bins is only
-z → −z there), and it warns if B was already built with a run-level `mirror_z`,
-because mirroring twice returns the original.
+**Command:** `dynamics`
 
-The difference Δ(z) = B − A is bootstrapped **jointly**: each replicate
-resamples paths within A and within B and differences the two resampled means.
-Drawing two separate confidence bands and checking whether they overlap is the
-intuitive alternative and it is wrong — non-overlapping intervals do imply a
-difference, but overlapping ones do not imply its absence, so that reading
-misses real effects. As with `sasa`, the resampling unit is the **path**, since
-frames within a path are consecutive points of one trajectory.
+Time-resolved CV features in a window around each crossing: fluctuation
+amplitude, autocorrelation time, and lead/lag event ordering against the order
+parameter. Optional FFT features, with a built-in redundancy check against
+them. `-align event` anchors on the outcome instead (reactive: crossing
+`-event-op`; unreactive: turning point) and writes class-averaged traces around
+it.
 
-Output is one plot per quantity (total / polar / apolar SASA and exposed
-fraction) showing both profiles above and Δ with its band below, plus
-`sasa_comparison.csv` giving per-bin Δ, interval and a significance flag.
+### `leaflet_index`
 
-Both runs must share a z axis. `sasa` records its binning in `sasa_meta.json`
-and the comparison refuses mismatched `-z-range`, `-z-bin-width`,
-`-probe-radius`, `-fold-symmetric` or `-occlude-with-water`.
+**Command:** `leaflet-index`
 
-### Which simulations to combine: the `-runs` file
-
-`chiroflux sasa` requires `-runs`, a TOML file with one `[[run]]` table per
-simulation. Start from [`examples/sasa_runs.toml`](examples/sasa_runs.toml):
-
-```toml
-[[run]]
-name     = "entry"
-load_dir = "L_PRO_neutral/infinit_entry/load"
-weights  = "L_PRO_neutral/infinit_entry/wham/path_weights.txt"
-ml_dir   = "L_PRO_neutral/infinit_entry/post/ML"
-tpr      = "L_PRO_neutral/infinit_entry/topol.tpr"
-scale    = 1.0        # multiplies this run's weighted histogram
-mirror_z = false      # reflect z, for a run entered from the other leaflet
-```
-
-Runs are summed onto one z axis, so `scale` puts them on a common footing: use
-`1.0` for the reference run, and for a second run referenced to its own state A
-use the ratio of total crossing probabilities (the last row of each run's
-`wham/Pcross.txt`, column 2). The ratio of crossing probabilities is sufficient 
-since the paths are weighted in the analysis. `mirror_z` is the SASA-profile 
-counterpart of `-flip-*` — set it for a run whose permeant entered from the 
-opposite leaflet.
-
-Every path in the file is checked for existence before a single trajectory is
-read, and a non-positive `scale` or a duplicate run name is rejected outright.
-
-**The weights and scales are applied at analysis, and finished paths are
-reused.** The intermediates store each path's sums at weight 1, tagged with its
-run, so paths with the same number in two runs stay separate. The weights file
-and `scale` are read when the profiles are built. After extending a simulation:
-
-- `chiroflux sasa -runs runs.toml -skip-parsing` redoes the profiles with the
-  new weights and reads no trajectories;
-- `chiroflux sasa -runs runs.toml` also computes the paths that are new in the
-  weights files, and reuses every path already done.
-
-Reuse is only allowed while the settings that change the computation are the
-same: bins, probe radius, dots per atom, selections, occlusion, `fold`, and each
-run's `mirror_z`. They are recorded in `sasa_meta.json`. A change triggers a
-full recomputation, and `-skip-parsing` refuses to run on intermediates made
-with different settings. `-recompute` forces a full recomputation. Intermediates
-from before this change had the weights multiplied in, so they are removed and
-recomputed rather than mixed in. The result is identical to multiplying the
-weights in during the computation, and a test checks this.
-
-`neighbours` works the same way: its per-path CSVs store counts at weight 1, and
-`-weights` is applied at `-plot`/`-stats`, so a new weights file only needs a
-rerun of those.
-
-### Worked example: two simulations entered from opposite leaflets
-
-L and D were run with the permeant entering from opposite sides of the
-membrane, so this run has to undo *both* a chirality convention and a
-direction-of-entry convention before the classifier sees the data:
-
-```bash
-chiroflux shap-enantiomer \
-  `# ── which simulations ──────────────────────────────────────────────` \
-  -dir-l data/L/ -dir-d data/D/ \
-  -data-l infretis_data_19.txt -data-d infretis_data_17.txt \
-  \
-  `# ── drop CVs that cannot inform an L/D comparison ──────────────────` \
-  `# z_O2/z_O3/z_C2/z_C3/z_N/z_P: lipid-atom families kept as controls in CV data ` \
-  `# intentially kept manually instead of one flag to exclude those               ` \
-  `# ACSF, z_PRO, cen_vec: not discriminating here                                ` \
-  -exclude z_O,z_C,z_N,z_P,cen_vec,ACSF,lambda \
-  \
-  `# ── collapse the leaflet pairs onto one naming scheme ──────────────` \
-  `# Keep only the LOWER-leaflet columns of L and the UPPER-leaflet    ` \
-  `# columns of D, then rename what survives to a single convention.   ` \
-  `# Dropping one side of each pair first is what makes the rename     ` \
-  `# safe: -name-cv-cols applies substitutions in order, so it cannot  ` \
-  `# express a genuine two-way swap.                                   ` \
-  `# Every leaflet-marked column spells the leaflet as a MEDIAL field, so   ` \
-  `# one pattern reaches all of them: CA_C2_u_DOPC, PRO_hCN_u_P,           ` \
-  `# PRO_hCN_u_C2_DOPC_s1, Mem_u_tilt, Mem_u_def. Do not shorten to a bare ` \
-  `# "_l": that also matches Mem_thick_loc, which is not leaflet-paired,   ` \
-  `# and would rename it to Mem_thick_uoc.                                  ` \
-  -exclude-l _u_ \
-  -exclude-d _l_ \
-  -name-cv-cols _l_:_u_ \
-  \
-  `# ── symmetry corrections, each applied to ONE simulation ───────────` \
-  `# theta -> 180 - theta: unsigned angles vs the membrane normal,     ` \
-  `# whose +z/-z face is swapped by the opposite entry direction.      ` \
-  -flip-d PRO_ang_C_CG,PRO_r_plane_chiral,PRO_mode_,_tilt \
-  `# theta -> -theta: chirality-odd pseudoscalars, negated between     ` \
-  `# enantiomers by definition (dihedrals, signed volume, handed CNs). ` \
-  -mirror-d PRO_dih_,PRO_sign_vol,PRO_hCN_,PRO_nCos_,PRO_azim_ \
-  `# phi -> phi + 180: the Cremer-Pople phase, whose mirror is half a  ` \
-  `# pseudorotation cycle away rather than negated.                    ` \
-  -phase-shift-l PRO_CP_phi2 \
-  \
-  `# ── representation ─────────────────────────────────────────────────` \
-  `# z_Memb is the reference for the z-corrections; it carries no      ` \
-  `# independent signal, so drop it from the feature set afterwards.   ` \
-  -drop-z-ref \
-  \
-  `# ── model, parallelism, output ─────────────────────────────────────` \
-  -optimize -n-jobs 28 -O
-```
-
-Three things in this example are worth copying deliberately:
-
-- **Corrections are per simulation.** Each one is applied to L *or* D, never
-  both — applying the same correction to both cancels it. Which side you
-  correct is free (here `-phase-shift-l` brings L into D's frame while the
-  other two bring D into L's), as long as each CV is corrected exactly once.
-- **Substrings, not names.** `-exclude`, `-mirror-*`, `-flip-*` and
-  `-phase-shift-*` match by substring, so `PRO_dih_` catches both
-  `PRO_dih_chiral` and `PRO_dih_OH`. Keep them specific: a bare `PRO` would
-  match essentially every CV in this feature set. (`-angle-cols`,
-  `-sym-angle-cols` and `-z-cols` match **exact** names instead.)
-- **`-exclude` runs before the corrections.** A CV dropped there is not
-  available to be corrected, so keep the patterns narrow enough not to catch
-  something you meant to correct. The `z_`-prefixed patterns above are chosen
-  for exactly that reason: they drop the per-atom z columns without touching
-  the `PRO_hCN_C2*`/`PRO_nCos_C2*` handed coordination numbers, which a bare
-  `C2,O2` would also have removed — and those pseudoscalars are the CVs most
-  able to resolve L from D.
-
-  Excluding the z columns also means every entry in the built-in z-correction
-  list is now absent, which is reported as one `Skipping z-correction for
-  'z_...': dropped by -exclude` line each rather than as a warning.
-
-When copying the block, keep the line continuations clean: a `\` continues a
-line only when it is the **last** character. A trailing space turns it into an
-escaped space, which arrives as a lone argument and fails with
-`Got unexpected extra argument ( )`.
-
-Note that options use a single dash (`-toml`, `-cv-dir`), matching the infretis
-tooling convention rather than the GNU `--long-option` style.
-
-`membrane-spatial` and `neighbours` came from scripts that already used
-double-dash options, so they accept **both** spellings — `-start` and `--start`
-are the same flag — and existing command lines keep working. Their few
-multi-value options changed from space- to comma-separated, since that has no
-single-dash equivalent:
-
-```bash
-chiroflux neighbours -start 1 -slab-range -40,40        # was: --slab-range -40 40
-chiroflux membrane-spatial -start 1 -near-n 5,10        # was: --near-n 5 10
-```
-
-### Aligning angle conventions between two simulations
-
-A CV that differs between L and D purely by convention will "perfectly"
-separate them while carrying no physical information, and will dominate any
-importance ranking. `shap-enantiomer` has three corrections for this, grouped
-in `--help` under *CV corrections: symmetry*. They fix *different* things, and
-which you need depends on how the CV is defined:
-
-| flag | operation | corrects for | applies to |
-| --- | --- | --- | --- |
-| `-mirror-l` / `-mirror-d` | θ → −θ | **chirality**: a chirality-odd CV is negated between mirror-image enantiomers by definition, so L has φ where D has −φ | **signed** CVs on a zero-centred domain — an `arctan2` dihedral in [−180, 180], a signed volume, a handed coordination number |
-| `-flip-l` / `-flip-d` | θ → 180 − θ | **direction of entry/internal/escape**: a permeant entering from the other leaflet sees the membrane normal reversed, swapping the +z (extracellular) and −z (intracellular) face | **unsigned** angles against the membrane normal, e.g. anything from `arccos` in [0, 180] |
-| `-phase-shift-l` / `-phase-shift-d` | φ → φ + 180 | **chirality of a periodic phase** whose reference vector is a pseudovector, so the mirror image lies half a cycle away rather than negated | **periodic phases** in (−180, 180] — e.g. a Cremer–Pople puckering phase, whose C3-endo mirrors to C3-exo |
-
-All three are their own inverse, and each should be applied to **one simulation
-only**, so its values become comparable to the other's.
-
-`-flip-*` is not a chirality operation — it will not turn L into D. 90°
-is its pivot because that is the flat-vs-vertical boundary: below 90° the
-reference face points toward +z, above it toward −z.
-
-`-phase-shift-*` exists because neither of the others is right for a puckering
-phase: the mirror is φ+180, not −φ and not 180−φ. It wraps back into
-(−180, 180] so the shifted simulation stays on the same domain as the
-unshifted one, and warns rather than silently re-basing a [0, 360) column.
-
-Match the flag to the domain. Negating an `arccos` angle sends [0, 180] to
-[−180, 0], off its own domain; flipping a signed dihedral gives
-180 − (−170) = 350, likewise off-domain.
-
-Columns already folded to `cos(...)`/`cos2(...)` by `-angle-cols` are skipped
-by `-flip-*` with a warning, since they hold values in [−1, 1] rather
-than degrees. (Negating them is the equivalent operation there, because
-−cos θ = cos(180 − θ).)
-
-#### Which correction the geometry-resolved chirality CVs need
-
-`generate-cvs` emits three kinds of quantity around the permeant stereocentre,
-and they do **not** all take the same correction:
-
-| CVs | kind | correction |
-| --- | --- | --- |
-| `PRO_hCN_*`, `PRO_hCN_*_s1..s3`, `PRO_nCos_*`, `PRO_azim_*`, `PRO_sign_vol`, `PRO_dih_chiral` | signed **pseudoscalar**, zero-centred | `-mirror-l` / `-mirror-d` |
-| `Mem_u_tilt`, `Mem_l_tilt`, `PRO_mode_ring`, `PRO_mode_O`, `PRO_mode_N` | cosine of a **true vector** against +z | `-flip-l` / `-flip-d` (negation, on a cos-valued column) |
-| `PRO_rMin_*`, `Mem_u_tiltN`, `Mem_l_tiltN`, `Mem_u_nP`, `Mem_l_nP`, `Water_wire`, `Water_cluster` | true scalar (a distance, a count, a flag) | **none** — these are reflection-invariant |
-
-Mirroring the handed columns is right and does not throw the chirality signal
-away. To leading order the lipid environment is achiral, so an L path's `hCN`
-distribution is the mirror of a D path's and the bulk of the L/D difference in
-these columns reflects that near-symmetry rather than any discrimination.
-`-mirror-*` removes exactly that leading antisymmetry; what survives is the
-diastereomeric residual, which is the quantity of interest.
-
-What must **not** be done to them is `-sym-angle-cols`. Folding to cos²θ
-discards the sign irreversibly, taking the residual with it — unlike negation,
-which is invertible. Reserve it for genuinely head–tail symmetric angles.
-
-> **Known limitation.** `-name-cv-cols` applies its substitutions in order, so
-> it cannot express a two-way swap: `'_u_:_l_,_l_:_u_'` collapses both onto
-> `_u_` and silently produces duplicate column names. Therefore, the individual
-> simulations should already exclude the opposite leaflet with no interaction.
-> **Have to come up with a fix for the internal simulations.**
-
-## Library use
-
-Each analysis lives in its own module and is imported from there:
-
-```python
-from chiroflux.shap_analysis import shap_ml
-from chiroflux.shap_analysis_ld import shap_enantiomer
-from chiroflux.statistical_analysis import statistics
-from chiroflux.principal_component_analysis import PCA
-from chiroflux.prepare_deeptda_data import prepare_deeptda_data, prepare_deeptda_data_ld
-from chiroflux.train_deeptda import train_deeptda
-```
-
-They are not re-exported from the top-level `chiroflux` namespace on purpose:
-two of them share a name with their own module, so an alias would resolve to the
-function or the module depending on import order. Importing from the module is
-unambiguous, and it keeps `import chiroflux` from pulling in shap, scikit-learn,
-lightgbm and torch.
-
-The CLI loads lazily for the same reason — `chiroflux --help` imports nothing
-beyond typer, and a subcommand imports only the module it needs.
-
-### Support modules
-
-The seven entry points sit on three support modules, which import nothing from
-the rest of the package:
-
-| module | holds | depends on |
-| --- | --- | --- |
-| `pathdata.py` | Reading a simulation: the `.toml`, the `infretis_data.txt` path table, the per-path trajectories, column discovery, and the WHAM path weights derived from them. Plus `_check_overwrite`. | numpy, tomli |
-| `cvs.py` | Transforms on an already-loaded CV matrix: angle→cos folding, z re-referencing, enantiomer mirrors / entry flips / renames, frame subsampling. | numpy |
-| `plotting.py` | The two plots shared between analyses: `_plot_importance_bar` and `_plot_interface_heatmap`. | numpy, matplotlib |
-
-`_compute_path_weights` is arithmetic rather than I/O, but lives in `pathdata`
-because it is never useful alone — every caller reads the path table and
-immediately weights it.
-
-**None of these import shap, scikit-learn or lightgbm, and that is load-bearing.**
-It is what lets `statistics`, `pca`, `prepare-deeptda-data` and `train-deeptda`
-run without the ML stack: PCA used to spend 2.0 s loading gradient boosting to
-get `_load_path_table`, and now imports in 0.46 s. Only `shap_analysis` and
-`shap_analysis_ld` pull that stack in, which is what they are for. Tests in
-`tests/test_packaging.py` enforce this.
-
-The SHAP-specific plots (beeswarm, dependence, ROC, calibration) stay in
-`shap_analysis.py` rather than moving to `plotting.py` for the same reason —
-they need shap and scikit-learn, and hoisting them would hand that cost to
-every importer of `plotting`.
-
-## Development
-
-```bash
-pytest          # packaging/CLI wiring, shared helpers, weighting maths
-ruff check .
-```
-
-## Known issues
-
-### Leaflet labels are unreliable for the deep chain carbons
-
-The `CN_*.ndx` leaflet groups are cut by a static z threshold evaluated at
-frame 0. For the headgroup, glycerol and ester markers that is exact — C2, P,
-N, O22 and O32 all split 55/55 in DOPC and 11/11 in POPC. For the deep chain
-carbons it is not: DOPC C210 splits 54/56 and C310 51/59, and POPC C210 10/12.
-
-This is **not** lipid flip-flop. A translocated lipid would carry its whole
-headgroup across, and the P/N/C2 counts would be off by the same number; they
-are exact. What the cutoff catches is chain **interdigitation** — C10 sits deep
-in the hydrophobic core, and chain ends from opposing leaflets reach across the
-midplane. The species dependence confirms it: DOPC's sn-3 chain is oleoyl
-(18:1, long and kinked) and misassigns four carbons, while POPC's is palmitoyl
-(16:0) and misassigns none. A flip-flop rate would not care which carbon you
-looked at.
-
-Consequence: the 24 coordination numbers built on groups 11–14
-(`CA_CC2_*`, `CA_CC3_*`, `N_CC2_*`, `N_CC3_*`, `O_CC2_*`, `O_CC3_*`) count a
-few percent of the opposite leaflet's chain carbons — and, since the
-misassigned atoms are exactly those nearest the midplane, that contamination is
-concentrated where a permeant crossing the core actually is. `Mem_*_tilt`
-avoids the problem by reassigning chain atoms geometrically rather than by
-label (see `compute_local_chain_tilt`); the coordination numbers do not.
-
-The error is static and shared across paths *within* a simulation, so it should
-largely cancel in reactive-vs-non-reactive comparisons. **It does not
-automatically cancel between two simulations**: L and D are built by the same
-script, but from their own frame-0 structures, so the misassigned set differs
-between them and the affected CVs carry a small systematic L/D difference that
-has nothing to do with chirality.
-
-**The fix is `chiroflux leaflet-index`**, which assigns each lipid to a leaflet
-once from its own headgroup phosphorus and then writes every marker of that
-residue to the matching group. A chain carbon never votes on its own leaflet,
-so interdigitation stops mattering and the groups come out equal by
-construction:
+Writes the `CN_*.ndx` leaflet groups, assigning each lipid to a leaflet once
+from its own headgroup phosphorus and then writing every marker of that residue
+to the matching group. A chain carbon never votes on its own leaflet, so chain
+interdigitation stops mattering and the groups come out equal by construction.
+Why that matters is under
+[Known issues](#leaflet-labels-are-unreliable-for-the-deep-chain-carbons).
 
 ```bash
 chiroflux leaflet-index -topology gromacs_input/topol.tpr \
@@ -643,7 +487,70 @@ The old shell recipe also hardcodes `ZMID=4.06` nm where the actual mean
 headgroup plane is 3.87 nm; `leaflet-index` computes the midplane from the
 structure, and takes `-midplane` if you need to pin it.
 
-### Per-path output of `membrane-spatial`
+### `membrane_compare`
+
+**Command:** `membrane-compare`
+
+The [`membrane-spatial`](#membrane_spatial) output of two path classes of one
+run (reactive vs unreactive) or of two runs (`-run-b`, e.g. L vs D), compared
+bin by bin in permeant depth: P2, tilt, thickness, curvature, radial phosphate
+deformation, core water, diffusion, and the permeant-centred maps, with
+block-jackknife errors on the difference. It works one stage at a time: each
+run is the run directory of one stage. Without `-run-b` it compares two path
+classes of `-run-a`; with it, the two runs, each with its own weights:
+
+```bash
+chiroflux membrane-compare -run-a L/infinit_entry -run-b D/infinit_entry \
+                           -label-a L -label-b D -paths unreactive -rotate-b
+```
+
+`-dir` and `-weights` are the per-path folder and the WHAM weights file
+relative to each run directory, given once for both runs. Their defaults,
+`analysis/Memb_OP` and `wham/path_weights.txt`, are where `membrane-spatial`
+and the WHAM analysis put them.
+
+There is no path range: every per-path file (`<n>.npz`) in each folder whose
+path has a positive weight is used. Paths outside the weights file or in its
+burn-in are left out, and the command prints how many weighted paths have no
+file yet.
+
+Which paths are [0-] is read from WHAM's `pathweights_0_min.txt` next to the
+weights file, here and in `membrane-spatial -paths`; reactive is what each path
+file stores. Path files written before 2026-11-18 store the wrong ensemble for
+paths made by a [0-]/[0+] swap, which were then counted as unreactive (or, if
+reactive, as [0-]). The command prints how many paths the WHAM list reclassifies,
+and a warning if there is no such file. Use the WHAM folder that belongs to the
+run the path files came from; one made before a restart numbers its paths
+differently.
+
+The permeant depth and the leaflet names are in the lab frame, so a run that
+entered from the other face sits at the opposite depths with its leaflets
+swapped. `-rotate-b` reads run B turned 180° about x (a rotation, not a
+mirror, so the chiral lipids stay what they are); the command prints the
+depth range each run reaches, so a missing rotation shows up as two disjoint
+ranges. `-paths` picks the classes pooled in each run; compare reactive with
+reactive and unreactive with unreactive, since the two runs need not have the
+same mix of them.
+
+`distortion_ranking.csv` lists what differs most and `overview_t.png` shows it
+against depth.
+
+### `membrane_spatial`
+
+**Command:** `membrane-spatial`
+
+Spatial membrane structure around the permeant: chain order (P2) and tilt,
+local thickness and curvature, radial phosphate deformation and water defect
+profiles, permeant diffusion along and across the normal, and permeant-centred
+2-D maps per depth bin. Each path is analysed once into its own file; `-plot`
+pools the paths with the WHAM weights, and `-paths` restricts the pool to one
+path class. To test a difference between two classes or two runs, use
+[`membrane-compare`](#membrane_compare).
+
+`membrane-spatial` accepts both `-option` and `--option`; see
+[Option spelling](#option-spelling).
+
+#### Per-path output
 
 Each path's results go into **one** compressed file, `Memb_OP/<path>.npz`. It
 used to be seven CSVs plus a spatial `.npz` per path — 80,000 files at 10,000
@@ -692,7 +599,7 @@ recomputes it, and the aggregation skips it and says how many it skipped.
 Recomputing needs the path's trajectories in `../load`. Files in the old CSV
 layout are ignored too — the run says how many it found — and can be deleted.
 
-### Local diffusion along the normal
+#### Local diffusion along the normal
 
 `membrane-spatial` writes `diffusion_aggregate.csv`: `D_z`,
 its block-jackknife `_err`/`_neff`, and `D_z_lag2`. The estimate is the
@@ -739,7 +646,55 @@ not that — in the same test it read 49% of the truth at 1 A slabs and 230% at
 `D` scales as `1/dt`, and `dt` is read from the first trajectory's own header;
 `-dt` overrides it if that header is wrong.
 
-### Permeability from the resistance integral
+### `neighbours`
+
+**Command:** `neighbours`
+
+Lipid neighbour composition around the permeant per membrane slab, with
+bootstrap enrichment statistics against bulk composition.
+
+Its per-path CSVs store counts at weight 1, and `-weights` is applied at
+`-plot`/`-stats`, so a new weights file only needs a rerun of those - the same
+scheme as [`sasa`](#sasa).
+
+`neighbours` accepts both `-option` and `--option`; see
+[Option spelling](#option-spelling).
+
+### `panels`
+
+**Support module, no command.** The section titles that group the options in
+every command's `--help` (input data, dataset construction, CV selection,
+representation, symmetry corrections, model, output). Keeping them in one place
+means every command presents its options in the same order under the same
+names, so the same flag is found in the same place in two commands. It imports
+nothing.
+
+### `pathdata`
+
+**Support module, no command.** Reading a simulation: the `.toml`, the
+`infretis_data.txt` path table, the per-path trajectories, column discovery,
+and the WHAM path weights derived from them. Plus `_check_overwrite`. Depends on
+numpy and tomli.
+
+`_compute_path_weights` is arithmetic rather than I/O, but lives in `pathdata`
+because it is never useful alone — every caller reads the path table and
+immediately weights it.
+
+### `permeant_index`
+
+**Command:** `permeant-index`
+
+Writes the permeant-side `.ndx` files, checking each group's atoms are bonded
+the way its CV assumes. It writes `C, O01, H02` for `PRO_C_O_H.ndx`, which
+changes what `PRO_ang_OH` measures compared with the old hand-made files; see
+[Known issues](#pro_ang_oh-measures-the-wrong-angle).
+
+### `permeation_process`
+
+**Command:** `permeation`
+
+Permeability from the inhomogeneous solubility-diffusion model: free energy and
+local diffusion combined into a resistance integral.
 
 `permeation` is the Marrink-Berendsen route (J. Phys. Chem. 100 (1996) 16729)
 to the number RETIS also computes:
@@ -841,10 +796,23 @@ underestimates 1/P and so **overestimates** P - the command says so.
 that way need their crossing probabilities with `-pcross`, which shifts them by
 `-sum ln(P_tot,j)` and warns if they are missing. Prefer `-runs`.
 
-### Comparing the lipid preference of two runs
+### `plotting`
 
-`preference-compare` differences `frac_DOPC(OP_Lamb)` between two simulations.
-Two things make this less obvious than it looks.
+**Support module, no command.** The two plots shared between analyses:
+`_plot_importance_bar` and `_plot_interface_heatmap`. Depends on numpy and
+matplotlib.
+
+The SHAP-specific plots (beeswarm, dependence, ROC, calibration) stay in
+`shap_analysis.py` rather than moving here: they need shap and scikit-learn,
+and hoisting them would hand that cost to every importer of `plotting` (see
+[Import cost](#import-cost)).
+
+### `preference_compare`
+
+**Command:** `preference-compare`
+
+Differences `frac_DOPC(OP_Lamb)` between two simulations, with a bootstrapped
+CI on the difference. Two things make this less obvious than it looks.
 
 **The enrichment curves cannot be differenced directly.** Since
 `frac_POPC = 1 - frac_DOPC` and `E = frac/F`, the two are locked together as
@@ -901,6 +869,531 @@ null is 5.3% at 40 chunks against a nominal 5%, rising to 8.3% at 10 chunks —
 the usual mild over-rejection of a percentile bootstrap with few resampling
 units, worth remembering for a run with few chunks.
 
+### `prepare_deeptda_data`
+
+**Commands:** `prepare-deeptda-data`, `prepare-deeptda-data-ld`
+
+`prepare-deeptda-data` builds a frame-level, weighted DeepTDA training set
+labelled reactive/non-reactive; `prepare-deeptda-data-ld` the same, labelled by
+which of two simulations each frame came from. Train on either with
+[`train-deeptda`](#train_deeptda):
+
+```bash
+chiroflux prepare-deeptda-data-ld  -dir-l /path/to/L/folder/ -dir-d /path/to/D/folder/
+chiroflux train-deeptda -npz deeptda_ld_dataset.npz -class-names L,D
+```
+
+The two-simulation form takes a *root directory* per simulation and expects
+the `.toml`, the data file and the CV folder inside it. Both accept
+[`-no-reweight`](#unweighted-runs-the--no-reweight-flag).
+
+### `principal_component_analysis`
+
+**Command:** `pca`
+
+Weighted PCA of the CV space, optionally on a joint basis fitted across two
+simulations so they can be compared in the same coordinates. `pca` takes the
+second simulation as a parallel set of options (`-toml2`, `-data2`, `-cv-dir2`)
+and fits one joint basis over both:
+
+```bash
+chiroflux pca -toml L/infretis.toml -cv-dir L/ML \
+              -toml2 D/infretis.toml -cv-dir2 D/ML -label1 L -label2 D
+```
+
+Accepts [`-no-reweight`](#unweighted-runs-the--no-reweight-flag).
+
+### `sasa`
+
+**Command:** `sasa`
+
+Weighted solvent-accessible surface area profile across the membrane, from a
+Shrake–Rupley construction on the trajectories. Requires a `-runs` file. Two
+profiles are compared with [`sasa-compare`](#sasa_compare).
+
+#### Which simulations to combine: the `-runs` file
+
+`chiroflux sasa` requires `-runs`, a TOML file with one `[[run]]` table per
+simulation. Start from [`examples/sasa_runs.toml`](examples/sasa_runs.toml):
+
+```toml
+[[run]]
+name     = "entry"
+load_dir = "L_PRO_neutral/infinit_entry/load"
+weights  = "L_PRO_neutral/infinit_entry/wham/path_weights.txt"
+ml_dir   = "L_PRO_neutral/infinit_entry/post/ML"
+tpr      = "L_PRO_neutral/infinit_entry/topol.tpr"
+scale    = 1.0        # multiplies this run's weighted histogram
+mirror_z = false      # reflect z, for a run entered from the other leaflet
+```
+
+Runs are summed onto one z axis, so `scale` puts them on a common footing: use
+`1.0` for the reference run, and for a second run referenced to its own state A
+use the ratio of total crossing probabilities (the last row of each run's
+`wham/Pcross.txt`, column 2). The ratio of crossing probabilities is sufficient 
+since the paths are weighted in the analysis. `mirror_z` is the SASA-profile 
+counterpart of `-flip-*` — set it for a run whose permeant entered from the 
+opposite leaflet.
+
+Every path in the file is checked for existence before a single trajectory is
+read, and a non-positive `scale` or a duplicate run name is rejected outright.
+
+**The weights and scales are applied at analysis, and finished paths are
+reused.** The intermediates store each path's sums at weight 1, tagged with its
+run, so paths with the same number in two runs stay separate. The weights file
+and `scale` are read when the profiles are built. After extending a simulation:
+
+- `chiroflux sasa -runs runs.toml -skip-parsing` redoes the profiles with the
+  new weights and reads no trajectories;
+- `chiroflux sasa -runs runs.toml` also computes the paths that are new in the
+  weights files, and reuses every path already done.
+
+Reuse is only allowed while the settings that change the computation are the
+same: bins, probe radius, dots per atom, selections, occlusion, `fold`, and each
+run's `mirror_z`. They are recorded in `sasa_meta.json`. A change triggers a
+full recomputation, and `-skip-parsing` refuses to run on intermediates made
+with different settings. `-recompute` forces a full recomputation. Intermediates
+from before this change had the weights multiplied in, so they are removed and
+recomputed rather than mixed in. The result is identical to multiplying the
+weights in during the computation, and a test checks this.
+
+### `sasa_compare`
+
+**Command:** `sasa-compare`
+
+`sasa` combines the runs in its `-runs` file into one profile; `sasa-compare`
+takes two such profiles and reports where they differ:
+
+```bash
+chiroflux sasa -runs L_runs.toml -out-dir sasa_L
+chiroflux sasa -runs D_runs.toml -out-dir sasa_D
+chiroflux sasa-compare -a sasa_L -b sasa_D -label-a L -label-b D
+```
+
+It recomputes both profiles from the cached per-path arrays, so no trajectory
+is re-read and the comparison can be re-run freely while adjusting it.
+
+If the two permeants traverse the membrane in **opposite directions**, their
+depth axes run opposite ways and the profiles are not comparable bin for bin.
+`-mirror-b` reflects B through the membrane centre (z → −z) first:
+
+```bash
+chiroflux sasa-compare -a sasa_L -b sasa_D -label-a L -label-b D -mirror-b
+```
+
+On a test profile peaking at z = −20 against one peaking at z = +20, this took
+the bins flagged as different from 24/40 down to 3/40 — the rest were an
+artefact of the misaligned axis. The reflection also swaps the phosphate-plane
+landmarks, since the upper leaflet becomes the lower one.
+
+Two guards: it requires a z range symmetric about zero (reversing bins is only
+z → −z there), and it warns if B was already built with a run-level `mirror_z`,
+because mirroring twice returns the original.
+
+The difference Δ(z) = B − A is bootstrapped **jointly**: each replicate
+resamples paths within A and within B and differences the two resampled means.
+Drawing two separate confidence bands and checking whether they overlap is the
+intuitive alternative and it is wrong — non-overlapping intervals do imply a
+difference, but overlapping ones do not imply its absence, so that reading
+misses real effects. As with `sasa`, the resampling unit is the **path**, since
+frames within a path are consecutive points of one trajectory.
+
+Output is one plot per quantity (total / polar / apolar SASA and exposed
+fraction) showing both profiles above and Δ with its band below, plus
+`sasa_comparison.csv` giving per-bin Δ, interval and a significance flag.
+
+Both runs must share a z axis. `sasa` records its binning in `sasa_meta.json`
+and the comparison refuses mismatched `-z-range`, `-z-bin-width`,
+`-probe-radius`, `-fold-symmetric` or `-occlude-with-water`.
+
+### `shap_analysis`
+
+**Command:** `shap-ml`
+
+Fits WHAM-weighted classifiers (random forest, logistic regression, gradient
+boosting, LightGBM, SVM) per interface and explains them with SHAP, to rank
+which CVs decide whether a path is reactive. A typical single-simulation run:
+
+```bash
+chiroflux shap-ml    -toml infretis.toml -data infretis_data.txt -cv-dir ML
+```
+
+Accepts [`-no-reweight`](#unweighted-runs-the--no-reweight-flag). The two GPU
+flags below apply to `shap-enantiomer` too; installing their packages is under
+[GPU acceleration](#gpu-acceleration).
+
+#### GPU SHAP: the `-shap-device` flag
+
+Explaining, not fitting, dominates `shap-ml` and `shap-enantiomer`. On a
+300-tree forest, fitting took ~1 s while `TreeExplainer` took ~177 s for a
+test fold — **99.4% of the time**. shap ships a CUDA implementation of the same
+Tree SHAP algorithm, and `-shap-device` selects it:
+
+| value | behaviour |
+| --- | --- |
+| `auto` (default) | use the GPU when one is usable, fall back to the CPU explainer with a warning otherwise |
+| `gpu` | fail rather than fall back — use when you want to know the GPU is really being used |
+| `cpu` | force the multi-core CPU path |
+
+Measured on an RTX 2000 Ada, 300 trees, 600 test rows × 40 CVs:
+
+```
+device=cpu (all 22 cores) : 13.58 s
+device=gpu                :  3.56 s     x3.8
+attributions agree        : True, max|diff| 2.2e-06
+```
+
+The difference is float32 on the GPU against float64 on the CPU, so rankings
+are unaffected — there is a test asserting the two agree.
+
+The GPU *replaces* the process fan-out rather than adding to it: `-n-jobs`
+workers all competing for one card would only contend for it and its VRAM.
+Batches are capped at 2000 rows to bound VRAM rather than host RAM.
+
+This applies to `rf` and `gbm`. LightGBM is handed a `DataFrame`, and shap's
+GPU TreeSHAP warns that categorical features are unsupported there, so that
+model stays on the CPU — it explains in milliseconds either way. `logreg` uses
+`LinearExplainer` and `svm` uses permutation importance, so neither is affected.
+
+Note this accelerates *explaining*. Fitting is the other 0.6% — for the SVM,
+which is not a tree model and is dominated by permutation importance instead,
+see `-svm-device` below.
+
+#### GPU SVM: the `-svm-device` flag
+
+`-models svm` spends ~75% of its time in `permutation_importance`, which is
+`predict`-bound rather than fit-bound. cuML's SVC accelerates exactly that:
+
+```
+                fit        permutation_importance      total
+sklearn CPU    1.59 s            192.15 s            193.74 s
+cuML GPU       2.73 s              2.44 s              5.17 s     x37.5 overall
+ranking agreement (Spearman): 0.9998, identical top-3 CVs
+```
+
+`-svm-device` takes `auto` (default), `gpu` or `cpu`, mirroring `-shap-device`.
+It needs cuML installed; without it, `auto` falls back to scikit-learn with a
+warning and the package behaves exactly as before.
+
+### `shap_analysis_ld`
+
+**Command:** `shap-enantiomer`
+
+Same as [`shap-ml`](#shap_analysis), but the label is *which of two
+simulations* a path came from (e.g. L and D enantiomers). It takes a *root
+directory* per simulation and expects the `.toml`, the data file and the CV
+folder inside it:
+
+```bash
+chiroflux shap-enantiomer          -dir-l /path/to/L/folder/ -dir-d /path/to/D/folder/
+```
+
+The GPU flags of `shap-ml` and [`-no-reweight`](#unweighted-runs-the--no-reweight-flag)
+apply here too. A CV that differs between the two simulations purely by
+convention has to be corrected first, which is what most of its options are
+for.
+
+#### Worked example: two simulations entered from opposite leaflets
+
+L and D were run with the permeant entering from opposite sides of the
+membrane, so this run has to undo *both* a chirality convention and a
+direction-of-entry convention before the classifier sees the data:
+
+```bash
+chiroflux shap-enantiomer \
+  `# ── which simulations ──────────────────────────────────────────────` \
+  -dir-l data/L/ -dir-d data/D/ \
+  -data-l infretis_data_19.txt -data-d infretis_data_17.txt \
+  \
+  `# ── drop CVs that cannot inform an L/D comparison ──────────────────` \
+  `# z_O2/z_O3/z_C2/z_C3/z_N/z_P: lipid-atom families kept as controls in CV data ` \
+  `# intentially kept manually instead of one flag to exclude those               ` \
+  `# ACSF, z_PRO, cen_vec: not discriminating here                                ` \
+  -exclude z_O,z_C,z_N,z_P,cen_vec,ACSF,lambda \
+  \
+  `# ── collapse the leaflet pairs onto one naming scheme ──────────────` \
+  `# Keep only the LOWER-leaflet columns of L and the UPPER-leaflet    ` \
+  `# columns of D, then rename what survives to a single convention.   ` \
+  `# Dropping one side of each pair first is what makes the rename     ` \
+  `# safe: -name-cv-cols applies substitutions in order, so it cannot  ` \
+  `# express a genuine two-way swap.                                   ` \
+  `# Every leaflet-marked column spells the leaflet as a MEDIAL field, so   ` \
+  `# one pattern reaches all of them: CA_C2_u_DOPC, PRO_hCN_u_P,           ` \
+  `# PRO_hCN_u_C2_DOPC_s1, Mem_u_tilt, Mem_u_def. Do not shorten to a bare ` \
+  `# "_l": that also matches Mem_thick_loc, which is not leaflet-paired,   ` \
+  `# and would rename it to Mem_thick_uoc.                                  ` \
+  -exclude-l _u_ \
+  -exclude-d _l_ \
+  -name-cv-cols _l_:_u_ \
+  \
+  `# ── symmetry corrections, each applied to ONE simulation ───────────` \
+  `# theta -> 180 - theta: unsigned angles (degrees) vs the membrane    ` \
+  `# normal, whose +z/-z face is swapped by the opposite entry.         ` \
+  -flip-d PRO_ang_C_CG,PRO_r_plane_chiral \
+  `# theta -> -theta: chirality-odd pseudoscalars, negated between     ` \
+  `# enantiomers by definition (dihedrals, signed volume, handed CNs), ` \
+  `# and, for the opposite entry, CVs signed along lab z: the raw       ` \
+  `# cosines PRO_mode_* / Mem_*_tilt (-flip would give 180 - cos), the  ` \
+  `# P displacements and the curvature. '_tilt$' is anchored to the end ` \
+  `# of the name, so the Mem_*_tiltN counts are left alone.             ` \
+  `# PRO_azim_* is NOT here: about lab +z, it is odd under both the     ` \
+  `# enantiomer and the entry face, and the two cancel.                 ` \
+  -mirror-d PRO_dih_,PRO_sign_vol,PRO_hCN_,PRO_nCos_,PRO_mode_,'_tilt$',_def,curvH \
+  `# phi -> phi + 180: the Cremer-Pople phase, whose mirror is half a  ` \
+  `# pseudorotation cycle away rather than negated.                    ` \
+  -phase-shift-l PRO_CP_phi2 \
+  \
+  `# ── representation ─────────────────────────────────────────────────` \
+  `# z_Memb is the reference for the z-corrections; it carries no      ` \
+  `# independent signal, so drop it from the feature set afterwards.   ` \
+  -drop-z-ref \
+  \
+  `# ── model, parallelism, output ─────────────────────────────────────` \
+  -optimize -n-jobs 28 -O
+```
+
+Three things in this example are worth copying deliberately:
+
+- **Corrections are per simulation.** Each one is applied to L *or* D, never
+  both — applying the same correction to both cancels it. Which side you
+  correct is free (here `-phase-shift-l` brings L into D's frame while the
+  other two bring D into L's), as long as each CV is corrected exactly once.
+- **Substrings, not names.** `-exclude`, `-mirror-*`, `-flip-*` and
+  `-phase-shift-*` match by substring, so `PRO_dih_` catches both
+  `PRO_dih_chiral` and `PRO_dih_OH`. Keep them specific: a bare `PRO` would
+  match essentially every CV in this feature set. A trailing `$` anchors a
+  pattern to the end of the name: `'_tilt$'` matches `Mem_u_tilt` but not
+  `Mem_u_tiltN`, which no plain substring can tell apart (quote it in the
+  shell). (`-angle-cols`, `-sym-angle-cols` and `-z-cols` match **exact**
+  names instead.)
+- **`-exclude` runs before the corrections.** A CV dropped there is not
+  available to be corrected, so keep the patterns narrow enough not to catch
+  something you meant to correct. The `z_`-prefixed patterns above are chosen
+  for exactly that reason: they drop the per-atom z columns without touching
+  the `PRO_hCN_C2*`/`PRO_nCos_C2*` handed coordination numbers, which a bare
+  `C2,O2` would also have removed — and those pseudoscalars are the CVs most
+  able to resolve L from D.
+
+  Excluding the z columns also means every entry in the built-in z-correction
+  list is now absent, which is reported as one `Skipping z-correction for
+  'z_...': dropped by -exclude` line each rather than as a warning.
+
+When copying the block, keep the line continuations clean: a `\` continues a
+line only when it is the **last** character. A trailing space turns it into an
+escaped space, which arrives as a lone argument and fails with
+`Got unexpected extra argument ( )`.
+
+#### Aligning angle conventions between two simulations
+
+A CV that differs between L and D purely by convention will "perfectly"
+separate them while carrying no physical information, and will dominate any
+importance ranking. `shap-enantiomer` has three corrections for this, grouped
+in `--help` under *CV corrections: symmetry*. They fix *different* things, and
+which you need depends on how the CV is defined:
+
+| flag | operation | corrects for | applies to |
+| --- | --- | --- | --- |
+| `-mirror-l` / `-mirror-d` | θ → −θ | **chirality**: a chirality-odd CV is negated between mirror-image enantiomers by definition, so L has φ where D has −φ | **signed** CVs on a zero-centred domain — an `arctan2` dihedral in [−180, 180], a signed volume, a handed coordination number |
+| `-flip-l` / `-flip-d` | θ → 180 − θ | **direction of entry/internal/escape**: a permeant entering from the other leaflet sees the membrane normal reversed, swapping the +z (extracellular) and −z (intracellular) face | **unsigned** angles against the membrane normal, e.g. anything from `arccos` in [0, 180] |
+| `-phase-shift-l` / `-phase-shift-d` | φ → φ + 180 | **chirality of a periodic phase** whose reference vector is a pseudovector, so the mirror image lies half a cycle away rather than negated | **periodic phases** in (−180, 180] — e.g. a Cremer–Pople puckering phase, measured on a ring normal fixed by the atom order: in the mirror image the same pucker (endo stays endo) sits half a cycle away |
+
+All three are their own inverse, and each should be applied to **one simulation
+only**, so its values become comparable to the other's.
+
+`-flip-*` is not a chirality operation — it will not turn L into D. 90°
+is its pivot because that is the flat-vs-vertical boundary: below 90° the
+reference face points toward +z, above it toward −z.
+
+`-phase-shift-*` exists because neither of the others is right for a puckering
+phase: the mirror is φ+180, not −φ and not 180−φ. It wraps back into
+(−180, 180] so the shifted simulation stays on the same domain as the
+unshifted one, and warns rather than silently re-basing a [0, 360) column.
+
+Match the flag to the domain. Negating an `arccos` angle sends [0, 180] to
+[−180, 0], off its own domain; flipping a signed dihedral gives
+180 − (−170) = 350, likewise off-domain.
+
+Columns already folded to `cos(...)`/`cos2(...)` by `-angle-cols` are skipped
+by `-flip-*` with a warning, since they hold values in [−1, 1] rather
+than degrees. (Negating them is the equivalent operation there, because
+−cos θ = cos(180 − θ).)
+
+#### Which correction the geometry-resolved chirality CVs need
+
+`generate-cvs` emits four kinds of quantity around the permeant stereocentre,
+and they do **not** all take the same correction. Two operations matter: the
+other enantiomer (a mirror image) and, when the runs entered from opposite
+faces, the face flip (+z becomes −z):
+
+| CVs | kind | same face | opposite faces |
+| --- | --- | --- | --- |
+| `PRO_hCN_*`, `PRO_hCN_*_s1..s3`, `PRO_nCos_*`, `PRO_sign_vol`, `PRO_dih_*` | signed **pseudoscalar** in the molecule's own frame: odd under the enantiomer, blind to the face | `-mirror-*` | `-mirror-*` |
+| `PRO_azim_u_P`, `PRO_azim_l_P` | signed azimuth **about lab +z**: odd under the enantiomer *and* under the face flip | `-mirror-*` | **none** (the two cancel) |
+| `Mem_u_tilt`, `Mem_l_tilt`, `PRO_mode_ring`, `PRO_mode_O`, `PRO_mode_N` | cosine of a **true vector** against +z: blind to the enantiomer, odd under the face flip | none | `-mirror-*` with `'_tilt$'` (negation; `-flip-*` would compute 180 − cos on a column that is already a cosine) |
+| `PRO_rMin_*`, `Mem_u_tiltN`, `Mem_l_tiltN`, `Mem_u_nP`, `Mem_l_nP`, `Water_wire`, `Water_cluster` | true scalar (a distance, a count, a flag) | none | none (leaflet names still swapped) |
+
+Mirroring the handed columns is right and does not throw the chirality signal
+away. To leading order the lipid environment is achiral, so an L path's `hCN`
+distribution is the mirror of a D path's and the bulk of the L/D difference in
+these columns reflects that near-symmetry rather than any discrimination.
+`-mirror-*` removes exactly that leading antisymmetry; what survives is the
+diastereomeric residual, which is the quantity of interest.
+
+What must **not** be done to them is `-sym-angle-cols`. Folding to cos²θ
+discards the sign irreversibly, taking the residual with it — unlike negation,
+which is invertible. Reserve it for genuinely head–tail symmetric angles.
+
+> **Known limitation.** `-name-cv-cols` applies its substitutions in order, so
+> it cannot express a two-way swap: `'_u_:_l_,_l_:_u_'` collapses both onto
+> `_u_` and silently produces duplicate column names. Therefore, the individual
+> simulations should already exclude the opposite leaflet with no interaction.
+> **Have to come up with a fix for the internal simulations.**
+
+### `statistical_analysis`
+
+**Command:** `statistics`
+
+Model-free weighted effect sizes (Cohen's d, Spearman ρ, KS distance) per
+interface — a cheap sanity check on the SHAP rankings. Accepts
+[`-no-reweight`](#unweighted-runs-the--no-reweight-flag). Its weighted Spearman
+does not average tied ranks; see
+[Known issues](#tied-ranks-in-the-weighted-spearman).
+
+### `train_deeptda`
+
+**Command:** `train-deeptda`
+
+Trains a 2-state DeepTDA CV on either dataset of
+[`prepare_deeptda_data`](#prepare_deeptda_data) and reports the input
+correlations that show which CVs drive it. Needs the `deeptda` extra (see
+[Optional extras](#optional-extras)). Accepts
+[`-no-reweight`](#unweighted-runs-the--no-reweight-flag).
+
+---
+
+## Conventions shared by the commands
+
+### Input layout
+
+Most commands expect the standard infretis output plus a folder of per-path CV
+trajectories (`-cv-dir`, default `ML/`), one `<path_nr>.txt` per path, as
+written by [`generate-cvs`](#cv_generation):
+
+```
+line 1: # reactive          |  # non-reactive
+line 2: # <ensemble info>
+line 3: # <duplicate/edit info>
+line 4: <column names>            (no leading '#')
+line 5+: <data>
+```
+
+One column is the order parameter (`-op-col`, default `OP_Lamb`); the rest are
+treated as CVs unless narrowed with `-cv-cols` / `-exclude`.
+
+### Option spelling
+
+Options use a single dash (`-toml`, `-cv-dir`), matching the infretis
+tooling convention rather than the GNU `--long-option` style.
+
+`membrane-spatial` and `neighbours` came from scripts that already used
+double-dash options, so they accept **both** spellings — `-start` and `--start`
+are the same flag — and existing command lines keep working. Their few
+multi-value options changed from space- to comma-separated, since that has no
+single-dash equivalent:
+
+```bash
+chiroflux neighbours -start 1 -slab-range -40,40        # was: --slab-range -40 40
+chiroflux membrane-spatial -start 1 -near-n 5,10        # was: --near-n 5 10
+```
+
+### Unweighted runs: the `-no-reweight` flag
+
+`shap-ml`, `shap-enantiomer`, `statistics`, `pca`, `prepare-deeptda-data(-ld)`
+and `train-deeptda` weight every path by its WHAM weight by default. Pass
+`-no-reweight` to give every path weight 1 instead, e.g. to check how much a
+ranking depends on the reweighting. In the DeepTDA commands the proximity ramp
+(`-lambda-low`/`-lambda-high`) still applies. `train-deeptda -no-reweight`
+drops the path weights from a dataset that was built weighted, and gives the
+same result as building it with `-no-reweight`. It reads the `w_prox` column
+for this, which datasets built before this flag existed don't have; for those
+it falls back to uniform weights and drops the ramp too.
+
+---
+
+## Using ChiroFlux from Python
+
+Each analysis lives in its own module and is imported from there:
+
+```python
+from chiroflux.shap_analysis import shap_ml
+from chiroflux.shap_analysis_ld import shap_enantiomer
+from chiroflux.statistical_analysis import statistics
+from chiroflux.principal_component_analysis import PCA
+from chiroflux.prepare_deeptda_data import prepare_deeptda_data, prepare_deeptda_data_ld
+from chiroflux.train_deeptda import train_deeptda
+```
+
+They are not re-exported from the top-level `chiroflux` namespace on purpose:
+two of them share a name with their own module, so an alias would resolve to the
+function or the module depending on import order. Importing from the module is
+unambiguous, and it keeps `import chiroflux` from pulling in shap, scikit-learn,
+lightgbm and torch.
+
+The CLI loads lazily for the same reason — `chiroflux --help` imports nothing
+beyond typer, and a subcommand imports only the module it needs.
+
+### Import cost
+
+The analyses sit on three support modules, [`pathdata`](#pathdata),
+[`cvs`](#cvs) and [`plotting`](#plotting), which import nothing from the rest of
+the package.
+
+**None of these import shap, scikit-learn or lightgbm, and that is load-bearing.**
+It is what lets `statistics`, `pca`, `prepare-deeptda-data` and `train-deeptda`
+run without the ML stack: PCA used to spend 2.0 s loading gradient boosting to
+get `_load_path_table`, and now imports in 0.46 s. Only `shap_analysis` and
+`shap_analysis_ld` pull that stack in, which is what they are for. Tests in
+`tests/test_packaging.py` enforce this.
+
+---
+
+## Known issues
+
+### Leaflet labels are unreliable for the deep chain carbons
+
+The `CN_*.ndx` leaflet groups are cut by a static z threshold evaluated at
+frame 0. For the headgroup, glycerol and ester markers that is exact — C2, P,
+N, O22 and O32 all split 55/55 in DOPC and 11/11 in POPC. For the deep chain
+carbons it is not: DOPC C210 splits 54/56 and C310 51/59, and POPC C210 10/12.
+
+This is **not** lipid flip-flop. A translocated lipid would carry its whole
+headgroup across, and the P/N/C2 counts would be off by the same number; they
+are exact. What the cutoff catches is chain **interdigitation** — C10 sits deep
+in the hydrophobic core, and chain ends from opposing leaflets reach across the
+midplane. The species dependence confirms it: DOPC's sn-3 chain is oleoyl
+(18:1, long and kinked) and misassigns four carbons, while POPC's is palmitoyl
+(16:0) and misassigns none. A flip-flop rate would not care which carbon you
+looked at.
+
+Consequence: the 24 coordination numbers built on groups 11–14
+(`CA_CC2_*`, `CA_CC3_*`, `N_CC2_*`, `N_CC3_*`, `O_CC2_*`, `O_CC3_*`) count a
+few percent of the opposite leaflet's chain carbons — and, since the
+misassigned atoms are exactly those nearest the midplane, that contamination is
+concentrated where a permeant crossing the core actually is. `Mem_*_tilt`
+avoids the problem by reassigning chain atoms geometrically rather than by
+label (see `compute_local_chain_tilt`); the coordination numbers do not.
+
+The error is static and shared across paths *within* a simulation, so it should
+largely cancel in reactive-vs-non-reactive comparisons. **It does not
+automatically cancel between two simulations**: L and D are built by the same
+script, but from their own frame-0 structures, so the misassigned set differs
+between them and the affected CVs carry a small systematic L/D difference that
+has nothing to do with chirality.
+
+**The fix is [`chiroflux leaflet-index`](#leaflet_index)**, which assigns each
+lipid to a leaflet by its own headgroup. Regenerate both simulations' index
+files with it and re-run `generate-cvs`.
+
 ### `PRO_ang_OH` measures the wrong angle
 
 The index files came from a hand-maintained `make_ndx.py` copied into each
@@ -926,12 +1419,12 @@ carbonyl version. Check L's shipped file before comparing the two runs; if they
 disagree, `PRO_ang_OH` is a convention artefact and will act as a spurious L/D
 discriminator.
 
-`chiroflux permeant-index` writes `C, O01, H02` for both runs and verifies it
-against the topology's bond list, so **regenerating changes what `PRO_ang_OH`
-means**. That is the intended fix, not a regression. If you did want the
-carbonyl geometry, change the one entry in `PERMEANT_INDEX_SPEC` — but then
-rename the CV, because `dih_OH` next to it is already the proper carboxylic
-torsion `O-C-O01-H02`.
+[`chiroflux permeant-index`](#permeant_index) writes `C, O01, H02` for both runs
+and verifies it against the topology's bond list, so **regenerating changes what
+`PRO_ang_OH` means**. That is the intended fix, not a regression. If you did
+want the carbonyl geometry, change the one entry in `PERMEANT_INDEX_SPEC` — but
+then rename the CV, because `dih_OH` next to it is already the proper
+carboxylic torsion `O-C-O01-H02`.
 
 ### Tied ranks in the weighted Spearman
 
