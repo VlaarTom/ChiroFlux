@@ -199,9 +199,36 @@ def _compute_path_weights(maxop, path_f, path_w, interfaces):
 
     return Q[K_per_path] * np.sum(w, axis=1)
 
+def _matches_pattern(name, pattern):
+    """True if CV `name` matches one -exclude/-mirror/-flip/... pattern.
+
+    A pattern is a substring, except that a trailing '$' anchors it to the
+    end of the name: '_tilt$' matches Mem_u_tilt but not Mem_u_tiltN, which
+    no plain substring can do because one name is a prefix of the other.
+    The anchor sees through an angle conversion, so 'C_CG$' also matches
+    cos(PRO_ang_C_CG).
+    """
+    if not pattern.endswith("$"):
+        return pattern in name
+    stem = pattern[:-1]
+    if not stem:
+        return False
+    for pre in ("cos2(", "cos("):
+        if name.startswith(pre) and name.endswith(")"):
+            name = name[len(pre):-1]
+            break
+    return name.endswith(stem)
+
+
+def _matches_any(name, patterns):
+    """True if `name` matches any of `patterns` (see _matches_pattern)."""
+    return bool(patterns) and any(_matches_pattern(name, p) for p in patterns)
+
+
 def _matches_exclude(name, exclude):
-    """True if name equals or contains any of the exclude substrings."""
-    return bool(exclude) and any(pattern in name for pattern in exclude)
+    """True if name equals or contains any of the exclude substrings (a
+    trailing '$' anchors one to the end of the name; see _matches_pattern)."""
+    return _matches_any(name, exclude)
 
 def _discover_columns(cv_dir, pnr_expected, op_col, cv_cols, encoding, exclude=None):
     """Return (cv_names, op_col_index, cv_col_indices) from the first
