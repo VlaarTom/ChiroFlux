@@ -70,6 +70,7 @@ PLOT_OUTPUTS = (("chiral_free_energy.png", "chiral_profiles.png",
                  "chiral_split_half.png", "chiral_split_half_profiles.png",
                  "chiral_blocking.png", "chiral_drift.png")
                 + ("chiral_reorientation.png", "chiral_barrier.png", "chiral_glycerol_dihedrals.png",
+                   "chiral_lipid_torsions.png",
                    "chiral_orient_fe_cos_axis_n.png", "chiral_orient_fe_cos_chi_n.png")
                 + ("chiral_orient_axis.png", "chiral_orient_chirality.png",
                    "chiral_split_half_orient_axis.png", "chiral_split_half_orient_chirality.png")
@@ -102,6 +103,17 @@ OBS_LABELS = {
     "pose_z": "pose_z: face of the lipid\nstereocentre (contact)",
     "chi_lz": "pseudovector . lipid e_z\n(contact)",
     "axis_lz": "axis . lipid e_z\n(contact)",
+    "endo": "Cg-endo pucker\n(fraction of frames)",
+    "nh_cis": "N-H on the carboxyl side\n(fraction of frames)",
+    "co_anti": "O=C-X-H anti\n(fraction of frames)",
+    "ihb_nh_o": "intramolecular N-H...O=C\n(fraction of frames)",
+    "ihb_xh_n": "intramolecular X-H...N\n(fraction of frames)",
+    "bidentate": "both donors on one lipid\n(fraction of frames)",
+    "n_chol_acc": "choline N+ at a\npermeant acceptor",
+    "co2_n": "sn-2 C=O . outward normal\n(touched lipid)",
+    "co1_n": "sn-1 C=O . outward normal\n(touched lipid)",
+    "co2_n_bulk": "sn-2 C=O . outward normal\n(all lipids)",
+    "co1_n_bulk": "sn-1 C=O . outward normal\n(all lipids)",
 }
 # Tables written before depth_profiles.csv had a `tested` column.
 MIRROR_ODD_VS_NORMAL = ("cos_chi_n", "chi_lz")
@@ -1137,14 +1149,16 @@ def plot_orientation_free_energy(in_dir):
         _save(fig, in_dir, f"chiral_orient_fe_{name}.png")
 
 
-def plot_glycerol_dihedrals(in_dir):
+def plot_glycerol_dihedrals(in_dir, stem="glycerol_dihedrals",
+                            figure="chiral_glycerol_dihedrals.png", what="Glycerol dihedrals"):
     """
     glycerol_dihedrals.npz: the distribution of each glycerol dihedral (rows)
     for the lipid the permeant touches and for all lipids (columns), L and D
     with 95% bands, dots where L and D differ (q < 0.05).  The shading marks
     the gauche-, trans and gauche+ ranges glycerol_conformers sums over.
+    `stem`/`figure` draw another file of the same layout (lipid_torsions).
     """
-    path = os.path.join(in_dir, "glycerol_dihedrals.npz")
+    path = os.path.join(in_dir, f"{stem}.npz")
     if not os.path.exists(path):
         return
     with np.load(path) as z:
@@ -1174,17 +1188,23 @@ def plot_glycerol_dihedrals(in_dir):
             ax.set_ylim(bottom=0)
             ax.set_title(f"{name}, {titles.get(lip, lip)}", loc="left", fontsize=9, pad=14)
             if c == 0:
-                ax.set_ylabel("% of frames per 10\u00b0")
+                ax.set_ylabel(f"% of frames per {edges[1] - edges[0]:.0f}\u00b0")
             if r == len(names) - 1:
                 ax.set_xlabel("dihedral angle (\u00b0)")
             if r == 0 and c == len(lipids) - 1:
                 ax.legend(loc="upper right")
     nL, nD = m["contact_frames"]
-    fig.suptitle(f"Glycerol dihedrals of the lipids (bands: 95% CI; dots: L vs D q < 0.05; "
+    fig.suptitle(f"{what} of the lipids (bands: 95% CI; dots: L vs D q < 0.05; "
                  f"touched lipid from {int(nL):,} L and {int(nD):,} D contact frames)",
                  x=0.01, ha="left", color=INK)
-    fig.tight_layout(rect=(0, 0, 1, 0.95))
-    _save(fig, in_dir, "chiral_glycerol_dihedrals.png")
+    fig.tight_layout(rect=(0, 0, 1, 1 - 0.05 * 2 / max(len(names), 2)))
+    _save(fig, in_dir, figure)
+
+
+def plot_lipid_torsions(in_dir):
+    """lipid_torsions.npz, drawn as plot_glycerol_dihedrals draws the glycerol."""
+    plot_glycerol_dihedrals(in_dir, "lipid_torsions", "chiral_lipid_torsions.png",
+                            "Torsions around the stereocentre, chains and headgroup")
 
 
 #: Histogram windows or depth rows with fewer frames than this (L or D) are
@@ -1345,7 +1365,7 @@ def plot_all(in_dir):
                plot_contacts, plot_pose, plot_pose_depth, plot_split_half,
                plot_split_half_profiles, plot_blocking, plot_drift,
                plot_orient, plot_split_half_orient, plot_reorientation, plot_barrier,
-               plot_glycerol_dihedrals,
+               plot_glycerol_dihedrals, plot_lipid_torsions,
                plot_orientation_free_energy, plot_hist1d, plot_hist2d):
         fn(in_dir)
 

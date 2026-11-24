@@ -1324,3 +1324,176 @@ def test_wham_xi_reads_only_the_minus_paths(tmp_path):
     # a [0-] path without its order.txt is still reported
     os.remove(tmp_path / "3.txt")
     assert cia.wham_xi(units, wtot, lam_a, lam_m1, minus)[1] == 1
+
+
+# ── The permeant's conformation, two-donor contacts, lipid torsions ─────────
+
+def _features(positions):
+    import MDAnalysis as mda
+
+    names, resnames, resix, _ = _system()
+    u = _universe(names, resnames, resix)
+    u.atoms.positions = positions
+    u.dimensions = BOX
+    T = cia._Topology(_topology_file(u), cia.PERMEANTS["pro"])
+    f, i, glyc, tors = cia._frame_features(T, u.atoms.positions.copy(), np.array(BOX))
+    return T, dict(zip(cia.FLOAT_COLS, f)), tors
+
+
+_TOPOLOGY = {}
+
+
+def _topology_file(u):
+    """The synthetic system written once as a .gro, for _Topology."""
+    import tempfile
+
+    if "gro" not in _TOPOLOGY:
+        path = os.path.join(tempfile.mkdtemp(), "topol.gro")
+        u.atoms.write(path)
+        _TOPOLOGY["gro"] = path
+    return _TOPOLOGY["gro"]
+
+
+def test_conformation_is_stored_in_the_l_convention_and_unknown_atoms_are_nan():
+    names, _, _, ref = _system()
+    T, f, tors = _features(ref)
+    at = {n: ref[names.index(n)] for n, _ in _PRO}
+    L = np.array(BOX[:3])
+    raw_nh = float(cia._dihedral(at["H01"], at["N"], at["CA"], at["C"], L))
+    raw_co = float(cia._dihedral(at["O"], at["C"], at["O01"], at["H02"], L))
+    h = 1.0 if str(cia.cip_label(cia.signed_volume(
+        at["CA"], np.stack([at["N"], at["C"], at["CB"]]), L))) == "S" else -1.0
+    assert f["conf_tau_nh"] == pytest.approx(h * raw_nh, abs=1e-3)
+    assert f["conf_tau_co"] == pytest.approx(h * raw_co, abs=1e-3)
+    assert f["conf_r_nh_o"] == pytest.approx(np.linalg.norm(at["O"] - at["H01"]) / 10, abs=1e-4)
+    assert f["conf_r_xh_n"] == pytest.approx(np.linalg.norm(at["N"] - at["H02"]) / 10, abs=1e-4)
+    # the test molecule has no CG, the test lipids no acyl chains or choline;
+    # they do have C2-C1-O11-P (torsion h)
+    for c in ("conf_chi1", "n_chol_acc", "co2_n", "co1_n_bulk", "ltor_c", "ltor_j"):
+        assert np.isnan(f[c]), c
+    h_row = [k for k, _ in cia.LIPID_TORSIONS].index("h")
+    assert np.isfinite(tors[h_row]).all() and np.isfinite(f["ltor_h"])
+    assert np.isnan(np.delete(tors, h_row, axis=0)).all()
+    assert any("conf_chi1" in m for m in T.missing)
+    assert any("choline" in m for m in T.missing)
+
+    # the exact mirror image (x -> -x) is the other enantiomer; its torsions
+    # change sign, so stored in L's convention they come out the same
+    mirrored = ref.copy()
+    mirrored[:, 0] = BOX[0] - mirrored[:, 0]
+    _, fm, _ = _features(mirrored)
+    for c in ("conf_tau_nh", "conf_tau_co", "conf_r_nh_o", "conf_r_xh_n"):
+        assert fm[c] == pytest.approx(f[c], abs=1e-3), c
+
+
+def _conf_path(n, chi1=0.0, tau_nh=0.0, tau_co=0.0, r_nh_o=0.4, r_xh_n=0.4):
+    arr = _path(n)
+    for c, v in (("conf_chi1", chi1), ("conf_tau_nh", tau_nh), ("conf_tau_co", tau_co),
+                 ("conf_r_nh_o", r_nh_o), ("conf_r_xh_n", r_xh_n)):
+        arr["F"][:, cia.FLOAT_COLS.index(c)] = v
+    return arr
+
+
+def test_frame_states_read_the_conformers_and_the_shared_lipid():
+    arr = _conf_path(4, chi1=[30, -30, 30, np.nan], tau_nh=[40, 150, -40, 0],
+                     tau_co=[10, 170, -175, 0], r_nh_o=[0.2, 0.3, 0.2, 0.2],
+                     r_xh_n=[0.4, 0.2, 0.4, 0.4])
+    I = arr["I"]
+    po4, co2 = cia.CLASS_NAMES.index("PO4"), cia.CLASS_NAMES.index("CO_sn2")
+    I[0, 1:] = [po4, 11, co2, 11]                     # both donors on lipid 11
+    I[1, 1:] = [po4, 11, co2, 12]                     # on two different lipids
+    I[2, 1:] = [po4, 11, cia.WATER_CLASS, 11]         # one of them on water
+    st = cia.frame_states(arr["F"].astype(float), I)
+    np.testing.assert_array_equal(st["endo"], [1, 0, 1, np.nan])
+    np.testing.assert_array_equal(st["nh_cis"], [1, 0, 1, 1])
+    np.testing.assert_array_equal(st["co_anti"], [0, 1, 1, 0])
+    np.testing.assert_array_equal(st["ihb_nh_o"], [1, 0, 1, 1])
+    np.testing.assert_array_equal(st["ihb_xh_n"], [0, 1, 0, 0])
+    np.testing.assert_array_equal(st["bidentate"], [1, 0, 0, 0])
+    assert st["pair"][0] == po4 * cia.N_LIPID_CLASSES + co2
+    assert cia.PAIR_NAMES[st["pair"][0]] == "PO4+CO_sn2"
+    assert (st["pair"][1:] == cia.N_PAIRS).all()
+
+
+def _bound_units(seed, n=40, frames=60, pair_share=0.0, endo_when_bound=0.5,
+                   tors_centre=60.0):
+    """Paths whose donors bind the same lipid (PO4 + CO_sn2) in `pair_share`
+    of the frames, are Cg-endo there with probability `endo_when_bound`
+    (0.5 otherwise), and whose touched lipid's torsion c scatters around
+    `tors_centre`; every lipid's torsion histogram (H) peaks at -60."""
+    rng = np.random.default_rng(seed)
+    grid = cia.Grid()
+    po4, co2 = cia.CLASS_NAMES.index("PO4"), cia.CLASS_NAMES.index("CO_sn2")
+    n_t = len(cia.LIPID_TORSIONS)
+    units, reds = [], []
+    for i in range(n):
+        bound = rng.random(frames) < pair_share
+        endo = np.where(bound, rng.random(frames) < endo_when_bound, rng.random(frames) < 0.5)
+        arr = _conf_path(frames, chi1=np.where(endo, 30.0, -30.0))
+        arr["I"][bound, 1:] = [po4, 5, co2, 5]
+        c = rng.normal(tors_centre, 40, frames)
+        for k, _ in cia.LIPID_TORSIONS:                     # not in this "topology"
+            arr["F"][:, cia.FLOAT_COLS.index(f"ltor_{k}")] = np.nan
+        arr["F"][:, cia.FLOAT_COLS.index("ltor_c")] = (c + 180) % 360 - 180
+        H = np.zeros((frames, n_t, cia.N_TORS_BINS), dtype=np.uint8)
+        H[:, :, 4] = 30                                     # -60..-30 deg
+        arr["H"] = H
+        op = rng.uniform(5.0, 20.0, frames)
+        units.append(cia.Unit(i, [], weight=1.0))
+        reds.append((cia.reduce_path(arr, op, 0.2, grid), None))
+    return grid, cia.Ensemble(units, reds)
+
+
+def test_two_donor_contacts_and_the_conformer_they_hold():
+    grid, eL = _bound_units(0, pair_share=0.4, endo_when_bound=0.9)
+    _, eD = _bound_units(1, pair_share=0.1, endo_when_bound=0.5)
+    pairs = cia.bidentate_pairs(eL, eD, grid, n_boot=40, block=3)
+    assert set(pairs["pair"]) == {"PO4+CO_sn2"}
+    pooled = pairs[pairs["depth"] == "all"].iloc[0]
+    assert pooled["L"] == pytest.approx(0.4, abs=0.04)
+    assert pooled["D"] == pytest.approx(0.1, abs=0.03)
+    assert pooled["q_bh"] < 0.05
+    prof = cia.depth_profiles(eL, eD, grid, n_boot=40, block=3)
+    bid = prof[(prof["observable"] == "bidentate") & prof["L"].notna()]
+    assert (bid["L"] > bid["D"]).all()
+
+    conf = cia.conformers_by_contact(eL, eD, grid, n_boot=40, block=3)
+    row = conf[(conf["conformer"] == "endo") & (conf["donor"] == 0)
+               & (conf["partner"] == "PO4") & (conf["depth"] == "all")].iloc[0]
+    assert row["L"] == pytest.approx(0.9, abs=0.05) and row["D"] == pytest.approx(0.5, abs=0.1)
+    assert row["q_bh"] < 0.05
+    free = conf[(conf["conformer"] == "endo") & (conf["donor"] == 0)
+                & (conf["partner"] == "none") & (conf["depth"] == "all")].iloc[0]
+    assert free["L"] == pytest.approx(0.5, abs=0.05) and free["q_bh"] > 0.05
+
+
+def test_lipid_torsions_find_a_shifted_touched_lipid_and_leave_the_bulk(tmp_path):
+    from chiroflux import chiral_plot
+
+    grid, eL = _bound_units(0, tors_centre=60.0)
+    _, eD = _bound_units(1, tors_centre=180.0)
+    pops, dist, arrays = cia.lipid_torsions(eL, eD, min_frames=50, n_boot=30, block=3)
+    c = pops[(pops["torsion"] == "c_C1-C2-O21-C21")].set_index(["lipid", "state"])
+    assert c.loc[("contact", "g+"), "L"] > 0.8 and c.loc[("contact", "t"), "D"] > 0.8
+    assert c.loc[("contact_minus_bulk", "g+"), "q_bh"] < 0.05
+    bulk = pops[pops["lipid"] == "bulk"]
+    assert not (bulk["q_bh"] < 0.05).any()
+    # bulk distributions are all at -60; torsions never seen in contact are NaN
+    np.testing.assert_allclose(arrays["L"][1, :, 4], 1.0)
+    assert np.isnan(arrays["L"][0, 1]).all()
+    np.savez(tmp_path / "lipid_torsions.npz", **arrays)
+    chiral_plot._style()
+    chiral_plot.plot_lipid_torsions(str(tmp_path))
+    assert (tmp_path / "chiral_lipid_torsions.png").exists()
+
+
+def test_a_slow_report_only_quantity_does_not_set_the_block(tmp_path):
+    import pandas as pd
+
+    sizes = (1, 10, 25, 50, 100, 250, 500)
+    rows = (_blocking_rows("contact fraction", dict.fromkeys(sizes, 1.0), n=10000)
+            + _blocking_rows("O=C-X-H anti", {B: 1.0 + B / 10 for B in sizes}, n=10000))
+    block, _ = cia._choose_and_report(pd.DataFrame(rows), None, str(tmp_path), "test")
+    assert block == 1
+    choice = pd.read_csv(tmp_path / "block_choice.csv").set_index("observable")
+    assert choice.loc["O=C-X-H anti", "used_for"].startswith("report only")

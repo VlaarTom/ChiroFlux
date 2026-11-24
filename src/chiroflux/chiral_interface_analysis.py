@@ -194,6 +194,11 @@ class PermeantSpec:
     axis: tuple        # (tail, head) of the molecular axis, a true vector
     donors: tuple      # ((heavy, H), ...)
     acceptors: tuple   # heavy-atom acceptors
+    #: Torsions of the permeant's own conformation, ((CONF_COLS column,
+    #: (a, b, c, d)), ...), stored in L's sign convention (see _frame_features).
+    conformation: tuple = ()
+    #: Intramolecular H-bonds, ((CONF_COLS column, (H, acceptor)), ...).
+    intra_hb: tuple = ()
 
     @property
     def polar(self):
@@ -207,11 +212,23 @@ class PermeantSpec:
 PERMEANTS = {
     # Neutral proline: ring N-H and COOH.
     "pro": PermeantSpec("ORP", "CA", ("N", "C", "CB", "HA"), "S", ("N", "C"),
-                        (("N", "H01"), ("O01", "H02")), ("O", "O01", "N")),
+                        (("N", "H01"), ("O01", "H02")), ("O", "O01", "N"),
+                        conformation=(("conf_chi1", ("N", "CA", "CB", "CG")),
+                                      ("conf_tau_nh", ("H01", "N", "CA", "C")),
+                                      ("conf_tau_co", ("O", "C", "O01", "H02"))),
+                        intra_hb=(("conf_r_nh_o", ("H01", "O")),
+                                  ("conf_r_xh_n", ("H02", "N")))),
     # Proline N-propargylamide (the species measured in the paper): ring N-H and
     # amide N-H; C4 is the alpha carbon.
+    # Ring C4 (alpha), C6, C7, C8, N9; its X-H is the amide N01-H03, so
+    # conf_tau_co is the amide O=C-N-H torsion (trans, |tau| > 90, as a rule).
     "pro_yne": PermeantSpec("ORP", "C4", ("N9", "C2", "C6", "H5"), "S", ("N9", "C2"),
-                            (("N9", "H04"), ("N01", "H03")), ("O3", "N9")),
+                            (("N9", "H04"), ("N01", "H03")), ("O3", "N9"),
+                            conformation=(("conf_chi1", ("N9", "C4", "C6", "C7")),
+                                          ("conf_tau_nh", ("H04", "N9", "C4", "C2")),
+                                          ("conf_tau_co", ("O3", "C2", "N01", "H03"))),
+                            intra_hb=(("conf_r_nh_o", ("H04", "O3")),
+                                      ("conf_r_xh_n", ("H03", "N9")))),
 }
 
 LIPID_RESNAMES = ("DOPC", "POPC")
@@ -234,12 +251,33 @@ WATER_SEL = "resname TIP3 and name OH2"
 HB_CUTOFF = 3.5      # Angstrom, donor-acceptor (gmx hbond default)
 HB_ANGLE = 30.0      # degrees, H-D-A (gmx hbond default)
 
+#: The permeant's own conformation per frame: torsions in L's sign
+#: convention (D's negated, so that for both chi1 > 0 is Cg-endo) and the
+#: H...acceptor distances (nm) of its intramolecular H-bonds.
+CONF_COLS = ("conf_chi1", "conf_tau_nh", "conf_tau_co", "conf_r_nh_o", "conf_r_xh_n")
+#: H...acceptor distance (nm) below which an intramolecular H-bond is made.
+IHB_CUT = 0.25
+#: Choline N+ within this distance (A) of a permeant acceptor is a contact.
+CHOLINE_CUT = 4.5
+#: Lipid torsions beyond the two glycerol dihedrals, for the touched lipid
+#: (F columns ltor_<key>) and for all lipids (the per-frame histogram H):
+#: rotation about C2-O21 (where the sn-2 ester points) and the start of the
+#: sn-2 chain, the same for sn-1, and the glycerol-phosphate-choline link.
+LIPID_TORSIONS = (("c", "C1-C2-O21-C21"), ("d", "O21-C21-C22-C23"),
+                  ("e", "C21-C22-C23-C24"), ("f", "C2-C3-O31-C31"),
+                  ("g", "O31-C31-C32-C33"), ("h", "C2-C1-O11-P"),
+                  ("i", "P-O12-C11-C12"), ("j", "O12-C11-C12-N"))
+N_TORS_BINS = 12            # 30 deg: the bulk histogram is kept per frame
+
 FLOAT_COLS = ("z", "cos_axis_n", "cos_chi_n", "d_c2",
               "pose_x", "pose_y", "pose_z",
               "axis_lx", "axis_ly", "axis_lz",
               "chi_lx", "chi_ly", "chi_lz",
               "glyc_a", "glyc_b",
-              "n_hb_lipid", "n_lipids_bound", "n_wat_polar")
+              "n_hb_lipid", "n_lipids_bound", "n_wat_polar",
+              *CONF_COLS, "n_chol_acc",
+              "co2_n", "co1_n", "co2_n_bulk", "co1_n_bulk",
+              *(f"ltor_{k}" for k, _ in LIPID_TORSIONS))
 N_GLYC_BINS = 36
 
 
@@ -340,6 +378,21 @@ class _Topology:
         self.polar = np.array([one(n) for n in polar])
         self.donor_rows = [polar.index(d) for d, _ in spec.donors]
         self.donor_h = np.array([one(h) for _, h in spec.donors])
+        self.acceptor_atoms = np.array([one(a) for a in spec.acceptors])
+
+        # Everything below is optional: a feature whose atoms the topology
+        # does not have is NaN, and is listed in `missing`.
+        self.missing = []
+
+        def maybe(names, what):
+            try:
+                return np.array([one(n) for n in names])
+            except ValueError:
+                self.missing.append(f"{what} ({'-'.join(names)})")
+                return None
+
+        self.conf = [(c, maybe(a, c)) for c, a in spec.conformation]
+        self.ihb = [(c, maybe(a, c)) for c, a in spec.intra_hb]
 
         lip_sel = "resname " + " ".join(LIPID_RESNAMES)
         lip = self.u.select_atoms(lip_sel)
@@ -354,6 +407,26 @@ class _Topology:
         self.O21, self.O11, self.O31 = per["O21"], per["O11"], per["O31"]
         self.P = lip.select_atoms("name P").indices
         self.lipid_heavy = lip.select_atoms("not name H*").indices
+
+        def per_lipid(name):
+            g = lip.select_atoms(f"name {name}")
+            return g.indices if np.array_equal(g.resindices, self.lipid_resix) else None
+
+        need = {n for _, atoms in LIPID_TORSIONS for n in atoms.split("-")}
+        self.lip_atoms = {n: per_lipid(n) for n in sorted(need | {"C21", "O22", "C31", "O32"})}
+        self.tors = []
+        for k, atoms in LIPID_TORSIONS:
+            idx = [self.lip_atoms[n] for n in atoms.split("-")]
+            self.tors.append(None if any(i is None for i in idx) else idx)
+            if self.tors[-1] is None:
+                self.missing.append(f"lipid torsion {k} ({atoms})")
+        for c_at, o_at in (("C21", "O22"), ("C31", "O32")):
+            if self.lip_atoms[c_at] is None or self.lip_atoms[o_at] is None:
+                self.missing.append(f"carbonyl orientation ({c_at}={o_at})")
+        chol = lip.select_atoms("name N").indices
+        self.choline = chol if chol.size else None
+        if self.choline is None:
+            self.missing.append("choline N (n_chol_acc)")
 
         tgt, cls = [], []
         for c, (_, names) in enumerate(ACCEPTOR_CLASSES):
@@ -370,7 +443,8 @@ class _Topology:
 
 def _frame_features(T: _Topology, pos, box):
     """Features of one frame.  Returns (float row, int row, glyc dihedrals of
-    all lipids (2, n_lipid))."""
+    all lipids (2, n_lipid), LIPID_TORSIONS of all lipids (n_torsion,
+    n_lipid), NaN where the topology lacks an atom)."""
     from MDAnalysis.lib.distances import capped_distance
 
     if not np.allclose(box[3:], 90.0):
@@ -446,7 +520,42 @@ def _frame_features(T: _Topology, pos, box):
     wat = pairs[T.target_class[pairs[:, 1]] == WATER_CLASS, 1]
     f["n_wat_polar"] = np.unique(wat).size
 
-    return np.array([f[c] for c in FLOAT_COLS]), np.array(ints), glyc
+    # The permeant's own conformation.  Torsions are odd under the mirror,
+    # so they are stored in L's convention: D's (by this frame's CIP label)
+    # negated.  Then chi1 > 0 is Cg-endo for both and L - D compares the same
+    # conformer; |tau| (syn/anti, the side of the N-H) does not depend on it.
+    h = 1.0 if str(cip_label(signed_volume(X, pos[T.cip[:3]], L))) == T.spec.l_config else -1.0
+    for c, idx in T.conf:
+        if idx is not None:
+            f[c] = h * float(_dihedral(*(pos[i] for i in idx), L))
+    for c, idx in T.ihb:
+        if idx is not None:
+            f[c] = float(np.linalg.norm(_mic(pos[idx[1]] - pos[idx[0]], L))) / 10.0
+
+    # The permeant as an acceptor: choline N+ next to any of its acceptors.
+    if T.choline is not None:
+        pr = capped_distance(pos[T.acceptor_atoms], pos[T.choline], max_cutoff=CHOLINE_CUT,
+                             box=box, return_distances=False)
+        f["n_chol_acc"] = np.unique(pr[:, 1]).size
+
+    # Carbonyl C=O against the outward normal of each lipid's own leaflet,
+    # for the touched lipid and averaged over all of them (the bulk).
+    zc = pos[T.C2, 2] - mid
+    zc -= L[2] * np.round(zc / L[2])
+    s_lip = np.where(zc >= 0, 1.0, -1.0)
+    for col, (c_at, o_at) in (("co2", ("C21", "O22")), ("co1", ("C31", "O32"))):
+        ci, oi = T.lip_atoms[c_at], T.lip_atoms[o_at]
+        if ci is not None and oi is not None:
+            cz = s_lip * _unit(_mic(pos[oi] - pos[ci], L))[:, 2]
+            f[f"{col}_n"], f[f"{col}_n_bulk"] = cz[j], cz.mean()
+
+    tors = np.full((len(LIPID_TORSIONS), len(T.C2)), np.nan)
+    for t, idx in enumerate(T.tors):
+        if idx is not None:
+            tors[t] = _dihedral(*(pos[i] for i in idx), L)
+            f[f"ltor_{LIPID_TORSIONS[t][0]}"] = tors[t, j]
+
+    return np.array([f[c] for c in FLOAT_COLS]), np.array(ints), glyc, tors
 
 
 def check_stereochemistry(T: _Topology, pos, box):
@@ -463,7 +572,7 @@ def check_stereochemistry(T: _Topology, pos, box):
 
 
 #: Bump when the cached content changes; old chunks are then ignored and rebuilt.
-CACHE_VERSION = 4
+CACHE_VERSION = 5
 #: Every cache chunk ends in this; anything else in a cache folder is ignored.
 CHUNK_SUFFIX = ".chiral.npz"
 #: Cache folder inside each run directory, unless one is given explicitly.
@@ -503,7 +612,7 @@ def extract_unit(T: _Topology, unit):
     path, which no analysis here looks at.  A frame index of None (plain MD)
     takes every frame of the file.
 
-    Returns {F, I, G, dt, stereo}: F/I/G one row per phase point; dt the frame
+    Returns {F, I, G, H, dt, stereo}: F/I/G/H one row per phase point; dt the frame
     spacing in ps (the first positive spacing found); stereo the CIP check of
     the first frame (see check_stereochemistry).
     """
@@ -514,6 +623,7 @@ def extract_unit(T: _Topology, unit):
         elif need.get(fname, ()) is not None:
             need.setdefault(fname, set()).add(idx)
     edges = np.linspace(-180.0, 180.0, N_GLYC_BINS + 1)
+    t_edges = np.linspace(-180.0, 180.0, N_TORS_BINS + 1)
     feats, n_frames = {}, {}
     dt, stereo = None, None
     for fname, idx in need.items():
@@ -527,11 +637,12 @@ def extract_unit(T: _Topology, unit):
                 continue
             if stereo is None:
                 stereo = check_stereochemistry(T, pos, box)
-            f_row, i_row, glyc = _frame_features(T, pos, box)
+            f_row, i_row, glyc, tors = _frame_features(T, pos, box)
             # Bulk glycerol dihedral histogram per frame, so trimmed frames
             # drop out of the bulk reference too.
             g_row = np.stack([np.histogram(glyc[a], bins=edges)[0] for a in range(2)])
-            feats[(fname, i)] = (f_row, i_row, g_row)
+            h_row = np.stack([np.histogram(t[np.isfinite(t)], bins=t_edges)[0] for t in tors])
+            feats[(fname, i)] = (f_row, i_row, g_row, h_row)
         n_frames[fname] = n
         if idx and max(idx) >= n:
             raise ValueError(f"{fname}: traj.txt asks for frame {max(idx)}, "
@@ -547,6 +658,10 @@ def extract_unit(T: _Topology, unit):
         "F": np.array([r[0] for r in rows], dtype=np.float32).reshape(-1, len(FLOAT_COLS)),
         "I": np.array([r[1] for r in rows], dtype=np.int32).reshape(-1, n_int),
         "G": np.array([r[2] for r in rows], dtype=np.uint16).reshape(-1, 2, N_GLYC_BINS),
+        # Lipid counts per torsion bin: a byte each unless there are more lipids.
+        "H": np.array([r[3] for r in rows],
+                      dtype=np.uint8 if len(T.C2) < 256 else np.uint16).reshape(
+                          -1, len(LIPID_TORSIONS), N_TORS_BINS),
         "dt": 0.0 if dt is None else dt,
         "stereo": stereo or {},
     }
@@ -595,11 +710,11 @@ def load_chunk(path):
 
 
 def chunk_entry(chunk, pos):
-    """(arrays {F, I, G}, dt, stereo) of the unit at position `pos` of a chunk."""
+    """(arrays {F, I, G, H}, dt, stereo) of the unit at position `pos` of a chunk."""
     a, b = int(chunk["starts"][pos]), int(chunk["starts"][pos + 1])
     stereo = {k: chunk[f"stereo_{k}"][pos].item()
               for k in ("permeant", "enantiomer", "lipids_R", "lipids_S")}
-    return ({k: chunk[k][a:b] for k in ("F", "I", "G")},
+    return ({k: chunk[k][a:b] for k in ("F", "I", "G", "H")},
             float(chunk["dt"][pos]), stereo)
 
 
@@ -630,6 +745,7 @@ def _write_chunk(path, entries, permeant):
         F=np.concatenate([r["F"] for r in res]),
         I=np.concatenate([r["I"] for r in res]),
         G=np.concatenate([r["G"] for r in res]),
+        H=np.concatenate([r["H"] for r in res]),
         **{f"stereo_{k}": np.array(v) for k, v in stereo.items()})
     os.replace(tmp, path)
 
@@ -759,7 +875,9 @@ def extract_many(units, tpr, permeant, cache_dir, tag, workers=8, overwrite=Fals
     # Resolve the topology once here: a wrong -tpr/-permeant then fails with
     # its own message, instead of killing every worker's initializer and
     # surfacing as an opaque BrokenProcessPool.
-    _Topology(tpr, PERMEANTS[permeant])
+    T0 = _Topology(tpr, PERMEANTS[permeant])
+    if T0.missing:
+        print("  [!] not in this topology, so left NaN: " + "; ".join(T0.missing))
     remaining = {name: len(m) for name, m in todo.items()}
     new = {name: {} for name in todo}
     jobs = [(name, u) for name in sorted(todo) for u in todo[name]]
@@ -1273,7 +1391,64 @@ PROFILE_OBS = (
     ("pose_z",         "pose_z",         True),   # face of the lipid stereocentre
     ("chi_lz",         "chi_lz",         True),   # relative handedness n_perm . n_lipid
     ("axis_lz",        "axis_lz",        True),
+    # The permeant's conformation (CONF_LABELS: populations, 0/1 per frame)
+    ("endo",           "endo",           False),  # Cg-endo pucker
+    ("nh_cis",         "nh_cis",         False),  # N-H on the carboxyl's side of the ring
+    ("co_anti",        "co_anti",        False),  # O=C-X-H anti (COOH anti; amide trans)
+    ("ihb_nh_o",       "ihb_nh_o",       False),  # intramolecular N-H...O=C
+    ("ihb_xh_n",       "ihb_xh_n",       False),  # intramolecular X-H...N
+    # Two donors on ONE lipid at once (see bidentate_pairs)
+    ("bidentate",      "bidentate",      False),
+    ("n_chol_acc",     "n_chol_acc",     False),  # choline N+ at a permeant acceptor
+    # sn-2 / sn-1 carbonyl C=O . outward normal: touched lipid, and all lipids
+    ("co2_n",          "co2_n",          True),
+    ("co1_n",          "co1_n",          True),
+    ("co2_n_bulk",     "co2_n_bulk",     False),
+    ("co1_n_bulk",     "co1_n_bulk",     False),
 )
+#: The permeant conformers counted per frame, in PROFILE_OBS and, per
+#: H-bond state, in conformers_by_contact.  All are the same in both mirror
+#: images (the torsions are stored in L's convention), so L - D is the test.
+CONF_LABELS = ("endo", "nh_cis", "co_anti", "ihb_nh_o", "ihb_xh_n")
+#: Lipid acceptor classes, and the (donor 0 class, donor 1 class) pairs of a
+#: frame with both donors on one lipid; the last slot is every other frame.
+N_LIPID_CLASSES = len(ACCEPTOR_CLASSES)
+N_PAIRS = N_LIPID_CLASSES ** 2
+PAIR_NAMES = [f"{a}+{b}" for a, _ in ACCEPTOR_CLASSES for b, _ in ACCEPTOR_CLASSES]
+
+
+def frame_states(F, I):
+    """
+    The derived per-frame states of PROFILE_OBS: {name: 0/1 per frame, NaN
+    where it is undefined}, from the cached columns.  `bidentate` is 1 where
+    the first two donors are H-bonded to the same lipid (not water), and
+    `pair` the index of their (class, class) pair there, N_PAIRS elsewhere.
+    """
+    col = {c: i for i, c in enumerate(FLOAT_COLS)}
+
+    def state(name, test):
+        v = F[:, col[name]]
+        with np.errstate(invalid="ignore"):
+            return np.where(np.isfinite(v), test(v).astype(float), np.nan)
+
+    out = {"endo": state("conf_chi1", lambda v: v > 0),
+           "nh_cis": state("conf_tau_nh", lambda v: np.abs(v) < 90),
+           "co_anti": state("conf_tau_co", lambda v: np.abs(v) > 90),
+           "ihb_nh_o": state("conf_r_nh_o", lambda v: v < IHB_CUT),
+           "ihb_xh_n": state("conf_r_xh_n", lambda v: v < IHB_CUT)}
+    n = len(F)
+    if (I.shape[1] - 1) // 2 >= 2:
+        c0, r0, c1, r1 = (I[:, k] for k in (1, 2, 3, 4))
+        on_lipid = (c0 >= 0) & (c0 != WATER_CLASS) & (c1 >= 0) & (c1 != WATER_CLASS)
+        both = on_lipid & (r0 == r1)
+        out["bidentate"] = both.astype(float)
+        out["pair"] = np.where(both, np.clip(c0, 0, None) * N_LIPID_CLASSES
+                               + np.clip(c1, 0, None), N_PAIRS)
+    else:
+        out["bidentate"] = np.full(n, np.nan)
+        out["pair"] = np.full(n, N_PAIRS)
+    return out
+
 #: Observables that are D = -L when the lipids' handedness plays no role in
 #: where and how the permeant sits, and L + D is tested for them instead of
 #: L - D.  The mirror image of L+R is D+S, so with no chiral recognition D+R
@@ -1443,7 +1618,7 @@ def frame_parts(op, unit: Unit):
 
 #: Frame counts, used only to decide which bins have enough data.  They are
 #: kept with the `above` part only, so they are not counted twice.
-RAW_KEYS = ("N_raw", "C_raw", "hb_raw", "pose_n_raw", "rot_n_raw")
+RAW_KEYS = ("N_raw", "C_raw", "hb_raw", "pose_n_raw", "rot_n_raw", "pair_raw")
 
 
 def reduce_path(arr, op, dt, grid: Grid, mult=None, live=None):
@@ -1460,6 +1635,8 @@ def reduce_path(arr, op, dt, grid: Grid, mult=None, live=None):
     mult = np.ones(len(op)) if mult is None else np.asarray(mult, dtype=float)
     F, I = arr["F"].astype(float), arr["I"]
     n_don = (I.shape[1] - 1) // 2
+    npd, n_tors = grid.n_pose_depth, len(LIPID_TORSIONS)
+    H = arr.get("H")
     # N/C/S/S2 carry the frame weights; N_raw/C_raw count frames, and are only
     # used to decide which bins have enough data to report.
     out = {"N": np.zeros(nz), "C": np.zeros((nobs, nz)),
@@ -1481,6 +1658,17 @@ def reduce_path(arr, op, dt, grid: Grid, mult=None, live=None):
            "rot_n_raw": np.zeros((grid.n_pose_depth, len(ROT_LAGS))),
            "axis_depth": np.zeros((grid.n_pose_depth, grid.n_phi, grid.n_cos), np.float32),
            "chi_depth": np.zeros((grid.n_pose_depth, grid.n_phi, grid.n_cos), np.float32),
+           # Both donors on one lipid, per acceptor-class pair (last: other
+           # frames), and the conformers per donor H-bond state, both on the
+           # coarser contact-depth bins.
+           "pair": np.zeros((N_PAIRS + 1, npd), np.float32),
+           "pair_raw": np.zeros((N_PAIRS + 1, npd), np.float32),
+           "conf_hb": np.zeros((len(CONF_LABELS), n_don, len(CLASS_NAMES) + 1, npd), np.float32),
+           "conf_hb_n": np.zeros((len(CONF_LABELS), n_don, len(CLASS_NAMES) + 1, npd),
+                                 np.float32),
+           "tors_partner": np.zeros((n_tors, N_TORS_BINS)),
+           "tors_bulk": (np.tensordot(mult, H.astype(float), axes=(0, 0)) if H is not None
+                         else np.zeros((n_tors, N_TORS_BINS))),
            "dt": dt}
     if len(F) == 0:
         return out
@@ -1491,8 +1679,10 @@ def reduce_path(arr, op, dt, grid: Grid, mult=None, live=None):
     out["N"] += np.bincount(zb, weights=mult, minlength=nz)
     out["N_raw"] += np.bincount(zb[live], minlength=nz)
 
+    states = frame_states(F, I)
+    states["contact"] = contact.astype(float)
     for o, (_, key, only_contact) in enumerate(PROFILE_OBS):
-        v = contact.astype(float) if key == "contact" else F[:, col[key]]
+        v = states[key] if key in states else F[:, col[key]]
         ok = np.isfinite(v) & live & (contact if only_contact else True)
         m = mult[ok]
         out["C"][o] += np.bincount(zb[ok], weights=m, minlength=nz)
@@ -1510,11 +1700,20 @@ def reduce_path(arr, op, dt, grid: Grid, mult=None, live=None):
                             minlength=nz * HIST_NBINS)
     out["hist"] += flat.reshape(nz, HIST_NBINS).astype(np.float32)
 
+    pdb_live = grid.pose_depth_bin(op)
     for k in range(n_don):
         cls = I[:, 1 + 2 * k].copy()
         cls[cls < 0] = len(CLASS_NAMES)          # last slot: no H-bond
         np.add.at(out["hb"][k], (cls[live], zb[live]), mult[live])
         np.add.at(out["hb_raw"][k], (cls[live], zb[live]), 1.0)
+        for li, name in enumerate(CONF_LABELS):
+            v = states[name]
+            ok = live & np.isfinite(v)
+            np.add.at(out["conf_hb_n"][li, k], (cls[ok], pdb_live[ok]), mult[ok])
+            np.add.at(out["conf_hb"][li, k], (cls[ok], pdb_live[ok]), mult[ok] * v[ok])
+    pair = states["pair"]
+    np.add.at(out["pair"], (pair[live], pdb_live[live]), mult[live])
+    np.add.at(out["pair_raw"], (pair[live], pdb_live[live]), 1.0)
 
     px, py, pz = (F[contact, col[c]] for c in ("pose_x", "pose_y", "pose_z"))
     phi = np.degrees(np.arctan2(py, px))
@@ -1562,6 +1761,11 @@ def reduce_path(arr, op, dt, grid: Grid, mult=None, live=None):
     for a, c in enumerate(("glyc_a", "glyc_b")):
         out["glyc_partner"][a] += np.histogram(F[contact, col[c]], bins=ge,
                                                weights=mult[contact])[0]
+    te = np.linspace(-180.0, 180.0, N_TORS_BINS + 1)
+    for t, (key, _) in enumerate(LIPID_TORSIONS):
+        x, w = F[contact, col[f"ltor_{key}"]], mult[contact]
+        ok = np.isfinite(x)
+        out["tors_partner"][t] += np.histogram(x[ok], bins=te, weights=w[ok])[0]
 
     # Lifetimes: continuous runs of the same (acceptor class, residue) per
     # donor, and of contact with the same lipid stereocentre.  The path is one
@@ -3055,7 +3259,20 @@ BLOCKING_OBS = {
         v.unit_values("life_n")[:, LIFE_KINDS.index("lipid_contact")]),
     "bulk glycerol b trans": lambda v: (v.unit_values("glyc_bulk")[:, 1, _glyc_trans()].sum(-1),
                                         v.unit_values("glyc_bulk")[:, 1].sum(-1)),
+    "Cg-endo": lambda v: (v.unit_values("S")[:, _obs_index("endo")].sum(-1),
+                          v.unit_values("C")[:, _obs_index("endo")].sum(-1)),
+    "two donors on one lipid": lambda v: (v.unit_values("S")[:, _obs_index("bidentate")].sum(-1),
+                                          v.unit_values("C")[:, _obs_index("bidentate")].sum(-1)),
+    "O=C-X-H anti": lambda v: (v.unit_values("S")[:, _obs_index("co_anti")].sum(-1),
+                               v.unit_values("C")[:, _obs_index("co_anti")].sum(-1)),
 }
+#: BLOCKING_OBS reported in blocking.csv and block_choice.csv but left out of
+#: every block choice.  The COOH turns anti and back so rarely that the paths
+#: inherit the state rather than sample it, and letting it set the block
+#: would widen every other error bar to its scale.  Its own rows (co_anti,
+#: ihb_xh_n) are therefore optimistic at the chosen block; block_choice.csv
+#: says which block they would need.
+INFO_BLOCKING_OBS = ("O=C-X-H anti",)
 BLOCK_SIZES = (1, 10, 25, 50, 100, 250, 500, 1000, 2000)
 MIN_BLOCKS = 10        # fewer blocks than this: the inefficiency itself is too noisy
 
@@ -3194,6 +3411,10 @@ def _choose_and_report(blocking, fixed, out_dir, label):
     (per quantity, the block it is used for in `chosen_block`) and prints
     one line.  Returns (block, lipid_block).
     """
+    info_rows = (blocking[blocking["observable"].isin(INFO_BLOCKING_OBS)]
+                 if not blocking.empty else blocking)
+    if not info_rows.empty:
+        blocking = blocking[~blocking["observable"].isin(INFO_BLOCKING_OBS)]
     lipid = blocking["observable"].isin(LIPID_BLOCKING_OBS) if not blocking.empty \
         else pd.Series(dtype=bool)
     block, rec, info = choose_block(blocking[~lipid] if lipid.any() else blocking)
@@ -3209,6 +3430,16 @@ def _choose_and_report(blocking, fixed, out_dir, label):
                     if not l_rec.empty else
                     [rec.assign(chosen_block=block, used_for="permeant comparisons")],
                     ignore_index=True).assign(mode=mode)
+    if not info_rows.empty:
+        i_block, i_rec, _ = choose_block(info_rows)
+        if not i_rec.empty:
+            rec = pd.concat([rec, i_rec.assign(chosen_block=block,
+                                               used_for="report only (slow state)",
+                                               mode=mode)], ignore_index=True)
+            if i_block > block:
+                print(f"  {label}: {', '.join(INFO_BLOCKING_OBS)} would need block "
+                      f"{i_block}; its rows use block {block}, so their error bars "
+                      f"are too small (see block_choice.csv)")
     rec.to_csv(os.path.join(out_dir, "block_choice.csv"), index=False)
     if fixed is not None:
         print(f"  {label}: -block {block} (fixed)")
@@ -3328,6 +3559,154 @@ def glycerol_dihedrals(eL, eD, min_frames=200, **boot):
                   "q": df["q_bh"].to_numpy().reshape(shape),
                   "contact_frames": np.array([fL, fD])}
     return df, arrays
+
+
+def bidentate_pairs(eL, eD, grid, **boot):
+    """
+    WHAT, for both donors at once: the share of frames with BOTH donors
+    H-bonded to the SAME lipid, by the acceptor class each binds (donor 0
+    class + donor 1 class, donors in PermeantSpec.donors order), per contact-
+    depth bin and pooled.  Two H-bonds to one lipid, with the ring against
+    it, are the three-point attachment classic chiral recognition needs, so
+    a diastereomeric complex should show here first.  `bidentate` in
+    depth_profiles is the sum over the pairs.  Pairs seen by neither side
+    are left out.
+    """
+    def stat(a):
+        p = a["pair"].astype(float)
+        per_z = _ratio(p[:-1], p.sum(axis=0, keepdims=True))
+        pooled = _ratio(p[:-1].sum(axis=1), p.sum())
+        return np.concatenate([per_z.ravel(), pooled])
+
+    pL, pD, rL, rD = bootstrap(eL, eD, stat, **boot)
+    zl = grid.pose_depth_labels()
+    rows = [(name, z) for name in PAIR_NAMES for z in zl] + [(name, "all") for name in PAIR_NAMES]
+    df = _diff_table(pL, pD, rL, rD, pd.DataFrame(rows, columns=["pair", "depth"]))
+    seen = (df["L"].fillna(0) > 0) | (df["D"].fillna(0) > 0)
+    df = df[seen].reset_index(drop=True)
+    ok = df["p_boot"].notna().to_numpy()
+    df["q_bh"] = np.nan
+    df.loc[ok, "q_bh"] = benjamini_hochberg(df.loc[ok, "p_boot"].to_numpy())
+    return df
+
+
+def pair_resolved_ddg(eL, eD, grid, temperature=310.0, min_frames=50, **boot):
+    """
+    WHAT carries the free-energy difference, for two-donor contacts:
+    G_pair(z) = -kT ln N_pair(z) / N(ref) on the contact-depth bins, anchored
+    at bulk like depth_ddg ('none' collects every frame without a two-donor
+    contact).  The bin width is the same for L and D, so ddG compares.
+    """
+    kt = KB_KCAL * temperature
+    _, ref = _reference_bin(eL, eD, min_frames)
+    if ref is None:
+        return pd.DataFrame()
+    dense = (eL.raw("pair_raw") >= min_frames) & (eD.raw("pair_raw") >= min_frames)
+
+    def stat(a):
+        with np.errstate(divide="ignore", invalid="ignore"):
+            g = -kt * np.log(a["pair"].astype(float) / a["N"][ref])
+        g[~dense | ~np.isfinite(g)] = np.nan
+        return g.ravel()
+
+    pL, pD, rL, rD = bootstrap(eL, eD, stat, **boot)
+    rows = [(name, z) for name in PAIR_NAMES + ["none"] for z in grid.pose_depth_labels()]
+    df = _diff_table(pL, pD, rL, rD, pd.DataFrame(rows, columns=["pair", "depth"]))
+    df = df.rename(columns={"L": "G_L", "D": "G_D", "L_minus_D": "ddG_kcal"})
+    df["reference_bin"] = grid.depth_labels()[ref]
+    return df.dropna(subset=["G_L", "G_D"], how="all")
+
+
+def conformers_by_contact(eL, eD, grid, **boot):
+    """
+    Conformation given the contact: for each permeant conformer (CONF_LABELS)
+    and each donor's H-bond state (acceptor class, water or none), the share
+    of those frames in that conformer, per contact-depth bin and pooled.  A
+    diastereomeric complex can hold L and D in different conformers even
+    where the overall populations (depth_profiles) agree.
+    """
+    def stat(a):
+        num, den = a["conf_hb"].astype(float), a["conf_hb_n"].astype(float)
+        return np.concatenate([_ratio(num, den).ravel(),
+                               _ratio(num.sum(axis=-1), den.sum(axis=-1)).ravel()])
+
+    pL, pD, rL, rD = bootstrap(eL, eD, stat, **boot)
+    n_don = eL.A["conf_hb"].shape[2]
+    partners = CLASS_NAMES + ["none"]
+    zl = grid.pose_depth_labels()
+    rows = [(c, k, pt, z) for c in CONF_LABELS for k in range(n_don) for pt in partners
+            for z in zl]
+    rows += [(c, k, pt, "all") for c in CONF_LABELS for k in range(n_don) for pt in partners]
+    df = _diff_table(pL, pD, rL, rD,
+                     pd.DataFrame(rows, columns=["conformer", "donor", "partner", "depth"]))
+    df = df.dropna(subset=["L", "D"], how="all").reset_index(drop=True)
+    ok = df["p_boot"].notna().to_numpy()
+    df["q_bh"] = np.nan
+    df.loc[ok, "q_bh"] = benjamini_hochberg(df.loc[ok, "p_boot"].to_numpy())
+    return df
+
+
+def lipid_torsions(eL, eD, min_frames=200, **boot):
+    """
+    RESPONSE, beyond the two glycerol dihedrals: every LIPID_TORSIONS torsion
+    of the lipid the permeant touches (contact frames) and of all lipids
+    (bulk), as 30-degree distributions, and their g-/t/g+ populations with
+    the contact-induced shift (contact - bulk), as glycerol_dihedrals and
+    glycerol_conformers do for the glycerol.  A diastereomeric contact
+    predicts different shifts for L and D; the bulk rows are the control.
+    Torsions the topology lacks are NaN.
+    Returns (populations table, distribution table, arrays for the .npz).
+    """
+    n_t, n_b = len(LIPID_TORSIONS), N_TORS_BINS
+    edges = np.linspace(-180.0, 180.0, n_b + 1)
+    centers = 0.5 * (edges[1:] + edges[:-1])
+    states = {"g+": (centers > 0) & (centers < 120), "t": np.abs(centers) >= 120,
+              "g-": (centers < 0) & (centers > -120)}
+
+    def norm(h):
+        with np.errstate(invalid="ignore", divide="ignore"):
+            return h / h.sum(axis=-1, keepdims=True)
+
+    def fractions(h):
+        return np.array([_ratio(h[t, m].sum(), h[t].sum()) for t in range(n_t)
+                         for m in states.values()], dtype=float)
+
+    def stat(a):
+        c, b = a["tors_partner"], a["tors_bulk"]
+        fc, fb = fractions(c), fractions(b)
+        return np.r_[norm(c).ravel(), norm(b).ravel(), fc, fb, fc - fb]
+
+    pL, pD, rL, rD = bootstrap(eL, eD, stat, **boot)
+    names = [f"{k}_{atoms}" for k, atoms in LIPID_TORSIONS]
+    n_dist = 2 * n_t * n_b
+    contact = int(np.argmax([o[2] for o in PROFILE_OBS]))     # a contact-only observable
+    fL, fD = eL.raw("C_raw")[contact].sum(), eD.raw("C_raw")[contact].sum()
+
+    rows = [(lip, nm, edges[i], edges[i + 1]) for lip in ("contact", "bulk") for nm in names
+            for i in range(n_b)]
+    dist = _diff_table(pL[:n_dist], pD[:n_dist], rL[:, :n_dist], rD[:, :n_dist],
+                       pd.DataFrame(rows, columns=["lipid", "torsion", "angle_lo", "angle_hi"]))
+    rows = [(src, nm, st) for src in ("contact", "bulk", "contact_minus_bulk") for nm in names
+            for st in states]
+    pops = _diff_table(pL[n_dist:], pD[n_dist:], rL[:, n_dist:], rD[:, n_dist:],
+                       pd.DataFrame(rows, columns=["lipid", "torsion", "state"]))
+    for df in (dist, pops):
+        if min(fL, fD) < min_frames:
+            df.loc[df["lipid"] != "bulk", "p_boot"] = np.nan
+        ok = df["p_boot"].notna().to_numpy()
+        df["q_bh"] = np.nan
+        df.loc[ok, "q_bh"] = benjamini_hochberg(df.loc[ok, "p_boot"].to_numpy())
+    shape = (2, n_t, n_b)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        arrays = {"edges": edges, "lipids": np.array(["contact", "bulk"]),
+                  "dihedrals": np.array([f"{k}: {atoms}" for k, atoms in LIPID_TORSIONS]),
+                  "L": pL[:n_dist].reshape(shape), "D": pD[:n_dist].reshape(shape),
+                  "Lse": np.nanstd(rL[:, :n_dist], axis=0).reshape(shape),
+                  "Dse": np.nanstd(rD[:, :n_dist], axis=0).reshape(shape),
+                  "q": dist["q_bh"].to_numpy().reshape(shape),
+                  "contact_frames": np.array([fL, fD])}
+    return pops, dist, arrays
 
 
 def _report_trimming(label, meta):
@@ -3454,6 +3833,7 @@ def _analyse(eL, eD, uL, uD, out_dir, grid, boot, by_class, split_half, names,
             "permeability_ratio": perm_summary,
             "resistance_shares": perm_shares,
             "ddG_by_hbond_state": state_resolved_ddg(eL, eD, grid, temperature, **boot),
+            "ddG_by_bidentate_state": pair_resolved_ddg(eL, eD, grid, temperature, **boot),
         }
         # Free energy over depth x orientation, and the L/D comparison
         # pooled over the depths that carry the resistance to crossing.
@@ -3582,6 +3962,11 @@ def _conditional_tables(eL, eD, grid, out_dir, boot, lipid_block=None):
     }
     tables["glycerol_dihedrals"], glyc = glycerol_dihedrals(eL, eD, **lipid_boot)
     np.savez(os.path.join(out_dir, "glycerol_dihedrals.npz"), **glyc)
+    tables["bidentate_pairs"] = bidentate_pairs(eL, eD, grid, **boot)
+    tables["conformers_by_contact"] = conformers_by_contact(eL, eD, grid, **boot)
+    tables["lipid_conformers"], tables["lipid_torsions"], tors = lipid_torsions(
+        eL, eD, **lipid_boot)
+    np.savez(os.path.join(out_dir, "lipid_torsions.npz"), **tors)
     maps, tables["pose_jsd"] = pose_maps(eL, eD, block=block, seed=seed)
     np.savez(os.path.join(out_dir, "pose_maps.npz"), **maps,
              phi_edges=np.linspace(-180, 180, grid.n_phi + 1),
@@ -3656,9 +4041,11 @@ COMPARE_OUTPUTS = (
         "lifetime_survival", "glycerol_conformers", "pose_jsd", "pose_jsd_depth",
         "path_classes", "blocking", "blocking_quarters", "block_choice", "histograms",
         "orient_jsd_depth", "reorientation", "orientation_free_energy", "barrier",
-        "glycerol_dihedrals")]
+        "glycerol_dihedrals", "ddG_by_bidentate_state", "bidentate_pairs",
+        "conformers_by_contact", "lipid_conformers", "lipid_torsions")]
     + ["pose_maps.npz", "pose_maps_depth.npz", "histograms.npz", "orient_maps_depth.npz",
-       "reorientation.npz", "orientation_free_energy.npz", "glycerol_dihedrals.npz"]
+       "reorientation.npz", "orientation_free_energy.npz", "glycerol_dihedrals.npz",
+       "lipid_torsions.npz"]
 )
 #: What compare writes into each PATH_SUBSETS subfolder.
 SUBSET_OUTPUTS = (
@@ -3666,9 +4053,10 @@ SUBSET_OUTPUTS = (
         "depth_profiles", "hbond_partners", "sn2_preference", "lifetimes",
         "lifetime_survival", "glycerol_conformers", "pose_jsd", "pose_jsd_depth",
         "blocking", "blocking_quarters", "block_choice", "histograms", "orient_jsd_depth",
-        "reorientation", "glycerol_dihedrals")]
+        "reorientation", "glycerol_dihedrals", "bidentate_pairs", "conformers_by_contact",
+        "lipid_conformers", "lipid_torsions")]
     + ["pose_maps.npz", "pose_maps_depth.npz", "histograms.npz", "orient_maps_depth.npz",
-       "reorientation.npz", "glycerol_dihedrals.npz"]
+       "reorientation.npz", "glycerol_dihedrals.npz", "lipid_torsions.npz"]
 )
 #: What compare writes into UNWEIGHTED_DIR, besides its subset folders.
 UNWEIGHTED_OUTPUTS = SUBSET_OUTPUTS + ["path_classes.csv"]
