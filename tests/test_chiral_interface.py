@@ -1289,3 +1289,38 @@ def test_glycerol_dihedral_distributions_find_a_shifted_touched_lipid(tmp_path):
     chiral_plot._style()
     chiral_plot.plot_glycerol_dihedrals(str(tmp_path))
     assert (tmp_path / "chiral_glycerol_dihedrals.png").exists()
+
+
+# ── xi: only the [0-] paths' order.txt is read ─────────────────────────────
+
+def test_wham_xi_reads_only_the_minus_paths(tmp_path):
+    """Plus paths start just below lambda_A, so none is LMR/RMR/LML/RML:
+    leaving their order.txt unread (here: absent) must not change xi, and
+    the missing count then covers the [0-] paths alone."""
+    lam_a, lam_m1 = -25.0, -35.0
+    traces = {1: [-36, -30, -24],          # LMR -> R
+              2: [-24, -26, -36],          # RML -> L
+              3: [-36, -30, -37],          # LML -> L
+              4: [-24, -27, -23]}          # RMR -> R
+    units = []
+    for pn, op in traces.items():
+        f = tmp_path / f"{pn}.txt"
+        f.write_text("# step op\n" + "\n".join(f"{i} {v}" for i, v in enumerate(op)))
+        units.append(cia.Unit(pn, [], order_file=str(f)))
+    units += [cia.Unit(pn, [], order_file=str(tmp_path / f"{pn}.txt"))   # no file
+              for pn in (10, 11, 12)]
+    minus = {1: 0.4, 2: 0.3, 3: 0.2, 4: 0.1}
+    plus = {10: 0.5, 11: 0.3, 12: 0.2}
+    wtot = cia.combine_weights(plus, minus)
+
+    xi_all, missing_all = cia.wham_xi(units, wtot, lam_a, lam_m1)
+    for u in units:
+        u.xi_end = None
+    xi, missing = cia.wham_xi(units, wtot, lam_a, lam_m1, minus)
+    assert xi == pytest.approx(xi_all) == pytest.approx((0.4 + 0.1) / 1.0)
+    assert (missing_all, missing) == (3, 0)
+    assert [u.xi_end for u in units] == ["R", "L", "L", "R", None, None, None]
+
+    # a [0-] path without its order.txt is still reported
+    os.remove(tmp_path / "3.txt")
+    assert cia.wham_xi(units, wtot, lam_a, lam_m1, minus)[1] == 1

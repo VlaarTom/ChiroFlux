@@ -80,8 +80,11 @@ PLOT_OUTPUTS = (("chiral_free_energy.png", "chiral_profiles.png",
 SUBSETS = {"reactive": "reactive paths only", "unreactive": "unreactive paths only"}
 
 COL = {"L": "#2a78d6", "D": "#eb6834"}
-INK, INK2, MUTED = "#0b0b0b", "#52514e", "#898781"
-GRID, AXIS, NEUTRAL = "#e1e0d9", "#c3c2b7", "#f0efec"
+# Every non-data ink - axes, ticks, labels, titles, annotations, reference
+# lines - is black; only the data carry colour.  The names are kept so the
+# figures can still tell primary from secondary ink apart if that changes.
+INK = INK2 = MUTED = AXIS = GRID = "#000000"
+NEUTRAL = "#f0efec"
 SEQ = LinearSegmentedColormap.from_list(
     "chiral_seq", ["#fcfcfb", "#e1e0d9", "#c3c2b7", "#898781", "#52514e", "#0b0b0b"])
 DIV = LinearSegmentedColormap.from_list(          # D more <- 0 -> L more
@@ -107,14 +110,15 @@ MIRROR_ODD_VS_NORMAL = ("cos_chi_n", "chi_lz")
 def _style():
     plt.rcParams.update({
         "figure.facecolor": "white", "axes.facecolor": "white",
-        "axes.edgecolor": AXIS, "axes.labelcolor": INK2, "axes.titlecolor": INK,
-        "axes.titlesize": 10, "axes.labelsize": 9, "axes.grid": True,
-        "grid.color": GRID, "grid.linewidth": 0.6, "axes.axisbelow": True,
+        "axes.edgecolor": INK, "axes.labelcolor": INK, "axes.titlecolor": INK,
+        "axes.titlesize": 10, "axes.labelsize": 10, "axes.grid": True,
+        "grid.color": GRID, "grid.linewidth": 0.3, "grid.linestyle": ":",
+        "axes.axisbelow": True, "text.color": INK, "legend.labelcolor": INK,
         "axes.spines.top": False, "axes.spines.right": False,
-        "xtick.color": MUTED, "ytick.color": MUTED,
-        "xtick.labelsize": 8, "ytick.labelsize": 8,
-        "legend.fontsize": 8, "legend.frameon": False,
-        "lines.linewidth": 1.6, "font.size": 9,
+        "xtick.color": INK, "ytick.color": INK,
+        "xtick.labelsize": 9, "ytick.labelsize": 9,
+        "legend.fontsize": 9, "legend.frameon": False,
+        "lines.linewidth": 1.6, "font.size": 10,
     })
 
 
@@ -283,7 +287,7 @@ def plot_free_energy(in_dir):
         r = pr.iloc[0]
         title += (f"\nln(P_L/P_D) = {r.ln_PL_over_PD:+.2f} [{r.ci_lo:+.2f}, {r.ci_hi:+.2f}]"
                   f"  ->  P_L/P_D = {r.PL_over_PD:.2g}  (equal D(z) assumed)")
-    ax.set_title(title, loc="left")
+    #ax.set_title(title, loc="left")
     _mark_stages(ax, edges, label=True)
 
     ax = axes[1]
@@ -320,7 +324,7 @@ def plot_profiles(in_dir):
     names = list(dict.fromkeys(dp["observable"]))
     ncol = 5
     nrow = int(np.ceil(len(names) / ncol))
-    fig, axes = plt.subplots(nrow, ncol, figsize=(3.0 * ncol, 2.7 * nrow), sharex=True)
+    fig, axes = plt.subplots(nrow, ncol, figsize=(3.0 * ncol, 2.7 * nrow), sharex=False)
     for ax, name in zip(axes.ravel(), names):
         df = dp[dp["observable"] == name]
         x = _depth_mid(df["depth"])
@@ -336,7 +340,7 @@ def plot_profiles(in_dir):
             ax.plot(x[ok], y[ok], color=COL["D"], ls="--", lw=1.2, label="-D (mirror null)")
             ax.axhline(0, color=AXIS, lw=0.8)
             ax.legend(loc="lower right", fontsize=7)
-        ax.set_title(OBS_LABELS.get(name, name), fontsize=8.5)
+        #ax.set_title(OBS_LABELS.get(name, name), fontsize=8.5)
         _mark_stages(ax, edges)
     for ax in axes.ravel()[len(names):]:
         ax.set_visible(False)
@@ -700,8 +704,8 @@ STAGE_COL = ("#1baf7a", "#eda100", "#4a3aa7", "#e87ba4", "#008300")
 def _stage_legend(fig, stages):
     handles = [Line2D([], [], color=STAGE_COL[k % len(STAGE_COL)], label=f"stage {k}")
                for k in stages]
-    handles += [Line2D([], [], color=INK2, ls="-", label="L"),
-                Line2D([], [], color=INK2, ls="--", label="D")]
+    handles += [Line2D([], [], color=INK, ls="-", label="L"),
+                Line2D([], [], color=INK, ls="--", label="D")]
     fig.legend(handles=handles, loc="upper right", ncol=len(handles), bbox_to_anchor=(1.0, 1.0))
 
 

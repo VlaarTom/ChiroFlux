@@ -1008,7 +1008,7 @@ def path_type(op, lambda_minus_one, lambda_A):
     return "0+"
 
 
-def wham_xi(units, weights, lambda_A, lambda_minus_one):
+def wham_xi(units, weights, lambda_A, lambda_minus_one, minus=None):
     """
     xi = R_END / (R_END + L_END), the WFtot-weighted fraction of [0-] paths
     ending at lambda_A (types LMR, RMR) rather than at lambda_-1 (LML, RML).
@@ -1016,10 +1016,19 @@ def wham_xi(units, weights, lambda_A, lambda_minus_one):
     (xi, number of weighted paths whose order.txt was missing), and sets
     each counted unit's `xi_end`, so the bootstrap can recompute xi from
     every resample (Ensemble.xi).
+
+    `minus` ({path: [0-] weight}, minus_weights) limits the order.txt reads
+    to the [0-] paths, the only ones xi counts: a plus path starts just
+    below lambda_A, so it is never one of the four types above and would
+    come out '0+' anyway.  On the entry stage that is ~1/7 of the files;
+    the missing count is then of [0-] paths only.  None reads every
+    weighted path.
     """
     r_end = l_end = 0.0
     missing = 0
     for u in units:
+        if minus is not None and minus.get(u.uid, 0.0) <= 0:
+            continue
         w = weights.get(u.uid, 0.0)
         if w <= 0:
             continue
@@ -1109,12 +1118,14 @@ class StageFactorModel:
 
 
 def setup_stages(specs, nskip=1000, wham_subdir="wham", pcross_col=3,
-                 trim=True, path_numbers=None):
+                 trim=True, path_numbers=None, make_units=None):
     """
     Units of every stage of one enantiomer, weighted onto one equilibrium
     scale (see the section comment).  `specs` are in chain order, entry first.
     Each unit carries both weights: `weight` (WFtot, the WHAM reweighting)
     and `weight_uniform` (the same paths, equal within plus and within [0-]).
+    `make_units(spec, path_numbers)` builds a stage's units instead of
+    listing load/ for the chiral cache (cv-compare reads the CV files).
     Returns (units, per-stage summary table, StageFactorModel).
     """
     from .permeation_process import load_stage, stage_factors
@@ -1131,14 +1142,17 @@ def setup_stages(specs, nskip=1000, wham_subdir="wham", pcross_col=3,
             raise ValueError(f"{spec.toml_file} has lambda_A = {lam_a} but "
                              f"{spec.run_dir}/{wham_subdir} was made with "
                              f"lA = {stage.lam_a}; wrong toml for this run?")
-        cache_dir = spec.cache_dir or os.path.join(spec.run_dir, DEFAULT_CACHE)
-        units = units_from_load_dir(os.path.join(spec.run_dir, "load"), path_numbers,
-                                    cache_dir, keep_plan=False)
+        if make_units is None:
+            cache_dir = spec.cache_dir or os.path.join(spec.run_dir, DEFAULT_CACHE)
+            units = units_from_load_dir(os.path.join(spec.run_dir, "load"), path_numbers,
+                                        cache_dir, keep_plan=False)
+        else:
+            units = make_units(spec, path_numbers)
         plus = wham_weights(spec.data_file, spec.toml_file, nskip)
         minus = minus_weights(spec.data_file, spec.toml_file, nskip)
         wtot = combine_weights(plus, minus)
         wuni = uniform_weights(plus, minus)
-        xi, missing = (wham_xi(units, wtot, lam_a, lam_m1) if k == 0
+        xi, missing = (wham_xi(units, wtot, lam_a, lam_m1, minus) if k == 0
                        else (np.nan, 0))
         # The same ratio with the uniform weights; xi_end is set by wham_xi.
         r = sum(wuni.get(u.uid, 0.0) for u in units if u.xi_end == "R")
@@ -3935,6 +3949,7 @@ def chiral_compare(
     from .chiral_plot import PLOT_OUTPUTS
     by_class = runs_l is not None and runs_d is not None
     extra = list(SPLIT_HALF_OUTPUTS) if split_half else []
+    out_dir = os.path.join("chiral_compare", out_dir)
     for name in COMPARE_OUTPUTS + list(PLOT_OUTPUTS) + extra:
         _check_overwrite(os.path.join(out_dir, name), overw)
     if by_class:
