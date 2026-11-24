@@ -20,6 +20,8 @@ from chiroflux.cv_generation import (
     compute_group_orientations,
     compute_handed_cn,
     compute_local_chain_tilt,
+    compute_local_swirl,
+    intramolecular_distance,
 )
 
 BOX = 100.0
@@ -327,3 +329,51 @@ def test_chi1_sign_is_the_pucker_and_flips_with_the_enantiomer():
         chi2 = _chi(atoms, ("CA", "CB", "CG", "CD"))
         assert np.sign(chi1) == sign and abs(chi1) > 20
         assert np.sign(chi2) == -sign and abs(chi2) > 20
+
+
+# ── Swirl of the lipids around the permeant ──────────────────────────────────
+
+def _ring_of_lipids(kind, n=6, r=0.5, mirror=False):
+    """(base, tip) of n lipids on a circle about the origin, each base -> tip
+    vector tangential anticlockwise, radial, or (mirror) the mirror image of
+    the tangential arrangement, x -> -x."""
+    ang = np.linspace(0, 2 * np.pi, n, endpoint=False)
+    base = np.stack([r * np.cos(ang), r * np.sin(ang), np.full(n, 2.0)], axis=1)
+    if kind == "tangential":
+        step = np.stack([-np.sin(ang), np.cos(ang), np.full(n, -0.3)], axis=1)
+    else:
+        step = np.stack([np.cos(ang), np.sin(ang), np.full(n, -0.3)], axis=1)
+    tip = base + 0.2 * step
+    if mirror:
+        base, tip = base * [-1, 1, 1], tip * [-1, 1, 1]
+    return (BOX / 2 + base).reshape(1, -1), (BOX / 2 + tip).reshape(1, -1)
+
+
+def test_swirl_has_a_sense_and_the_mirror_reverses_it():
+    centre = np.full((1, 2), BOX / 2)
+    base, tip = _ring_of_lipids("tangential")
+    s = compute_local_swirl(centre, base, tip, BOX)[0]
+    assert s == pytest.approx(0.2 / np.hypot(0.2, 0.06))      # anticlockwise, tilted
+    mb, mt = _ring_of_lipids("tangential", mirror=True)
+    assert compute_local_swirl(centre, mb, mt, BOX)[0] == pytest.approx(-s)
+    rb, rt = _ring_of_lipids("radial")
+    assert compute_local_swirl(centre, rb, rt, BOX)[0] == pytest.approx(0.0, abs=1e-12)
+    # lipids outside the radius, or too few of them: no swirl
+    assert compute_local_swirl(centre, base, tip, BOX, radius=0.4)[0] == 0.0
+    few_b, few_t = base[:, :6], tip[:, :6]
+    assert compute_local_swirl(centre, few_b, few_t, BOX)[0] == 0.0
+
+
+def test_swirl_sees_lipids_across_the_periodic_boundary():
+    centre = np.array([[0.05, BOX / 2]])
+    base, tip = _ring_of_lipids("tangential")
+    shift = np.tile([0.05 - BOX / 2, 0.0, 0.0], 6)
+    wrapped_b = (base + shift) % BOX
+    wrapped_t = (tip + shift) % BOX
+    s_ref = compute_local_swirl(np.full((1, 2), BOX / 2), base, tip, BOX)[0]
+    assert compute_local_swirl(centre, wrapped_b, wrapped_t, BOX)[0] == pytest.approx(s_ref)
+
+
+def test_intramolecular_distance_uses_the_minimum_image():
+    xyz = np.array([[0.1, 0.0, 0.0, BOX - 0.1, 0.0, 0.0]])
+    assert intramolecular_distance(xyz, 0, 1, BOX)[0] == pytest.approx(0.2)

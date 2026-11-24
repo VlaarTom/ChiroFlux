@@ -4,6 +4,7 @@ os.environ["OMP_NUM_THREADS"] = "1"
 import argparse
 import re
 import traceback
+import warnings
 from collections import OrderedDict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Annotated, Optional
@@ -722,6 +723,11 @@ HCN_SHELL_EDGES = (0.0, 0.5, 0.8, 1.2)
 #: Column-name suffixes for the shells above, in the same order.
 HCN_SHELL_NAMES = ('s1', 's2', 's3')
 
+#: Choline N+ within this distance (nm) of a permeant acceptor counts as a
+#: contact (PRO_chol_O, PRO_chol_N).  The methyls keep N+ about 0.35-0.45 nm
+#: from an oxygen it touches, so this takes the first shell and no more.
+CHOLINE_CUTOFF = 0.45
+
 
 def compute_handed_cn(coords_tetra, coords_lipid, box, d0=0.5, n_exp=6, m_exp=12,
                       shell_edges=None):
@@ -935,6 +941,61 @@ def compute_local_chain_tilt(pro_xy, coords_c2, coords_cc, z_mid, box, radius=1.
     ok = (n_c2 >= min_count) & (n_cc >= min_count)
     vec = np.where(ok[:, None], vec_local, vec_global)
     return _unit(vec)[:, 2], n_c2.astype(float)
+
+
+def compute_local_swirl(pro_xy, coords_base, coords_tip, box, radius=1.0, min_count=3):
+    """
+    How far the lipids around the permeant are turned about it, one way or
+    the other.
+
+    For each lipid whose `base` atom lies within `radius` of the permeant in
+    the membrane plane: r_hat, the in-plane unit vector from the permeant to
+    that atom, and t_hat, the unit base -> tip vector of the same lipid
+    (P -> N for the headgroup, P -> C2 for the glycerol).  The swirl is the
+    mean of (r_hat x t_hat) . z over those lipids: +1 if every vector points
+    anticlockwise about the permeant seen from +z, -1 clockwise, 0 for no
+    net turn - which is what a radial or random arrangement gives, and what
+    any arrangement around an achiral permeant in an achiral membrane gives
+    on average.
+
+    It is a pseudoscalar about lab +z, so it changes sign under a mirror
+    image and under the face flip (a 180-degree turn about x sends +z to
+    -z): between enantiomers that entered from opposite faces the two cancel,
+    as for PRO_azim_*.  `coords_base` and `coords_tip` must list the same
+    lipids in the same order.  Fewer than `min_count` lipids in range give
+    0, so the column stays finite for the analyses that drop rows with NaN.
+
+    Returns (n_frames,) swirl.
+    """
+    base = np.asarray(coords_base, dtype=float)
+    n_frames = base.shape[0]
+    base = base.reshape(n_frames, -1, 3)
+    tip = np.asarray(coords_tip, dtype=float).reshape(n_frames, -1, 3)
+    if tip.shape != base.shape:
+        raise ValueError("base and tip must hold the same lipids")
+    box = _normalize_box(box, n_frames)
+    pro_xy = np.asarray(pro_xy, dtype=float).reshape(n_frames, -1)[:, :2]
+
+    d = base[:, :, :2] - pro_xy[:, None, :]
+    d = d - box[:, None, :2] * np.round(d / box[:, None, :2])
+    r = np.linalg.norm(d, axis=-1)
+    near = (r < radius) & (r > 1e-9)
+    r_hat = d / np.where(r > 1e-9, r, 1.0)[..., None]
+    t = _min_image(tip - base, box)
+    t_hat = _unit(t)
+    turn = r_hat[..., 0] * t_hat[..., 1] - r_hat[..., 1] * t_hat[..., 0]
+    count = near.sum(axis=1)
+    mean = np.where(near, turn, 0.0).sum(axis=1) / np.maximum(count, 1)
+    return np.where(count >= min_count, mean, 0.0)
+
+
+def intramolecular_distance(coords, i, j, box):
+    """Distance (nm) between atoms i and j of a small group (n_frames, k*3)."""
+    xyz = np.asarray(coords, dtype=float)
+    n_frames = xyz.shape[0]
+    xyz = xyz.reshape(n_frames, -1, 3)
+    v = _min_image(xyz[:, j, :] - xyz[:, i, :], _normalize_box(box, n_frames))
+    return np.linalg.norm(v, axis=1)
 
 
 def compute_group_orientations(coords_cn_ref, coords_ring, box):
@@ -1357,7 +1418,7 @@ def _init_system(gromacs_input="../gromacs_input"):
     global tetrahedral_index_file, CN_DOPC_index_file, CN_POPC_index_file, ZCOM_index_file, lipid_per_leaflet
     global atom_per_lipid_dopc, atom_per_lipid_popc, IDX_BACKBONE, IDX_HEAVY, IDX_C_CG
     global IDX_ANG_OH, IDX_RING5, IDX_RING6, IDX_DIH_CHIRAL, IDX_DIH_OH
-    global IDX_CHI1, IDX_CHI2
+    global IDX_CHI1, IDX_CHI2, IDX_NH, IDX_IHB, IDX_ORP_ACC_O, SWIRL_PAIRS
     global IDX_TETRA5, CN_DOPC_GROUPS, CN_POPC_GROUPS, IDX_CN_REF, IDX_CN_REF_COMBINED
     global ZCOM_GROUPS, ZCOM_SCALAR_GROUPS, _ref_u, IDX_ORP_ALL, IDX_ORP_N
     global IDX_ORP_H01, IDX_ORP_O01, IDX_ORP_H02, IDX_PHOSPHATE, IDX_CARBONYL
@@ -1408,6 +1469,9 @@ def _init_system(gromacs_input="../gromacs_input"):
     ZCOM_GROUPS = ndx_group_list(ZCOM_index_file)  # 14 groups, 0..13
     # 0=ORP 1=N_top 2=N_bot 3=P_top 4=P_bot 5=O2_top 6=O2_bot 7=O3_top 8=O3_bot
     # 9=C2_top 10=C2_bot 11=C3_top 12=C3_bot 13=whole membrane
+    # (the "C2"/"C3" groups hold the sn-2/sn-1 ester and first chain carbons,
+    # C21-C23 / C31-C33, three per lipid - not the glycerol C2 and C3; checked
+    # in the PRO_neutral gromacs_input files)
     ZCOM_SCALAR_GROUPS = [1, 2, 5, 6, 7, 8, 9, 10, 11, 12, 13]  # stored as scalar COM-z only
     # groups 0 (ORP), 3 (P_top), 4 (P_bot) are stored as full per-atom positions:
     # ORP's own COM needs x,y too (pro_xy), and P_top/P_bot feed the chirality CVs.
@@ -1441,14 +1505,37 @@ def _init_system(gromacs_input="../gromacs_input"):
     # PRO_dih_chi1 below), by atom NAME as well, so they do not depend on the
     # order the ring .ndx happens to list its atoms in.
     ring = {}
-    for name in ("N", "CA", "CB", "CG", "CD"):
+    for name in ("N", "CA", "CB", "CG", "CD", "C", "O", "O01", "H01", "H02"):
         found = _ref_u.select_atoms(f"resname ORP and name {name}").indices
         if len(found) != 1:
             raise ValueError(f"{topol_file}: expected one ORP atom named {name} for the "
-                             f"ring torsions, found {len(found)}")
+                             f"ring and carboxyl geometry, found {len(found)}")
         ring[name] = found[0]
     IDX_CHI1 = np.array([ring[n] for n in ("N", "CA", "CB", "CG")])
     IDX_CHI2 = np.array([ring[n] for n in ("CA", "CB", "CG", "CD")])
+    # Which side of the ring the N-H points to (H01-N-CA-C, see PRO_dih_NH)
+    # and the atoms of the two intramolecular H-bonds, N-H...O=C and O-H...N.
+    IDX_NH = np.array([ring[n] for n in ("H01", "N", "CA", "C")])
+    IDX_IHB = np.array([ring[n] for n in ("H01", "O", "O01", "H02", "N")])
+    IDX_ORP_ACC_O = np.array([ring["O"], ring["O01"]])
+    # The swirl needs, for every phosphorus of a leaflet's P group (ZCOM 3
+    # upper, 4 lower), the same lipid's choline N (P -> N, headgroup) and
+    # glycerol C2 (P -> C2).  They are found by residue, not taken from the
+    # ZCOM N/C2 groups by position: those need not list the lipids in the
+    # same order, and the "C2" groups (9, 10) hold the sn-2 ester carbons
+    # C21-C23, three per lipid, not the glycerol C2.  SWIRL_PAIRS maps
+    # (tag, leaf) to the tip atoms, in the order of the P group; a lipid
+    # without exactly one such atom leaves that swirl at 0, with a warning.
+    SWIRL_PAIRS = {}
+    for leaf, gb in (("u", 3), ("l", 4)):
+        p_atoms = _ref_u.atoms[ZCOM_GROUPS[gb]]
+        for tag, tip_name in (("PN", "N"), ("PC", "C2")):
+            tips = [a.residue.atoms.select_atoms(f"name {tip_name}").indices for a in p_atoms]
+            if p_atoms.n_atoms and all(len(t) == 1 for t in tips):
+                SWIRL_PAIRS[(tag, leaf)] = np.array([t[0] for t in tips])
+            else:
+                warnings.warn(f"swirl {tag} ({leaf}): not every lipid of ZCOM group {gb} has "
+                              f"exactly one atom named {tip_name}; Mem_{leaf}_swirl{tag} is 0")
     IDX_PHOSPHATE = _ref_u.select_atoms("resname DOPC POPC and name O11 O12 O13 O14").indices
     IDX_CARBONYL  = _ref_u.select_atoms("resname DOPC POPC and name O21 O22 O31 O32").indices
     IDX_NITROGEN  = _ref_u.select_atoms("resname DOPC POPC and name N").indices
@@ -1547,7 +1634,8 @@ def gather_path_arrays(plan, path_folder):
     """
     small_keys = (['backbone', 'heavy', 'c_cg', 'ang_oh', 'ring5', 'ring6',
                    'dih_chiral', 'dih_oh', 'tetra5', 'orp_all', 'lipPu', 'lipPl',
-                   'cn_ref', 'chi1', 'chi2']
+                   'cn_ref', 'chi1', 'chi2', 'nh', 'ihb']
+                  + [f'swirl_{tag}_{leaf}' for tag in ('PN', 'PC') for leaf in ('u', 'l')]
                   + [f'dopc_{i}' for i in _SEL_IDX_DOPC]
                   + [f'popc_{i}' for i in _SEL_IDX_POPC])
 
@@ -1557,14 +1645,20 @@ def gather_path_arrays(plan, path_folder):
         'dih_chiral': IDX_DIH_CHIRAL, 'dih_oh': IDX_DIH_OH, 'tetra5': IDX_TETRA5,
         'orp_all': IDX_ORP_ALL, 'lipPu': ZCOM_GROUPS[3], 'lipPl': ZCOM_GROUPS[4],
         'cn_ref': IDX_CN_REF_COMBINED, 'chi1': IDX_CHI1, 'chi2': IDX_CHI2,
+        'nh': IDX_NH, 'ihb': IDX_IHB,
     }
+    # The swirl tips, one per phosphorus of lipPu / lipPl, in that order.
+    for tag in ('PN', 'PC'):
+        for leaf in ('u', 'l'):
+            small_idx[f'swirl_{tag}_{leaf}'] = SWIRL_PAIRS.get((tag, leaf),
+                                                               np.zeros(0, dtype=int))
     for i in _SEL_IDX_DOPC:
         small_idx[f'dopc_{i}'] = CN_DOPC_GROUPS[i]
     for i in _SEL_IDX_POPC:
         small_idx[f'popc_{i}'] = CN_POPC_GROUPS[i]
 
     scalar_keys = (['water_03', 'dopc_05', 'popc_05', 'water_06', 'water_10',
-                    'hb_po', 'hb_co', 'hb_n', 'wire', 'wire_n']
+                    'hb_po', 'hb_co', 'hb_n', 'wire', 'wire_n', 'chol_o', 'chol_n']
                    + [f'zcom_{gi}' for gi in ZCOM_SCALAR_GROUPS])
 
     n_frames = len(plan)
@@ -1623,6 +1717,13 @@ def gather_path_arrays(plan, path_folder):
                 count_hbonds(h01, n1, pos[IDX_NITROGEN], dims, 0.35)
                 + count_hbonds(h02, o01, pos[IDX_NITROGEN], dims, 0.35)
             )
+            # The permeant as an acceptor: choline N+ next to its carboxyl
+            # oxygens or its ring N lone pair (a cation-dipole contact, which
+            # the H-bond counts above cannot see: the lipids have no donors).
+            scalars['chol_o'][out_i] = count_atoms_within(
+                pos[IDX_ORP_ACC_O], pos[IDX_NITROGEN], dims, CHOLINE_CUTOFF)
+            scalars['chol_n'][out_i] = count_atoms_within(
+                pos[[IDX_ORP_N]], pos[IDX_NITROGEN], dims, CHOLINE_CUTOFF)
 
             # NOTE on PBC here: unlike ORP (one bonded molecule -- see
             # compute_com_unwrapped), each of these zcom groups is one marker
@@ -1644,7 +1745,8 @@ def gather_path_arrays(plan, path_folder):
                 scalars[f'zcom_{gi}'][out_i] = np.average(pos[idx, 2], weights=masses)
 
             # Needs the whole water set, so it is reduced here like the counts
-            # above; the core boundary is the glycerol C2 plane of each leaflet.
+            # above; the core boundary is each leaflet's sn-2 ester plane
+            # (zcom 9/10: C21-C23, close below the glycerol).
             scalars['wire'][out_i], scalars['wire_n'][out_i] = compute_water_wire(
                 orp_pos, pos[IDX_WATER_O],
                 scalars['zcom_9'][out_i], scalars['zcom_10'][out_i], box3,
@@ -2041,6 +2143,38 @@ def process_single_path(path_number, overwrite, lambda_A, lambda_B, lambda_minus
         # 'PRO_endo=PRO_dih_chi1>0').
         params['PRO_dih_chi1'] = np.squeeze(compute_dihedral_series(small['chi1'].reshape(n_frames, -1), pbc_box))
         params['PRO_dih_chi2'] = np.squeeze(compute_dihedral_series(small['chi2'].reshape(n_frames, -1), pbc_box))
+
+        # ── Ring nitrogen, intramolecular H-bonds, acceptor contacts ─────────
+        # PRO_dih_NH = H01-N-CA-C: the secondary amine N inverts, and its two
+        # forms put the N-H on the carboxyl's side of the ring (|tau| < 90)
+        # or on the other (|tau| > 90). Odd under the mirror, like every
+        # PRO_dih_*; the side itself is not.
+        # PRO_rHB_*: H...acceptor distances (nm) of the intramolecular H-bonds
+        # N-H...O=C, N-H...O(H) and O-H...N; below ~0.25 nm the bond is made.
+        # The last one needs the anti COOH.
+        # PRO_chol_O / PRO_chol_N: choline N+ within CHOLINE_CUTOFF of the
+        # carboxyl oxygens / of the ring N.
+        ihb = small['ihb'].reshape(n_frames, -1)      # H01, O, O01, H02, N
+        params['PRO_dih_NH'] = np.squeeze(compute_dihedral_series(small['nh'].reshape(n_frames, -1), pbc_box))
+        params['PRO_rHB_NH_O'] = np.squeeze(intramolecular_distance(ihb, 0, 1, pbc_box))
+        params['PRO_rHB_NH_O01'] = np.squeeze(intramolecular_distance(ihb, 0, 2, pbc_box))
+        params['PRO_rHB_OH_N'] = np.squeeze(intramolecular_distance(ihb, 3, 4, pbc_box))
+        params['PRO_chol_O'] = np.squeeze(scalars['chol_o'])
+        params['PRO_chol_N'] = np.squeeze(scalars['chol_n'])
+
+        # ── Swirl of the lipids around the permeant (appended) ─────────────
+        # Mean (r_hat x t_hat) . z over the lipids within 1 nm in the plane,
+        # t the P -> N (headgroup) or P -> C2 (glycerol) vector of each; see
+        # compute_local_swirl. A pseudoscalar about lab +z, like PRO_azim_*.
+        for tag in ("PN", "PC"):
+            for leaf, base in (("u", lip_Pu), ("l", lip_Pl)):
+                if (tag, leaf) in SWIRL_PAIRS:
+                    swirl = compute_local_swirl(pro_xy, base,
+                                                small[f'swirl_{tag}_{leaf}'].reshape(n_frames, -1),
+                                                pbc_box, radius=1.0)
+                else:
+                    swirl = np.zeros(n_frames)
+                params[f'Mem_{leaf}_swirl{tag}'] = np.squeeze(swirl)
 
         write_ML_txt(path_number, reactive, ensemble, lambda_A, lambda_minus_one, **params)
         return (path_number, "ok")

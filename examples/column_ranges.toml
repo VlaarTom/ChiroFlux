@@ -213,6 +213,20 @@
 "Water_cluster" = [-0.5, 60.5, 61]
 "PRO_dih_chi1" = [-60, 60, 120]
 "PRO_dih_chi2" = [-60, 60, 120]
+# Ring N-H side (H01-N-CA-C), intramolecular H...acceptor distances (nm),
+# choline N+ at the carboxyl O / ring N (counts).
+"PRO_dih_NH" = [-180, 180, 72]
+"PRO_rHB_NH_O" = [0.15, 0.45, 60]
+"PRO_rHB_NH_O01" = [0.15, 0.45, 60]
+"PRO_rHB_OH_N" = [0.15, 0.45, 60]
+"PRO_chol_O" = [-0.5, 5.5, 6]
+"PRO_chol_N" = [-0.5, 5.5, 6]
+# Swirl of the lipids within 1 nm about the permeant, per leaflet:
+# P -> N (headgroup) and P -> C2 (glycerol); -1 clockwise ... +1 anticlockwise.
+"Mem_u_swirlPN" = [-1, 1, 40]
+"Mem_l_swirlPN" = [-1, 1, 40]
+"Mem_u_swirlPC" = [-1, 1, 40]
+"Mem_l_swirlPC" = [-1, 1, 40]
 
 # Overrides applied only to the ("non-reactive", "minus") group, which samples a
 # different OP window from the plus ensembles. Anything not listed here falls
